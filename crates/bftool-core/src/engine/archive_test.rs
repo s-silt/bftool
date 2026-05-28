@@ -105,7 +105,7 @@ fn tester_name(t: Tester) -> &'static str {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TestReport {
     pub ok: bool,
     pub archive_failed: Vec<(PathBuf, String)>,
@@ -113,6 +113,19 @@ pub struct TestReport {
     pub enum_errors: Vec<String>,
     pub archives_tested: usize,
     pub uncovered_files: usize,
+}
+
+impl Default for TestReport {
+    fn default() -> Self {
+        Self {
+            ok: true, // "测试通过"是默认假设,出错才置 false
+            archive_failed: Vec::new(),
+            tester_errors: Vec::new(),
+            enum_errors: Vec::new(),
+            archives_tested: 0,
+            uncovered_files: 0,
+        }
+    }
 }
 
 impl TestReport {
@@ -188,7 +201,6 @@ fn invoke_tester(tester: (Tester, &Path), archive: &Path) -> InvokeOutcome {
 /// 测试一个文件夹下所有压缩包。
 pub fn test_folder(folder: &Path, tester: (Tester, &Path), reporter: &dyn Reporter) -> TestReport {
     let mut report = TestReport::default();
-    report.ok = true;
     let mut archives: Vec<PathBuf> = Vec::new();
     let mut continuations: Vec<PathBuf> = Vec::new();
 
@@ -244,11 +256,13 @@ pub fn test_folder(folder: &Path, tester: (Tester, &Path), reporter: &dyn Report
         return report;
     }
 
-    reporter.info(&format!(
-        "测试 {} 个压缩包({})…",
-        archives.len(),
-        tester_name(tester.0)
-    ));
+    if !archives.is_empty() {
+        reporter.info(&format!(
+            "测试 {} 个压缩包({})…",
+            archives.len(),
+            tester_name(tester.0)
+        ));
+    }
     for a in &archives {
         report.archives_tested += 1;
         match invoke_tester(tester, a) {
@@ -356,6 +370,12 @@ mod tests {
     #[test]
     fn continuation_rar_main_not_continuation() {
         assert!(!is_multipart_continuation(Path::new("foo.rar")));
+    }
+
+    #[test]
+    fn continuation_case_insensitive() {
+        assert!(is_multipart_continuation(Path::new("foo.Z01")));
+        assert!(is_multipart_continuation(Path::new("foo.R00")));
     }
 
     #[test]
