@@ -4,7 +4,8 @@ use anyhow::{bail, Result};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use walkdir::WalkDir;
+
+use crate::engine::cruft;
 
 /// 校验三个根目录之间的相互关系，以及它们不在备份盘上。
 pub fn check_paths(
@@ -100,7 +101,11 @@ pub struct StableCheck {
 /// 文件夹是否稳定：所有文件最近修改时间须早于 N 分钟前，且不被占用。
 pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
     let cutoff = SystemTime::now() - Duration::from_secs(minutes * 60);
-    for entry in WalkDir::new(root).follow_links(false) {
+    for entry in cruft::walk(root) {
+        // 稳定性检测对 walkdir 错误**保持原 swallow 语义**：
+        // 真实枚举错误会在后续 manifest::real_files 阶段被收集并 bail。
+        // 让稳定性检测也 bail 会让单个"权限拒绝"在第一关就把项目挡掉，
+        // 用户看不到 manifest 阶段更详细的多文件错误汇总。
         let Ok(e) = entry else { continue };
         if !e.file_type().is_file() {
             continue;
