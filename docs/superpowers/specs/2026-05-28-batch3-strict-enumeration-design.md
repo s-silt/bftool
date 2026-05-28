@@ -38,7 +38,11 @@ D3 / D5 即「简化」相对路线图原 Batch 3 的具体内容。
 
 ### 4.1 新增 `crates/bftool-core/src/engine/cruft.rs`
 
-包含 cruft 名单 + **共享的 cruft-aware walker**。**五处** `archive::handle_one` 会走的目录遍历都用同一个 walker —— 稳定性检测 / manifest / copy / size 统计 / verify —— 保证 cruft 在所有路径上的处理一致：不卡稳定性检测、不进 manifest、**不复制到机械盘**、不算入 folder_stats、verify 也不报"清单外多余"。
+包含 cruft 名单 + **共享的 cruft-aware walker**。**两条独立调用链**都用同一个 walker：
+- **`archive::handle_one` 路径**（四处）：`safety::folder_stable` → `archive::folder_stats` → `manifest::real_files` → `archive::copy_folder`
+- **`verify::run` 命令**（独立命令,不走 handle_one）：扫"清单外多余文件"那一段
+
+保证 cruft 在所有路径上的处理一致：不卡稳定性检测、不进 manifest、**不复制到机械盘**、不算入 folder_stats、verify 也不报"清单外多余"。
 
 ```rust
 //! OS 注入的杂文件 / 目录，默认从 manifest、复制、容量统计全部排除。
