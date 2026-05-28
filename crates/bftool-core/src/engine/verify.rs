@@ -163,7 +163,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
     }
 
     let summary = format!(
-        "复查完成：检查 {} 个文件，损坏/缺失/大小问题 {} 个，清单外多余 {} 个。",
+        "复查完成：检查 {} 个文件，损坏/缺失/大小/枚举问题 {} 个,清单外多余 {} 个。",
         checked, bad, extra
     );
     if bad > 0 {
