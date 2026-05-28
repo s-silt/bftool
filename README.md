@@ -103,6 +103,14 @@ bftool find 关键词
 
 会在全局索引里搜，告诉你它在哪块「备份N」、盘内路径。
 
+### 9. 装了 7-Zip 自动测压缩包
+
+如果你的机器装了 [7-Zip](https://7-zip.org)（或 WinRAR / Bandizip），bftool 会在归档前后各跑一次 `t` 测试压缩包内部结构 —— 确保**字节没变**（SHA256 兜底）**+ 结构也没坏**（archive test 兜底）。没装也能跑，只是少一道压缩包专项保险，启动时会给一行 warn。
+
+**与 `--unsafe-no-hash` 互斥**：如果你同时关 SHA256 又关 archive test（或者机器上一个压缩工具都没装），bftool 会拒绝运行 —— 那种状态只剩文件数 + 大小 + 修改时间，等价于"没在做完整性校验"。
+
+需要彻底关压缩包测试？显式传 `--no-test-archives`，或在 `bftool.toml` 里写 `test_archives = false`。
+
 ## 子命令速查
 
 | 命令 | 作用 |
@@ -110,7 +118,8 @@ bftool find 关键词
 | `bftool` | 显示当前状态 + 可用子命令 |
 | `bftool archive` | 归档：处理 待备份 下所有就绪项目 |
 | `bftool archive --dry-run` | 演练（不复制、不写索引、不移动源） |
-| `bftool archive --unsafe-no-hash --i-understand-this-can-miss-bitrot` | **危险**：跳过 SHA256 内容校验，挡不住静默损坏（比特腐烂）。必须两个开关同时传才生效，单独 `--unsafe-no-hash` 会被拒绝。仅适合海量素材类、且接受静默损坏不可见的场景；**不可再生的资料请保持完整 SHA256**。 |
+| `bftool archive --unsafe-no-hash --i-understand-this-can-miss-bitrot` | **危险**：跳过 SHA256 内容校验，挡不住静默损坏（比特腐烂）。必须两个开关同时传才生效，单独 `--unsafe-no-hash` 会被拒绝。仅适合海量素材类、且接受静默损坏不可见的场景；**不可再生的资料请保持完整 SHA256**。开启此项要求机器装了 7-Zip/WinRAR/Bandizip 任一（让压缩包测试兜底）；同时关压缩包测试 → 直接拒绝。 |
+| `bftool archive --no-test-archives` | 关掉压缩包内部结构测试（默认开启）。SHA256 字节级校验仍在。与 `--unsafe-no-hash` 互斥（两者同关 ≈ 没在校验）。 |
 | `bftool archive --limit 1` | 本次只处理一个项目 |
 | `bftool init <盘符>` | 初始化一块空盘为下一个「备份N」 |
 | `bftool init <盘符> --force` | 跳过防呆（系统盘/资料库盘/非空盘）；风险自负 |
