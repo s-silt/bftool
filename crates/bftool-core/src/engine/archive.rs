@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::engine::drive::{self, DriveInfo};
 use crate::engine::manifest::{self, ManifestOpts};
 use crate::engine::{paths, safety, txn};
-use crate::ui;
+use crate::reporter::Reporter;
 
 #[derive(Debug, Default)]
 pub struct Options {
@@ -27,14 +27,14 @@ pub struct Options {
     pub drive_letter_override: Option<String>,
 }
 
-pub fn run(cfg: &Config, opts: Options) -> Result<()> {
+pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     // 准备系统目录
     fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
     fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
     fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
 
     // 启动自检：上次的事务标记是不是残留？
-    check_pending_txn(cfg)?;
+    check_pending_txn(cfg, reporter)?;
 
     // 找当前可用备份盘
     let drive = match opts.drive_letter_override.as_deref() {
@@ -42,21 +42,21 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
         None => match drive::pick_active()? {
             Some(d) => d,
             None => {
-                ui::error("未发现已初始化且未封盘的备份盘。");
-                ui::info("插入空盘后运行：bftool init <盘符>（例：bftool init E）");
+                reporter.error("未发现已初始化且未封盘的备份盘。");
+                reporter.info("插入空盘后运行：bftool init <盘符>（例：bftool init E）");
                 return Ok(());
             }
         },
     };
     if drive.sealed {
-        ui::error(format!(
+        reporter.error(&format!(
             "盘 {} ({}:) 已封盘，禁止写入。请换上一块未封盘的备份盘或初始化新盘。",
             drive.id, drive.letter
         ));
         return Ok(());
     }
 
-    ui::ok(format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
+    reporter.ok(&format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
 
     // 路径安全检查
     let warnings = safety::check_paths(
@@ -66,12 +66,12 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
         Some(&drive.root),
     )?;
     for w in warnings {
-        ui::warn(w);
+        reporter.warn(&w);
     }
 
     // 列出待归档项目
     if !cfg.ready_root.is_dir() {
-        ui::error(format!("待备份 不存在：{}", cfg.ready_root.display()));
+        reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
         return Ok(());
     }
     let mut projects: Vec<_> = fs::read_dir(&cfg.ready_root)?
@@ -85,10 +85,10 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
         leading_number(name).unwrap_or(u64::MAX)
     });
     if projects.is_empty() {
-        ui::info("待备份 中没有待归档项目，结束。");
+        reporter.info("待备份 中没有待归档项目，结束。");
         return Ok(());
     }
-    ui::info(format!(
+    reporter.info(&format!(
         "发现 {} 个待归档项目（按编号升序处理）。",
         projects.len()
     ));
@@ -96,17 +96,17 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
     let mut handled = 0usize;
     for proj in &projects {
         if opts.limit > 0 && handled >= opts.limit {
-            ui::action(format!(
+            reporter.action(&format!(
                 "已达本次处理上限（{} 个项目），停止；剩余项目下次运行继续。",
                 opts.limit
             ));
             break;
         }
-        match handle_one(cfg, &drive, proj, &opts) {
+        match handle_one(cfg, reporter, &drive, proj, &opts) {
             Ok(HandleOutcome::Done) => handled += 1,
             Ok(HandleOutcome::Skipped) => {}
             Ok(HandleOutcome::DriveSealed) => {
-                ui::action(
+                reporter.action(
                     "本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
                 );
                 break;
@@ -116,7 +116,7 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                ui::error(format!(
+                reporter.error(&format!(
                     "项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。",
                     name, e
                 ));
@@ -124,7 +124,7 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
             }
         }
     }
-    ui::ok("本轮结束。");
+    reporter.ok("本轮结束。");
     Ok(())
 }
 
@@ -136,6 +136,7 @@ enum HandleOutcome {
 
 fn handle_one(
     cfg: &Config,
+    reporter: &dyn Reporter,
     drive: &DriveInfo,
     proj_path: &Path,
     opts: &Options,
@@ -146,12 +147,12 @@ fn handle_one(
         .ok_or_else(|| anyhow::anyhow!("无效的项目目录名"))?
         .to_string();
     let proj_no = leading_digits(&name);
-    ui::action(format!("=== 处理: {} ===", name));
+    reporter.action(&format!("=== 处理: {} ===", name));
 
     // 稳定性
     let st = safety::folder_stable(proj_path, cfg.stable_minutes);
     if !st.stable {
-        ui::warn(format!("跳过（未稳定）：{}", st.reason));
+        reporter.warn(&format!("跳过（未稳定）：{}", st.reason));
         return Ok(HandleOutcome::Skipped);
     }
 
@@ -166,7 +167,7 @@ fn handle_one(
     if dup_in_drive {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
         dest_name = format!("{}_{}", name, stamp);
-        ui::action(format!(
+        reporter.action(&format!(
             "本盘已存在同名历史备份『{}』→ 为避免污染旧备份，本次改用唯一名『{}』。",
             name, dest_name
         ));
@@ -178,7 +179,7 @@ fn handle_one(
     // 容量
     let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
     if size > drive.total_bytes.saturating_sub(reserve) {
-        ui::error(format!(
+        reporter.error(&format!(
             "项目 {:.2}GB 超过单盘容量，空盘也放不下 → 需人工拆分",
             size_gb
         ));
@@ -192,12 +193,12 @@ fn handle_one(
     if need.saturating_add(reserve) > drive.free_bytes {
         let need_gb = need as f64 / 1024.0 / 1024.0 / 1024.0;
         let free_gb = drive.free_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-        ui::warn(format!(
+        reporter.warn(&format!(
             "盘 {} 余量不足以放下 {}（还需约 {:.2}GB + 余量；当前剩余 {:.2}GB）。封盘并请换下一块盘后重跑。",
             drive.id, name, need_gb, free_gb
         ));
         drive::seal(drive).context("封盘失败")?;
-        ui::action(format!(
+        reporter.action(&format!(
             "已封盘 {}。取下本盘、插上下一块空盘(NTFS)后，运行 `bftool init <盘符>` 初始化再继续。",
             drive.id
         ));
@@ -205,7 +206,7 @@ fn handle_one(
     }
 
     if opts.dry_run {
-        ui::info(format!(
+        reporter.info(&format!(
             "[演练] 将归档 {} ({:.2}GB) → {}",
             name, size_gb, drive.id
         ));
@@ -213,19 +214,20 @@ fn handle_one(
     }
 
     // 生成源清单
-    ui::info(format!("生成源清单/校验和（{:.2}GB，可能较慢）…", size_gb));
+    reporter.info(&format!("生成源清单/校验和（{:.2}GB，可能较慢）…", size_gb));
     let src = manifest::build(
         proj_path,
         ManifestOpts {
             no_hash: opts.no_hash,
         },
+        reporter,
     )?;
 
     // 复制
     fs::create_dir_all(&dest).context("创建目标目录失败")?;
-    ui::info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
+    reporter.info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
     copy_folder(proj_path, &dest)?;
-    ui::info("复制完成，开始校验…");
+    reporter.info("复制完成，开始校验…");
 
     // 目标清单 + 比对
     let dst = manifest::build(
@@ -233,10 +235,11 @@ fn handle_one(
         ManifestOpts {
             no_hash: opts.no_hash,
         },
+        reporter,
     )?;
     let d = manifest::diff(&src, &dst, !opts.no_hash);
     if !d.ok {
-        ui::error(format!(
+        reporter.error(&format!(
             "校验失败：{} → 不写索引、不移动源。",
             d.reasons.join("; ")
         ));
@@ -252,7 +255,7 @@ fn handle_one(
                         fs::create_dir_all(p).ok();
                     }
                     if let Err(e) = fs::rename(&src_p, &dst_p) {
-                        ui::warn(format!(
+                        reporter.warn(&format!(
                             "隔离失败 {}：{}（请手动检查 {}）",
                             rel,
                             e,
@@ -263,7 +266,7 @@ fn handle_one(
                     }
                 }
             }
-            ui::action(format!(
+            reporter.action(&format!(
                 "已将 {} 个损坏/多余的目标文件移到：{} → 下次运行会自动补传并重新校验。",
                 moved,
                 quar.display()
@@ -274,16 +277,17 @@ fn handle_one(
     }
 
     // 复核源在复制期间未变化
-    ui::info("复核源文件在复制期间未变化…");
+    reporter.info("复核源文件在复制期间未变化…");
     let src2 = manifest::build(
         proj_path,
         ManifestOpts {
             no_hash: opts.no_hash,
         },
+        reporter,
     )?;
     let (changed, why) = manifest::source_changed(&src, &src2, opts.no_hash);
     if changed {
-        ui::error(format!(
+        reporter.error(&format!(
             "源在复制期间发生变化（{}）→ 不移动源、不写索引；该项目保留在 待备份，下次重做。",
             why.join("; ")
         ));
@@ -367,7 +371,7 @@ fn handle_one(
     )?;
 
     txn::PendingTxn::clear(&txn_path)?;
-    ui::ok(format!(
+    reporter.ok(&format!(
         "✓ {} 归档+校验成功 → {}\\项目\\{}；SSD 源已移到 已备份（未删除）。",
         name, drive.id, dest_name
     ));
@@ -487,7 +491,7 @@ fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_pending_txn(cfg: &Config) -> Result<()> {
+fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     let path = paths::system_pending_txn(&cfg.system_root);
     if !path.is_file() {
         return Ok(());
@@ -501,20 +505,21 @@ fn check_pending_txn(cfg: &Config) -> Result<()> {
     let global = paths::system_global_catalog(&cfg.system_root);
     let indexed = global_has_folder(&global, &pname).unwrap_or(false);
 
-    ui::action(format!("发现上次未完成的事务（项目：{}）。", pname));
+    reporter.action(&format!("发现上次未完成的事务（项目：{}）。", pname));
     if in_ready {
-        ui::action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。已清除旧标记。");
+        reporter
+            .action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。已清除旧标记。");
         let _ = fs::remove_file(&path);
     } else if moved && indexed {
-        ui::action("→ 已移动且索引中已有记录，判定为已完成（仅标记残留）。已自动清除标记。");
+        reporter.action("→ 已移动且索引中已有记录，判定为已完成（仅标记残留）。已自动清除标记。");
         let _ = fs::remove_file(&path);
     } else if moved && !indexed {
-        ui::error(format!(
+        reporter.error(&format!(
             "→ 源已移到『已备份』但全局索引可能漏写：数据应在备份盘 {}。请人工核对并在索引中补登；标记保留。",
             parch
         ));
     } else {
-        ui::error(format!(
+        reporter.error(&format!(
             "→ 无法自动判定（源不在待备份、目标也未确认）。请按以下信息人工核对，标记保留：\n{}",
             text
         ));
@@ -565,6 +570,8 @@ fn folder_size(p: &Path) -> u64 {
 
 /// 简单的递归复制；与 robocopy 比缺少 /Z 断点续传中段恢复，但小文件/中等大小够用。
 /// 已存在且大小相同的文件直接跳过（保留断点续传的核心语义）。
+///
+/// TODO(Batch 4)：改为 .bftool-part 临时文件 + 写完 sync + 重读目标算 hash + 原子 rename。
 fn copy_folder(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst).ok();
     for entry in walkdir::WalkDir::new(src).follow_links(false) {

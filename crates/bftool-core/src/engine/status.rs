@@ -1,4 +1,8 @@
 //! `bftool` 不带子命令时的输出：把"现在是什么样、可以做什么"一屏摆给用户看。
+//!
+//! TODO(Batch 1c)：改为返回 `StatusReport` 结构体，由调用方决定怎么渲染。
+//! GUI 不会调用这个函数，而是单独用 Config getter + drive::scan_mounted +
+//! 自己的 dashboard 渲染。
 
 use anyhow::Result;
 use std::fs;
@@ -6,8 +10,11 @@ use std::fs;
 use crate::config::Config;
 use crate::engine::drive;
 use crate::engine::paths;
+use crate::reporter::Reporter;
 
-pub fn run(cfg: &Config) -> Result<()> {
+/// `_reporter` 暂未使用：当前实现仍直接 `println!` 渲染面板。
+/// 重构成结构化报告后会改走 reporter。
+pub fn run(cfg: &Config, _reporter: &dyn Reporter) -> Result<()> {
     println!("==================== 归档备份工具 (bftool) ====================");
     println!("  待备份(源)  : {}", display_root(&cfg.ready_root));
     println!("  已备份      : {}", display_root(&cfg.archived_root));

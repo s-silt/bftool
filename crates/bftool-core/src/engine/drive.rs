@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::engine::paths;
-use crate::ui;
+use crate::reporter::Reporter;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DriveInfo {
@@ -23,11 +23,11 @@ pub struct DriveInfo {
     pub total_bytes: u64,
 }
 
-pub fn list_mounted(cfg: &Config) -> Result<()> {
+pub fn list_mounted(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     let drives = scan_mounted()?;
     if drives.is_empty() {
-        ui::warn("未发现已初始化的备份盘。");
-        ui::info("插入一块空盘后，运行：bftool init <盘符> 把它初始化为下一个「备份N」。");
+        reporter.warn("未发现已初始化的备份盘。");
+        reporter.info("插入一块空盘后，运行：bftool init <盘符> 把它初始化为下一个「备份N」。");
         return Ok(());
     }
     for d in &drives {
@@ -36,14 +36,15 @@ pub fn list_mounted(cfg: &Config) -> Result<()> {
         } else {
             "[可用]  "
         };
-        println!(
+        // 每行是结构化"盘项"，借 Info 级别打印；GUI 会换成自己的 list view。
+        reporter.info(&format!(
             "  {}  {} ({}:)  剩余 {:.1} GB / 共 {:.0} GB",
             tag,
             d.id,
             d.letter,
             d.free_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
             d.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
-        );
+        ));
     }
     let _ = cfg; // 当前未用 cfg；保留参数便于将来加 system_root 联动展示
     Ok(())
@@ -107,7 +108,13 @@ fn drive_letter_of(p: &Path) -> Option<String> {
 }
 
 /// 初始化一块盘为下一个「备份N」（或自定义 ID）
-pub fn init(cfg: &Config, drive_letter: &str, id: Option<&str>, force: bool) -> Result<()> {
+pub fn init(
+    cfg: &Config,
+    reporter: &dyn Reporter,
+    drive_letter: &str,
+    id: Option<&str>,
+    force: bool,
+) -> Result<()> {
     let letter = drive_letter.trim_end_matches(':').to_uppercase();
     if letter.len() != 1 {
         bail!("盘符无效：{}（应为单字母，例如 E）", drive_letter);
@@ -135,7 +142,7 @@ pub fn init(cfg: &Config, drive_letter: &str, id: Option<&str>, force: bool) -> 
         }
         // 已是备份盘 → 不阻止（init 等同重新写元数据），但提示
         if paths::drive_id_path(&root).is_file() {
-            ui::warn(format!(
+            reporter.warn(&format!(
                 "{}: 已经是一块初始化过的备份盘；将覆盖元数据，但不会动 \\项目\\ 下的数据。",
                 letter
             ));
@@ -186,10 +193,10 @@ pub fn init(cfg: &Config, drive_letter: &str, id: Option<&str>, force: bool) -> 
         bump_drive_seq(cfg, n)?;
     }
 
-    ui::ok(format!("已初始化备份盘 {} ({}:)", id, letter));
+    reporter.ok(&format!("已初始化备份盘 {} ({}:)", id, letter));
     if !force && paths::drive_id_path(&root).is_file() {
         // 提示用户可以接着 archive
-        ui::info(
+        reporter.info(
             "现在可以运行 `bftool archive` 开始归档；先 `bftool archive --dry-run` 演练一下更稳。",
         );
     }

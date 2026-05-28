@@ -15,6 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 bftool-core = { path = "../bftool-core" }
-clap.workspace   = true
-anyhow.workspace = true
-toml.workspace   = true
+clap.workspace      = true
+anyhow.workspace    = true
+toml.workspace      = true
+# CLI 端用 indicatif 渲染进度条；core 不再依赖它。
+indicatif.workspace = true

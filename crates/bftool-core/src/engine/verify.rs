@@ -10,9 +10,9 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::engine::{drive, paths};
-use crate::ui;
+use crate::reporter::Reporter;
 
-pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
+pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) -> Result<()> {
     let drives = drive::scan_mounted()?;
     if drives.is_empty() {
         bail!("未发现已初始化的备份盘。");
@@ -31,9 +31,9 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
             if drives.len() == 1 {
                 drives.into_iter().next().unwrap()
             } else {
-                ui::info("检测到多块备份盘；请显式指定盘符。已识别：");
+                reporter.info("检测到多块备份盘；请显式指定盘符。已识别：");
                 for (i, d) in drives.iter().enumerate() {
-                    println!("  [{}] {} ({}:)", i + 1, d.id, d.letter);
+                    reporter.info(&format!("  [{}] {} ({}:)", i + 1, d.id, d.letter));
                 }
                 bail!("用法：bftool verify <盘符>（例：bftool verify E）");
             }
@@ -44,7 +44,7 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
     if !mdir.is_dir() {
         bail!("盘 {} 上没有校验清单目录：{}", target.id, mdir.display());
     }
-    ui::info(format!(
+    reporter.info(&format!(
         "开始复查 {} ({}:)，重算 SHA256 / 核对大小，可能较慢…",
         target.id, target.letter
     ));
@@ -69,7 +69,7 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
             .strip_suffix(".sha256.csv")
             .unwrap_or(&stem)
             .to_string();
-        ui::action(format!("· {}", project_name));
+        reporter.action(&format!("· {}", project_name));
         let proj_dir = projects_dir.join(&project_name);
         let mut expected: HashMap<String, (u64, String)> = HashMap::new();
 
@@ -80,7 +80,7 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
         let i_size = headers.iter().position(|h| h == "Size");
         let i_hash = headers.iter().position(|h| h == "Hash");
         let Some(i_rel) = i_rel else {
-            ui::warn(format!("清单缺少 Rel 列，跳过：{}", mf.path().display()));
+            reporter.warn(&format!("清单缺少 Rel 列，跳过：{}", mf.path().display()));
             continue;
         };
 
@@ -96,20 +96,20 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
             let f = proj_dir.join(&rel);
             checked += 1;
             if !f.is_file() {
-                ui::error(format!("  缺失: {}", rel));
+                reporter.error(&format!("  缺失: {}", rel));
                 bad += 1;
                 continue;
             }
             let meta = match fs::metadata(&f) {
                 Ok(m) => m,
                 Err(e) => {
-                    ui::error(format!("  无法读元数据 {}: {}", rel, e));
+                    reporter.error(&format!("  无法读元数据 {}: {}", rel, e));
                     bad += 1;
                     continue;
                 }
             };
             if size > 0 && meta.len() != size {
-                ui::error(format!("  大小不一致: {}", rel));
+                reporter.error(&format!("  大小不一致: {}", rel));
                 bad += 1;
                 continue;
             }
@@ -117,11 +117,11 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
                 match sha256_hex(&f) {
                     Ok(h) if h == hash => {}
                     Ok(_) => {
-                        ui::error(format!("  损坏/不一致: {}", rel));
+                        reporter.error(&format!("  损坏/不一致: {}", rel));
                         bad += 1;
                     }
                     Err(e) => {
-                        ui::error(format!("  读取失败 {}: {}", rel, e));
+                        reporter.error(&format!("  读取失败 {}: {}", rel, e));
                         bad += 1;
                     }
                 }
@@ -142,7 +142,7 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
                     .map(|p| p.to_string_lossy().replace('/', "\\"))
                     .unwrap_or_default();
                 if !expected.contains_key(&rel) {
-                    ui::warn(format!("  多余(清单外): {}", rel));
+                    reporter.warn(&format!("  多余(清单外): {}", rel));
                     extra += 1;
                 }
             }
@@ -154,14 +154,14 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
         checked, bad, extra
     );
     if bad > 0 {
-        ui::error(summary);
+        reporter.error(&summary);
     } else if extra > 0 {
-        ui::warn(summary);
+        reporter.warn(&summary);
     } else {
-        ui::ok(summary);
+        reporter.ok(&summary);
     }
     if extra > 0 {
-        ui::info("（多余文件不会自动删除；如确认无用可人工清理。）");
+        reporter.info("（多余文件不会自动删除；如确认无用可人工清理。）");
     }
     Ok(())
 }

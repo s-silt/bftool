@@ -13,12 +13,13 @@ name = "bftool_core"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow.workspace    = true
-sha2.workspace      = true
-walkdir.workspace   = true
-indicatif.workspace = true
-serde.workspace     = true
-csv.workspace       = true
-chrono.workspace    = true
-toml.workspace      = true
-sysinfo.workspace   = true
+# Batch 1b 之后 core 不再依赖 indicatif（进度条由 reporter trait 抽象，
+# CLI 端用 indicatif 实现，未来 GUI 端可换成自己的进度模型）。
+anyhow.workspace  = true
+sha2.workspace    = true
+walkdir.workspace = true
+serde.workspace   = true
+csv.workspace     = true
+chrono.workspace  = true
+toml.workspace    = true
+sysinfo.workspace = true

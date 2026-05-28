@@ -80,6 +80,7 @@ dependencies = [
  "anyhow",
  "bftool-core",
  "clap",
+ "indicatif",
  "toml",
 ]
 
@@ -90,7 +91,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "csv",
- "indicatif",
  "serde",
  "sha2",
  "sysinfo",

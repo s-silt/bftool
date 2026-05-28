@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::ui;
+use crate::reporter::Reporter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -77,7 +77,9 @@ impl Manifest {
 /// - 不进入目录链接（symlink/junction）
 /// - 跳过文件 reparse point
 /// - 出错的子项记日志后跳过，不让整轮失败
-fn real_files(root: &Path) -> Vec<PathBuf> {
+///
+/// TODO(Batch 3)：默认改为"枚举失败 → 当前项目失败"；仅当显式 --allow-skip-errors 时才跳过。
+fn real_files(root: &Path, reporter: &dyn Reporter) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let walker = WalkDir::new(root)
         .follow_links(false) // 不递归进 symlink/junction
@@ -92,7 +94,7 @@ fn real_files(root: &Path) -> Vec<PathBuf> {
                 }
             }
             Err(err) => {
-                ui::warn(format!("枚举文件时跳过一项：{}", err));
+                reporter.warn(&format!("枚举文件时跳过一项：{}", err));
             }
         }
     }
@@ -104,14 +106,14 @@ pub struct ManifestOpts {
 }
 
 /// 生成文件夹清单。`no_hash=true` 时 Hash 字段为空串。
-pub fn build(root: &Path, opts: ManifestOpts) -> Result<Manifest> {
-    let files = real_files(root);
+pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result<Manifest> {
+    let files = real_files(root, reporter);
     let total_bytes: u64 = files
         .iter()
         .filter_map(|p| p.metadata().ok().map(|m| m.len()))
         .sum();
 
-    let bar = ui::bytes_bar(total_bytes, if opts.no_hash { "枚举" } else { "校验" });
+    let mut bar = reporter.progress_bytes(if opts.no_hash { "枚举" } else { "校验" }, total_bytes);
 
     let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut entries = Vec::with_capacity(files.len());
@@ -138,7 +140,7 @@ pub fn build(root: &Path, opts: ManifestOpts) -> Result<Manifest> {
             mtime,
         });
     }
-    bar.finish_and_clear();
+    bar.finish();
     Ok(Manifest { entries })
 }
 

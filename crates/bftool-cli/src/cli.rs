@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use bftool_core::config::Config;
 use bftool_core::engine;
+use bftool_core::reporter::Reporter;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -112,11 +113,11 @@ pub enum Command {
     ConfigShow,
 }
 
-pub fn dispatch(args: Cli) -> Result<()> {
+pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
     let cfg = Config::load(args.config.as_deref()).context("加载配置失败")?;
 
     match args.cmd {
-        None => engine::status::run(&cfg),
+        None => engine::status::run(&cfg, reporter),
         Some(Command::Archive {
             dry_run,
             unsafe_no_hash,
@@ -146,6 +147,7 @@ pub fn dispatch(args: Cli) -> Result<()> {
             }
             engine::archive::run(
                 &cfg,
+                reporter,
                 engine::archive::Options {
                     dry_run,
                     // core API 仍叫 no_hash：CLI 层负责让"开启它"变得困难。
@@ -156,12 +158,13 @@ pub fn dispatch(args: Cli) -> Result<()> {
             )
         }
         Some(Command::Init { drive, id, force }) => {
-            engine::drive::init(&cfg, &drive, id.as_deref(), force)
+            engine::drive::init(&cfg, reporter, &drive, id.as_deref(), force)
         }
-        Some(Command::Verify { drive }) => engine::verify::run(&cfg, drive.as_deref()),
+        Some(Command::Verify { drive }) => engine::verify::run(&cfg, reporter, drive.as_deref()),
         Some(Command::Find { keyword }) => engine::find::run(&cfg, &keyword),
-        Some(Command::Drives) => engine::drive::list_mounted(&cfg),
+        Some(Command::Drives) => engine::drive::list_mounted(&cfg, reporter),
         Some(Command::ConfigShow) => {
+            // 这条命令是查询性质，直接打到 stdout 即可（GUI 端会用 config getter，不走 CLI）。
             println!(
                 "{}",
                 toml::to_string_pretty(&cfg).context("序列化配置失败")?
