@@ -78,6 +78,17 @@ pub fn is_cruft_dir(name: &str) -> bool {
     CRUFT_DIRS.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
 
+/// 从 manifest 的 `Rel` 字段提取叶子名（**第四轮 P3 修复**）。
+///
+/// manifest 的 `Rel` 是 PowerShell 旧版兼容格式，**永远用 `\` 分隔**（哪怕在 Linux 跑测试）：
+/// `crates/bftool-core/src/engine/manifest.rs:19`。直接用 `Path::new(rel).file_name()` 在
+/// 非 Windows 平台会把整串 "foo\Thumbs.db" 当成叶子名，cruft 判断漏判。
+///
+/// 这里手动按 `\` 和 `/` 都切，取最后一段。
+pub fn leaf_name_from_rel(rel: &str) -> &str {
+    rel.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(rel)
+}
+
 /// 共享的 cruft-aware 遍历器。
 ///
 /// 调用方拿到的 `DirEntry` 序列已经过滤掉：
@@ -178,31 +189,35 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
 容量预估不能算 cruft，否则跟 manifest / copy 不一致。同时按 user review (P3-dry-run)，dry-run 既要报 GB 也要报"X 个文件"，所以把单一字节数改为双字段：
 
 ```rust
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FolderStats {
     pub files: u64,
     pub bytes: u64,
+    /// walkdir 枚举错误描述（第四轮 P2 修复）。
+    /// 容量判断时忽略（best-effort），但 dry-run 输出要向用户暴露：
+    /// "你看到的'X 个文件'可能不完整，请先解决环境问题再正式跑"。
+    pub enum_errors: Vec<String>,
 }
 
-/// best-effort 统计：walkdir 错误 swallow（folder_stats 仅给容量判断和 dry-run 摘要用；
-/// 真实错误会在后续 manifest::build / copy_folder 里被收集并 bail）。
 fn folder_stats(p: &Path) -> FolderStats {
     let mut s = FolderStats::default();
-    for e in cruft::walk(p).filter_map(|e| e.ok()) {
-        if e.file_type().is_file() {
-            s.files += 1;
-            if let Ok(m) = e.metadata() {
-                s.bytes += m.len();
+    for entry in cruft::walk(p) {
+        match entry {
+            Ok(e) if e.file_type().is_file() => {
+                s.files += 1;
+                if let Ok(m) = e.metadata() {
+                    s.bytes += m.len();
+                }
             }
+            Ok(_) => continue,
+            Err(err) => s.enum_errors.push(format!("{}", err)),
         }
     }
     s
 }
-
-// 兼容旧调用点：folder_size 改为 folder_stats(...).bytes 的薄包装（或直接删除调用点改用 folder_stats）。
 ```
 
-`handle_one` 的 dry-run 分支改为：
+`handle_one` 的 dry-run 分支改为（**第四轮 P2 修复**：dry-run 报告统计可能不完整）：
 
 ```rust
 let stats = folder_stats(proj_path);
@@ -211,14 +226,25 @@ if opts.dry_run {
         "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
         name, stats.files, stats.bytes as f64 / 1024.0 / 1024.0 / 1024.0, drive.id
     ));
+    if !stats.enum_errors.is_empty() {
+        for e in &stats.enum_errors {
+            reporter.warn(&format!("[演练] 枚举失败：{}", e));
+        }
+        reporter.warn(&format!(
+            "[演练] {} 项目的统计可能不完整 ({} 个枚举错误)。正式归档会因为同样的错误失败 \
+             —— 请先解决环境问题（权限拒绝？路径过长？被 AV 锁住？）再去掉 --dry-run 跑。",
+            name, stats.enum_errors.len()
+        ));
+    }
     return Ok(HandleOutcome::Done);
 }
 ```
 
-`folder_stats` 本身仍允许 swallow walkdir 错误 —— 这是有意的，因为：
-1. 它只服务于"容量判断 + dry-run 摘要"两个场景
-2. 真实错误会在后续 `manifest::build` 调用 `real_files` 时被收集并 bail（Spec §4.2）
-3. 让 folder_stats 也 bail 会导致 dry-run 在仅"想看看会做什么"的场景下也直接报错，反而不友好
+为什么 folder_stats 仍 swallow（**不** bail）：
+1. 它服务于"容量判断 + dry-run 摘要"两个场景
+2. 容量判断里就算少算几个文件,正式跑时 `manifest::real_files` 会精确枚举并 bail —— 容量这层 best-effort 是 OK 的
+3. dry-run 路径必须**主动暴露**这些错误（user-review-P2 修复:之前是悄悄 swallow,违反 Spec A 总原则）—— 上面 if 分支的 warn 就是
+4. 让 folder_stats 直接 bail 会让单一权限拒绝在容量判断阶段就把项目挡掉,看不到 manifest 阶段的多文件错误汇总
 
 ### 4.2d 改造 `safety::folder_stable`（**user-review-第三轮 P1 修复**）
 
@@ -354,14 +380,14 @@ verify 第一条路是读 manifest 里的每个 `Rel` 去 check 文件存在 / �
 ```rust
 for rec in rdr.records().flatten() {
     let rel = rec.get(i_rel).unwrap_or("").to_string();
-    if let Some(leaf) = std::path::Path::new(&rel).file_name() {
-        let leaf_str = leaf.to_string_lossy();
-        if cruft::is_cruft_file(&leaf_str) {
-            // legacy cruft：旧清单有这条，但 Batch 3 后我们不再关心 cruft
-            // → 不加入 expected，不 check 存在/大小/哈希
-            // → 用户手动删 Thumbs.db 不会被报"缺失"；被 AV 锁也不会读取失败
-            continue;
-        }
+    // 第四轮 P3 修复：用 cruft::leaf_name_from_rel 而不是 Path::file_name
+    // —— manifest Rel 永远 \\ 分隔，跨平台 Path::file_name 会漏判
+    let leaf = cruft::leaf_name_from_rel(&rel);
+    if cruft::is_cruft_file(leaf) {
+        // legacy cruft：旧清单有这条，但 Batch 3 后我们不再关心 cruft
+        // → 不加入 expected，不 check 存在/大小/哈希
+        // → 用户手动删 Thumbs.db 不会被报"缺失"；被 AV 锁也不会读取失败
+        continue;
     }
     // ... 余下逻辑不变（expected.insert + check）
 }
@@ -396,7 +422,17 @@ for rec in rdr.records().flatten() {
 5. `manifest::build`：3 个文件中 1 个 metadata 失败 → 错误信息列出失败的那 1 个的路径，不混淆其它 2 个
 6. 集成测试：`bftool archive --dry-run` 在含 cruft 的源目录上，输出"X 个文件"的统计**不**包含 cruft
 7. **`safety::folder_stable`（第三轮 P1）**：(a) 含一个 5 分钟前刚改的 Thumbs.db + 一个 1 小时前的真实项目文件 → 返回 stable=true（cruft 不算入稳定性）；(b) 含一个被独占锁住的 Thumbs.db → stable=true
-8. **`verify` legacy cruft（第三轮 P2-verify）**：(a) 手写一份旧 manifest 含 `Thumbs.db` 条目 + 盘上有 Thumbs.db → verify summary 报 0 缺失（不再 check 该条）；(b) 同上但 Thumbs.db 已被用户删 → 同样 0 缺失
+8. **`verify` legacy cruft（第三轮 P2-verify + 第四轮 P3）**：
+   - (a) 手写一份旧 manifest 含 `Thumbs.db` 条目 + 盘上有 Thumbs.db → verify summary 报 0 缺失
+   - (b) 同上但 Thumbs.db 已被用户删 → 同样 0 缺失
+   - (c) **跨平台**：旧 manifest 含 `子目录\\Thumbs.db` 条目（注意 `\\` 分隔，模拟 Windows 写入的旧清单）→ 不管在 Windows 还是 Linux 跑测试,`cruft::leaf_name_from_rel` 都正确取出 `Thumbs.db`,verify 0 缺失
+9. **第四轮 P2 `folder_stats` 错误暴露**：含一个不可读子目录的源目录 → `folder_stats` 返回 `enum_errors` 非空；`bftool archive --dry-run` 输出含 `[演练] 枚举失败：...` 和"统计可能不完整"warn
+10. **第四轮 P3 `cruft::leaf_name_from_rel`** 单元测试:
+    - `"Thumbs.db"` → `"Thumbs.db"`
+    - `"foo\\Thumbs.db"` → `"Thumbs.db"`
+    - `"a/b/Thumbs.db"` → `"Thumbs.db"`
+    - `"a/b\\Thumbs.db"` → `"Thumbs.db"`(混用)
+    - `""` → `""`
 
 ## 7. 不做的事（明确边界）
 
@@ -409,10 +445,10 @@ for rec in rdr.records().flatten() {
 
 | 文件 | 改动 |
 |---|---|
-| `crates/bftool-core/src/engine/cruft.rs` | 新建：名单 + 共享 `walk()` |
+| `crates/bftool-core/src/engine/cruft.rs` | 新建：名单 + 共享 `walk()` + 跨平台 `leaf_name_from_rel(rel)`（第四轮 P3） |
 | `crates/bftool-core/src/engine/mod.rs` | `pub mod cruft;` |
 | `crates/bftool-core/src/engine/manifest.rs` | `real_files` 改签名 + 用 `cruft::walk` + 收集错误；`build` 改 metadata/hash 错误收集语义 |
-| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail + 签名加 `reporter: &dyn Reporter`；新增 `FolderStats` 结构和 `folder_stats()` 函数（取代 `folder_size`）；`handle_one` 的 dry-run 分支报告"X 个文件 Y GB" |
+| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail + 签名加 `reporter: &dyn Reporter`；新增 `FolderStats { files, bytes, enum_errors }` 结构和 `folder_stats()` 函数（取代 `folder_size`，**含 enum_errors 暴露**——第四轮 P2）；`handle_one` 的 dry-run 分支报告"X 个文件 Y GB"，**有枚举错误时输出 warn 提示统计可能不完整**（第四轮 P2） |
 | `crates/bftool-core/src/engine/safety.rs` | `folder_stable` 改用 `cruft::walk`（第三轮 P1） |
 | `crates/bftool-core/src/engine/verify.rs` | 两处改：(a) 扫"清单外多余"那段改用 `cruft::walk` + walkdir 错误计入 bad；(b) 读旧 manifest 时跳过 legacy cruft 条目（第三轮 P2-verify） |
 | `README.md` | 「设计原则」一节加一条「OS 杂文件自动排除」；FAQ 加一条「我看 manifest 文件数少了几个，怎么回事」→「Thumbs.db 等已自动排除」 |
