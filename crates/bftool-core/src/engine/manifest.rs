@@ -10,8 +10,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use walkdir::WalkDir;
 
+use crate::engine::cruft;
 use crate::reporter::Reporter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,29 +76,30 @@ impl Manifest {
 /// 列举一个文件夹下所有真实文件。
 /// - 不进入目录链接（symlink/junction）
 /// - 跳过文件 reparse point
-/// - 出错的子项记日志后跳过，不让整轮失败
-///
-/// TODO(Batch 3)：默认改为"枚举失败 → 当前项目失败"；仅当显式 --allow-skip-errors 时才跳过。
-fn real_files(root: &Path, reporter: &dyn Reporter) -> Vec<PathBuf> {
+/// - 跳过 cruft（Thumbs.db、$RECYCLE.BIN 等）
+/// - 枚举失败 → 收集所有错误,本项目 bail（D4 一次输出）；本项目跳过,不影响后续项目；下次运行重做。
+fn real_files(root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    let walker = WalkDir::new(root)
-        .follow_links(false) // 不递归进 symlink/junction
-        .into_iter();
-    for entry in walker {
+    let mut errors: Vec<String> = Vec::new();
+
+    for entry in cruft::walk(root) {
         match entry {
-            Ok(e) => {
-                let ft = e.file_type();
-                if ft.is_file() {
-                    // walkdir 已经在 follow_links=false 时跳过链接，无需再判
-                    out.push(e.into_path());
-                }
-            }
-            Err(err) => {
-                reporter.warn(&format!("枚举文件时跳过一项：{}", err));
-            }
+            Ok(e) if e.file_type().is_file() => out.push(e.into_path()),
+            Ok(_) => continue,
+            Err(err) => errors.push(format!("{}", err)),
         }
     }
-    out
+
+    if !errors.is_empty() {
+        for e in &errors {
+            reporter.error(&format!("枚举失败：{}", e));
+        }
+        anyhow::bail!(
+            "枚举本项目时遇到 {} 个错误（详见上方）→ 本项目跳过,不影响后续项目；下次运行会重做。",
+            errors.len()
+        );
+    }
+    Ok(out)
 }
 
 pub struct ManifestOpts {
@@ -107,7 +108,7 @@ pub struct ManifestOpts {
 
 /// 生成文件夹清单。`no_hash=true` 时 Hash 字段为空串。
 pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result<Manifest> {
-    let files = real_files(root, reporter);
+    let files = real_files(root, reporter)?;
     let total_bytes: u64 = files
         .iter()
         .filter_map(|p| p.metadata().ok().map(|m| m.len()))
@@ -117,11 +118,17 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 
     let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut entries = Vec::with_capacity(files.len());
+    let mut metadata_errors: Vec<String> = Vec::new();
+    let mut hash_errors: Vec<String> = Vec::new();
 
     for f in &files {
-        let meta = f
-            .metadata()
-            .with_context(|| format!("读元数据失败：{}", f.display()))?;
+        let meta = match f.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                metadata_errors.push(format!("{}: {}", f.display(), e));
+                continue;
+            }
+        };
         let size = meta.len();
         let mtime = system_time_to_rfc3339(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         let rel = path_relative(&base, f);
@@ -129,7 +136,13 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
         let hash = if opts.no_hash {
             String::new()
         } else {
-            sha256_hex(f)?
+            match sha256_hex(f) {
+                Ok(h) => h,
+                Err(e) => {
+                    hash_errors.push(format!("{}: {}", f.display(), e));
+                    continue;
+                }
+            }
         };
 
         bar.inc(size);
@@ -141,6 +154,20 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
         });
     }
     bar.finish();
+
+    if !metadata_errors.is_empty() || !hash_errors.is_empty() {
+        for e in &metadata_errors {
+            reporter.error(&format!("读元数据失败：{}", e));
+        }
+        for e in &hash_errors {
+            reporter.error(&format!("读文件内容失败：{}", e));
+        }
+        anyhow::bail!(
+            "本项目有 {} 个元数据失败、{} 个内容读取失败 → 本项目跳过,下次重做。",
+            metadata_errors.len(),
+            hash_errors.len()
+        );
+    }
     Ok(Manifest { entries })
 }
 
