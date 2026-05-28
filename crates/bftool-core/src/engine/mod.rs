@@ -12,6 +12,7 @@
 //! - paths.rs    ── 盘内/系统路径常量与构造
 
 pub mod archive;
+pub mod archive_test;
 pub mod cruft;
 pub mod drive;
 pub mod find;
