@@ -1,0 +1,9 @@
+# 强制文本文件统一 LF 行尾，避免 Windows / macOS / Linux 协作时 CRLF 污染。
+* text=auto eol=lf
+
+# 二进制保持原样
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.zip binary

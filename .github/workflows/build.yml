@@ -1,0 +1,85 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags:    [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: cargo check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true   # 格式不阻断构建，留作 advisory
+      - name: cargo check
+        run: cargo check --all-targets --locked || cargo check --all-targets
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true   # MVP 阶段先 advisory，稳定后再 strict
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: check
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build release
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: package
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bftool.exe" "$dist/bftool.exe"
+          Copy-Item "bftool.toml.example" "$dist/bftool.toml.example"
+          Copy-Item "README.md" "$dist/README.md"
+          Copy-Item "LICENSE" "$dist/LICENSE"
+          Compress-Archive -Path "$dist/*" -DestinationPath "bftool-${{ matrix.target }}.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bftool-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/bftool.exe
+            bftool-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/bftool-*.zip
+            artifacts/**/bftool.exe
+          generate_release_notes: true

@@ -1,0 +1,552 @@
+//! 主归档流程：扫描 → 稳定性 → 容量 → 复制 → 校验 → 复核源 → 事务式提交。
+//!
+//! 顺序与不变量（与 PowerShell 旧版一致，且经实测）：
+//! 1. 多块未封盘备份盘同时在线 → 立即停止（防写错盘）
+//! 2. 单项目 try/catch 隔离，意外只跳过该项目不中断整轮
+//! 3. 校验失败时把目标侧坏文件移到 异常文件/，下次自动重传
+//! 4. 移动源前再次比对源（防"备份的是旧版本"）
+//! 5. 写事务标记 → 移动源 → 写清单/索引 → 删标记（宁可漏写索引也不要"假装归档好了"）
+
+use anyhow::{Context, Result};
+use chrono::{Local, Utc};
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+use crate::engine::drive::{self, DriveInfo};
+use crate::engine::manifest::{self, ManifestOpts};
+use crate::engine::{paths, safety, txn};
+use crate::ui;
+
+#[derive(Debug, Default)]
+pub struct Options {
+    pub dry_run: bool,
+    pub no_hash: bool,
+    pub limit: usize,
+    pub drive_letter_override: Option<String>,
+}
+
+pub fn run(cfg: &Config, opts: Options) -> Result<()> {
+    // 准备系统目录
+    fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
+    fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
+    fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
+
+    // 启动自检：上次的事务标记是不是残留？
+    check_pending_txn(cfg)?;
+
+    // 找当前可用备份盘
+    let drive = match opts.drive_letter_override.as_deref() {
+        Some(letter) => drive::info_by_letter(letter)?,
+        None => match drive::pick_active()? {
+            Some(d) => d,
+            None => {
+                ui::error("未发现已初始化且未封盘的备份盘。");
+                ui::info("插入空盘后运行：bftool init <盘符>（例：bftool init E）");
+                return Ok(());
+            }
+        },
+    };
+    if drive.sealed {
+        ui::error(format!(
+            "盘 {} ({}:) 已封盘，禁止写入。请换上一块未封盘的备份盘或初始化新盘。",
+            drive.id, drive.letter
+        ));
+        return Ok(());
+    }
+
+    ui::ok(format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
+
+    // 路径安全检查
+    let warnings = safety::check_paths(
+        &cfg.ready_root,
+        &cfg.archived_root,
+        &cfg.system_root,
+        Some(&drive.root),
+    )?;
+    for w in warnings {
+        ui::warn(w);
+    }
+
+    // 列出待归档项目
+    if !cfg.ready_root.is_dir() {
+        ui::error(format!("待备份 不存在：{}", cfg.ready_root.display()));
+        return Ok(());
+    }
+    let mut projects: Vec<_> = fs::read_dir(&cfg.ready_root)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    // 按文件夹名前导数字升序，无数字前缀的排最后
+    projects.sort_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        leading_number(name).unwrap_or(u64::MAX)
+    });
+    if projects.is_empty() {
+        ui::info("待备份 中没有待归档项目，结束。");
+        return Ok(());
+    }
+    ui::info(format!("发现 {} 个待归档项目（按编号升序处理）。", projects.len()));
+
+    let mut handled = 0usize;
+    for proj in &projects {
+        if opts.limit > 0 && handled >= opts.limit {
+            ui::action(format!(
+                "已达本次处理上限（{} 个项目），停止；剩余项目下次运行继续。",
+                opts.limit
+            ));
+            break;
+        }
+        match handle_one(cfg, &drive, proj, &opts) {
+            Ok(HandleOutcome::Done) => handled += 1,
+            Ok(HandleOutcome::Skipped) => {}
+            Ok(HandleOutcome::DriveSealed) => {
+                ui::action("本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。");
+                break;
+            }
+            Err(e) => {
+                let name = proj.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                ui::error(format!("项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。", name, e));
+                append_manual(cfg, &name, &format!("未捕获异常：{}", e))?;
+            }
+        }
+    }
+    ui::ok("本轮结束。");
+    Ok(())
+}
+
+enum HandleOutcome {
+    Done,
+    Skipped,
+    DriveSealed,
+}
+
+fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options) -> Result<HandleOutcome> {
+    let name = proj_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("无效的项目目录名"))?
+        .to_string();
+    let proj_no = leading_digits(&name);
+    ui::action(format!("=== 处理: {} ===", name));
+
+    // 稳定性
+    let st = safety::folder_stable(proj_path, cfg.stable_minutes);
+    if !st.stable {
+        ui::warn(format!("跳过（未稳定）：{}", st.reason));
+        return Ok(HandleOutcome::Skipped);
+    }
+
+    // 体积 + 目标已存在量（断点续传时仅按"还需写入"判断）
+    let size = folder_size(proj_path);
+    let size_gb = size as f64 / 1024.0 / 1024.0 / 1024.0;
+
+    // 重名保护
+    let mut dest_name = name.clone();
+    let catalog = paths::drive_catalog_path(&drive.root);
+    let dup_in_drive = catalog_has_project(&catalog, &name).unwrap_or(false);
+    if dup_in_drive {
+        let stamp = Local::now().format("%Y%m%d%H%M%S");
+        dest_name = format!("{}_{}", name, stamp);
+        ui::action(format!(
+            "本盘已存在同名历史备份『{}』→ 为避免污染旧备份，本次改用唯一名『{}』。",
+            name, dest_name
+        ));
+    }
+    let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
+    let dest_have = if dest.is_dir() { folder_size(&dest) } else { 0 };
+    let need = size.saturating_sub(dest_have);
+
+    // 容量
+    let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
+    if size > drive.total_bytes.saturating_sub(reserve) {
+        ui::error(format!(
+            "项目 {:.2}GB 超过单盘容量，空盘也放不下 → 需人工拆分",
+            size_gb
+        ));
+        append_manual(cfg, &name, &format!("{:.2}GB 超过单盘容量，需拆分或显式跨盘", size_gb))?;
+        return Ok(HandleOutcome::Skipped);
+    }
+    if need.saturating_add(reserve) > drive.free_bytes {
+        let need_gb = need as f64 / 1024.0 / 1024.0 / 1024.0;
+        let free_gb = drive.free_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        ui::warn(format!(
+            "盘 {} 余量不足以放下 {}（还需约 {:.2}GB + 余量；当前剩余 {:.2}GB）。封盘并请换下一块盘后重跑。",
+            drive.id, name, need_gb, free_gb
+        ));
+        drive::seal(drive).context("封盘失败")?;
+        ui::action(format!(
+            "已封盘 {}。取下本盘、插上下一块空盘(NTFS)后，运行 `bftool init <盘符>` 初始化再继续。",
+            drive.id
+        ));
+        return Ok(HandleOutcome::DriveSealed);
+    }
+
+    if opts.dry_run {
+        ui::info(format!("[演练] 将归档 {} ({:.2}GB) → {}", name, size_gb, drive.id));
+        return Ok(HandleOutcome::Done);
+    }
+
+    // 生成源清单
+    ui::info(format!("生成源清单/校验和（{:.2}GB，可能较慢）…", size_gb));
+    let src = manifest::build(proj_path, ManifestOpts { no_hash: opts.no_hash })?;
+
+    // 复制
+    fs::create_dir_all(&dest).context("创建目标目录失败")?;
+    ui::info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
+    copy_folder(proj_path, &dest)?;
+    ui::info("复制完成，开始校验…");
+
+    // 目标清单 + 比对
+    let dst = manifest::build(&dest, ManifestOpts { no_hash: opts.no_hash })?;
+    let d = manifest::diff(&src, &dst, !opts.no_hash);
+    if !d.ok {
+        ui::error(format!("校验失败：{} → 不写索引、不移动源。", d.reasons.join("; ")));
+        // 隔离坏文件，让下次 robocopy 风格的"补传"再来一遍
+        if !d.bad_dst_rels.is_empty() {
+            let quar = paths::drive_quarantine_dir(&drive.root).join(&name);
+            let mut moved = 0usize;
+            for rel in &d.bad_dst_rels {
+                let src_p = dest.join(rel);
+                if src_p.exists() {
+                    let dst_p = quar.join(rel);
+                    if let Some(p) = dst_p.parent() {
+                        fs::create_dir_all(p).ok();
+                    }
+                    if let Err(e) = fs::rename(&src_p, &dst_p) {
+                        ui::warn(format!("隔离失败 {}：{}（请手动检查 {}）", rel, e, src_p.display()));
+                    } else {
+                        moved += 1;
+                    }
+                }
+            }
+            ui::action(format!(
+                "已将 {} 个损坏/多余的目标文件移到：{} → 下次运行会自动补传并重新校验。",
+                moved,
+                quar.display()
+            ));
+        }
+        append_manual(cfg, &name, &format!("校验失败：{}", d.reasons.join("; ")))?;
+        return Ok(HandleOutcome::Skipped);
+    }
+
+    // 复核源在复制期间未变化
+    ui::info("复核源文件在复制期间未变化…");
+    let src2 = manifest::build(proj_path, ManifestOpts { no_hash: opts.no_hash })?;
+    let (changed, why) = manifest::source_changed(&src, &src2, opts.no_hash);
+    if changed {
+        ui::error(format!(
+            "源在复制期间发生变化（{}）→ 不移动源、不写索引；该项目保留在 待备份，下次重做。",
+            why.join("; ")
+        ));
+        append_manual(cfg, &name, &format!("源在复制期间变化：{}", why.join("; ")))?;
+        return Ok(HandleOutcome::Skipped);
+    }
+
+    // 事务式提交
+    let local_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let utc = Utc::now().to_rfc3339();
+    let src_bytes = src.total_bytes();
+    let size_gbval = src_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    let verify_status = if opts.no_hash { "SIZE+COUNT" } else { "SHA256-OK" };
+    let manifest_path = paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
+    let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
+    let mut arch_dest = cfg.archived_root.join(&name);
+    if arch_dest.exists() {
+        let stamp = Local::now().format("%Y%m%d%H%M%S");
+        arch_dest = cfg.archived_root.join(format!("{}_{}", name, stamp));
+    }
+
+    let txn_path = paths::system_pending_txn(&cfg.system_root);
+    let pending = txn::PendingTxn {
+        project_dest_name: dest_name.clone(),
+        project_src_name: name.clone(),
+        drive_id: drive.id.clone(),
+        drive_letter: drive.letter.clone(),
+        in_drive_path: format!("项目\\{}", dest_name),
+        src_path: proj_path.display().to_string(),
+        move_to: arch_dest.display().to_string(),
+        started_at: local_time.clone(),
+    };
+    pending.write(&txn_path)?;
+
+    // 移动源（先动它；失败抛错 → 不写索引；源留在 待备份 下次重做）
+    fs::rename(proj_path, &arch_dest).with_context(|| {
+        format!(
+            "移动源失败：{} → {}",
+            proj_path.display(),
+            arch_dest.display()
+        )
+    })?;
+
+    // 写清单 + 本盘索引 + 全局索引
+    src.write_csv(&manifest_path)?;
+    append_drive_catalog(
+        &catalog,
+        &DriveCatalogRow {
+            project_no: proj_no,
+            project_name: dest_name.clone(),
+            file_count: src.count() as u64,
+            total_bytes: src_bytes,
+            archived_utc: utc.clone(),
+            verify_status: verify_status.to_string(),
+            status: "Complete".to_string(),
+            notes: if dup_in_drive { format!("原名 {}", name) } else { String::new() },
+        },
+    )?;
+    append_global_catalog(
+        &paths::system_global_catalog(&cfg.system_root),
+        &GlobalCatalogRow {
+            folder_name: dest_name.clone(),
+            drive_name: drive.id.clone(),
+            archived_time: local_time.clone(),
+            project_no: leading_digits(&name),
+            in_drive_path: format!("项目\\{}", dest_name),
+            file_count: src.count() as u64,
+            size_gb: size_gbval,
+            verify: verify_status.to_string(),
+            manifest_path: rel_manifest,
+        },
+    )?;
+
+    txn::PendingTxn::clear(&txn_path)?;
+    ui::ok(format!(
+        "✓ {} 归档+校验成功 → {}\\项目\\{}；SSD 源已移到 已备份（未删除）。",
+        name, drive.id, dest_name
+    ));
+    Ok(HandleOutcome::Done)
+}
+
+#[derive(Debug, Serialize)]
+struct DriveCatalogRow {
+    #[serde(rename = "ProjectNo")]
+    project_no: String,
+    #[serde(rename = "ProjectName")]
+    project_name: String,
+    #[serde(rename = "FileCount")]
+    file_count: u64,
+    #[serde(rename = "TotalBytes")]
+    total_bytes: u64,
+    #[serde(rename = "ArchivedUTC")]
+    archived_utc: String,
+    #[serde(rename = "VerifyStatus")]
+    verify_status: String,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "Notes")]
+    notes: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GlobalCatalogRow {
+    #[serde(rename = "文件夹名")]
+    folder_name: String,
+    #[serde(rename = "备份盘名")]
+    drive_name: String,
+    #[serde(rename = "备份时间")]
+    archived_time: String,
+    #[serde(rename = "编号")]
+    project_no: String,
+    #[serde(rename = "盘内路径")]
+    in_drive_path: String,
+    #[serde(rename = "文件数")]
+    file_count: u64,
+    #[serde(rename = "大小GB")]
+    size_gb: f64,
+    #[serde(rename = "校验方式")]
+    verify: String,
+    #[serde(rename = "校验清单")]
+    manifest_path: String,
+}
+
+fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
+    let file_existed = path.is_file();
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(!file_existed)
+        .from_writer(file);
+    wtr.serialize(row)?;
+    wtr.flush()?;
+    Ok(())
+}
+
+fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
+    let file_existed = path.is_file();
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(!file_existed)
+        .from_writer(file);
+    wtr.serialize(row)?;
+    wtr.flush()?;
+    Ok(())
+}
+
+fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
+    if !catalog.is_file() {
+        return Ok(false);
+    }
+    let mut rdr = csv::Reader::from_path(catalog)?;
+    let headers = rdr.headers()?.clone();
+    let Some(col) = headers.iter().position(|h| h == "ProjectName") else {
+        return Ok(false);
+    };
+    for rec in rdr.records().flatten() {
+        if rec.get(col).map(|v| v == project_name).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
+    let path = paths::system_need_manual(&cfg.system_root);
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p).ok();
+    }
+    let line = format!(
+        "{}\t{}\t{}\n",
+        Local::now().format("%Y-%m-%d %H:%M"),
+        name,
+        why
+    );
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    f.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn check_pending_txn(cfg: &Config) -> Result<()> {
+    let path = paths::system_pending_txn(&cfg.system_root);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let text = txn::PendingTxn::read_text(&path)?;
+    let pname = grab_field(&text, "项目").unwrap_or_default();
+    let psrc = grab_field(&text, "源名").unwrap_or_else(|| pname.clone());
+    let parch = grab_field(&text, "将移至").unwrap_or_default();
+    let in_ready = !psrc.is_empty() && cfg.ready_root.join(&psrc).exists();
+    let moved = !parch.is_empty() && Path::new(&parch).exists();
+    let global = paths::system_global_catalog(&cfg.system_root);
+    let indexed = global_has_folder(&global, &pname).unwrap_or(false);
+
+    ui::action(format!("发现上次未完成的事务（项目：{}）。", pname));
+    if in_ready {
+        ui::action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。已清除旧标记。");
+        let _ = fs::remove_file(&path);
+    } else if moved && indexed {
+        ui::action("→ 已移动且索引中已有记录，判定为已完成（仅标记残留）。已自动清除标记。");
+        let _ = fs::remove_file(&path);
+    } else if moved && !indexed {
+        ui::error(format!(
+            "→ 源已移到『已备份』但全局索引可能漏写：数据应在备份盘 {}。请人工核对并在索引中补登；标记保留。",
+            parch
+        ));
+    } else {
+        ui::error(format!(
+            "→ 无法自动判定（源不在待备份、目标也未确认）。请按以下信息人工核对，标记保留：\n{}",
+            text
+        ));
+    }
+    Ok(())
+}
+
+fn grab_field(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        // 兼容 "key:" 和 "key  :" 写法（PowerShell 旧版用全角/空格混排）
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(key) {
+            let r = rest.trim_start();
+            let r = r.trim_start_matches([':', '：']).trim();
+            return Some(r.to_string());
+        }
+    }
+    None
+}
+
+fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
+    if !global.is_file() {
+        return Ok(false);
+    }
+    let mut rdr = csv::Reader::from_path(global)?;
+    let headers = rdr.headers()?.clone();
+    let Some(col) = headers.iter().position(|h| h == "文件夹名") else {
+        return Ok(false);
+    };
+    for rec in rdr.records().flatten() {
+        if rec.get(col).map(|v| v == folder_name).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn folder_size(p: &Path) -> u64 {
+    walkdir::WalkDir::new(p)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// 简单的递归复制；与 robocopy 比缺少 /Z 断点续传中段恢复，但小文件/中等大小够用。
+/// 已存在且大小相同的文件直接跳过（保留断点续传的核心语义）。
+fn copy_folder(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).ok();
+    for entry in walkdir::WalkDir::new(src).follow_links(false) {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(src)?;
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).ok();
+        } else if entry.file_type().is_file() {
+            // 已存在且大小一致 → 视为已传，跳过（与 robocopy 的默认行为一致）
+            if let (Ok(meta_src), Ok(meta_dst)) = (path.metadata(), target.metadata()) {
+                if meta_src.len() == meta_dst.len() {
+                    continue;
+                }
+            }
+            if let Some(p) = target.parent() {
+                fs::create_dir_all(p).ok();
+            }
+            fs::copy(path, &target)
+                .with_context(|| format!("复制失败：{} → {}", path.display(), target.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn leading_number(name: &str) -> Option<u64> {
+    let s = name.trim_start();
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u64>().ok()
+    }
+}
+
+fn leading_digits(name: &str) -> String {
+    let s = name.trim_start();
+    s.chars().take_while(|c| c.is_ascii_digit()).collect()
+}

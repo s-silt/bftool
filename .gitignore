@@ -1,0 +1,27 @@
+# Rust
+/target
+/Cargo.lock.bak
+**/*.rs.bk
+*.pdb
+
+# IDE
+/.vscode
+/.idea
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# 用户私有配置（默认配置示例在 bftool.toml.example）；只忽略仓库根目录下的，避免误伤 .cargo/config.toml
+/bftool.toml
+/config.toml
+
+# 编译产物
+/dist
+*.exe
+
+# 临时
+/.bftool-scratch

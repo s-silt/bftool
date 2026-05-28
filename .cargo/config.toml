@@ -1,0 +1,10 @@
+# 让 release 构建静态链接 CRT，产出的 bftool.exe 不依赖 vcruntime140.dll，
+# 用户拿到一个文件即可双击运行，无需安装 VC++ 运行库 / 任何外部依赖。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
