@@ -16,7 +16,7 @@ use std::path::Path;
 use crate::config::Config;
 use crate::engine::drive::{self, DriveInfo};
 use crate::engine::manifest::{self, ManifestOpts};
-use crate::engine::{paths, safety, txn};
+use crate::engine::{cruft, paths, safety, txn};
 use crate::reporter::Reporter;
 
 #[derive(Debug, Default)]
@@ -157,7 +157,8 @@ fn handle_one(
     }
 
     // 体积 + 目标已存在量（断点续传时仅按"还需写入"判断）
-    let size = folder_size(proj_path);
+    let stats = folder_stats(proj_path);
+    let size = stats.bytes;
     let size_gb = size as f64 / 1024.0 / 1024.0 / 1024.0;
 
     // 重名保护
@@ -173,7 +174,11 @@ fn handle_one(
         ));
     }
     let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
-    let dest_have = if dest.is_dir() { folder_size(&dest) } else { 0 };
+    let dest_have = if dest.is_dir() {
+        folder_stats(&dest).bytes
+    } else {
+        0
+    };
     let need = size.saturating_sub(dest_have);
 
     // 容量
@@ -207,9 +212,25 @@ fn handle_one(
 
     if opts.dry_run {
         reporter.info(&format!(
-            "[演练] 将归档 {} ({:.2}GB) → {}",
-            name, size_gb, drive.id
+            "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
+            name, stats.files, size_gb, drive.id
         ));
+        if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
+            for e in &stats.enum_errors {
+                reporter.warn(&format!("[演练] 枚举失败：{}", e));
+            }
+            for e in &stats.metadata_errors {
+                reporter.warn(&format!("[演练] 读元数据失败：{}", e));
+            }
+            reporter.warn(&format!(
+                "[演练] {} 项目的统计可能不完整 ({} 个枚举错误 + {} 个 metadata 错误)。\
+                 正式归档会因为同样的错误失败 —— 请先解决环境问题(权限拒绝？路径过长？\
+                 被 AV 锁住？)再去掉 --dry-run 跑。",
+                name,
+                stats.enum_errors.len(),
+                stats.metadata_errors.len()
+            ));
+        }
         return Ok(HandleOutcome::Done);
     }
 
@@ -226,7 +247,7 @@ fn handle_one(
     // 复制
     fs::create_dir_all(&dest).context("创建目标目录失败")?;
     reporter.info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
-    copy_folder(proj_path, &dest)?;
+    copy_folder(proj_path, &dest, reporter)?;
     reporter.info("复制完成，开始校验…");
 
     // 目标清单 + 比对
@@ -557,25 +578,49 @@ fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn folder_size(p: &Path) -> u64 {
-    walkdir::WalkDir::new(p)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+#[derive(Debug, Clone, Default)]
+pub struct FolderStats {
+    pub files: u64,
+    pub bytes: u64,
+    pub enum_errors: Vec<String>,
+    pub metadata_errors: Vec<String>,
+}
+
+fn folder_stats(p: &Path) -> FolderStats {
+    let mut s = FolderStats::default();
+    for entry in cruft::walk(p) {
+        match entry {
+            Ok(e) if e.file_type().is_file() => {
+                s.files += 1;
+                match e.metadata() {
+                    Ok(m) => s.bytes += m.len(),
+                    Err(err) => s
+                        .metadata_errors
+                        .push(format!("{}: {}", e.path().display(), err)),
+                }
+            }
+            Ok(_) => continue,
+            Err(err) => s.enum_errors.push(format!("{}", err)),
+        }
+    }
+    s
 }
 
 /// 简单的递归复制；与 robocopy 比缺少 /Z 断点续传中段恢复，但小文件/中等大小够用。
 /// 已存在且大小相同的文件直接跳过（保留断点续传的核心语义）。
 ///
 /// TODO(Batch 4)：改为 .bftool-part 临时文件 + 写完 sync + 重读目标算 hash + 原子 rename。
-fn copy_folder(src: &Path, dst: &Path) -> Result<()> {
+fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
     fs::create_dir_all(dst).ok();
-    for entry in walkdir::WalkDir::new(src).follow_links(false) {
-        let entry = entry?;
+    let mut errors: Vec<String> = Vec::new();
+    for entry in cruft::walk(src) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                errors.push(format!("{}", err));
+                continue;
+            }
+        };
         let path = entry.path();
         let rel = path.strip_prefix(src)?;
         let target = dst.join(rel);
@@ -594,6 +639,12 @@ fn copy_folder(src: &Path, dst: &Path) -> Result<()> {
             fs::copy(path, &target)
                 .with_context(|| format!("复制失败：{} → {}", path.display(), target.display()))?;
         }
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            reporter.error(&format!("复制阶段枚举源失败：{}", e));
+        }
+        anyhow::bail!("复制阶段枚举源失败 {} 项 → 本项目跳过。", errors.len());
     }
     Ok(())
 }
