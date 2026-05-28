@@ -38,7 +38,7 @@ D3 / D5 即「简化」相对路线图原 Batch 3 的具体内容。
 
 ### 4.1 新增 `crates/bftool-core/src/engine/cruft.rs`
 
-包含 cruft 名单 + **共享的 cruft-aware walker**。manifest / copy / size 统计 / verify 四处都用同一个 walker，保证 cruft 在所有路径上的处理一致 —— 不进 manifest、**不复制到机械盘**、不算入 folder_stats、verify 也不报"清单外多余"。
+包含 cruft 名单 + **共享的 cruft-aware walker**。**五处** `archive::handle_one` 会走的目录遍历都用同一个 walker —— 稳定性检测 / manifest / copy / size 统计 / verify —— 保证 cruft 在所有路径上的处理一致：不卡稳定性检测、不进 manifest、**不复制到机械盘**、不算入 folder_stats、verify 也不报"清单外多余"。
 
 ```rust
 //! OS 注入的杂文件 / 目录，默认从 manifest、复制、容量统计全部排除。
@@ -220,6 +220,57 @@ if opts.dry_run {
 2. 真实错误会在后续 `manifest::build` 调用 `real_files` 时被收集并 bail（Spec §4.2）
 3. 让 folder_stats 也 bail 会导致 dry-run 在仅"想看看会做什么"的场景下也直接报错，反而不友好
 
+### 4.2d 改造 `safety::folder_stable`（**user-review-第三轮 P1 修复**）
+
+`safety::folder_stable` 是 `archive::handle_one` 的**第一关**（在 manifest / copy / stats 之前）。
+当前实现裸跑 `WalkDir`：
+
+```rust
+// crates/bftool-core/src/engine/safety.rs:101 当前实现
+for entry in WalkDir::new(root).follow_links(false) {
+    let Ok(e) = entry else { continue };
+    if !e.file_type().is_file() { continue; }
+    // 检查 mtime > cutoff、试图 File::open
+}
+```
+
+Thumbs.db 被 antivirus 持续触碰是 Windows 上的常态，会让稳定性检测报"最近被修改"或"被占用"，**项目根本走不到 manifest 阶段就被早退**。这正好违反 Spec A "OS 杂文件不影响项目"的目标。
+
+修复：
+
+```rust
+pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
+    let cutoff = SystemTime::now() - Duration::from_secs(minutes * 60);
+    for entry in cruft::walk(root) {  // 改用共享 walker（自动跳 cruft）
+        let Ok(e) = entry else {
+            // 稳定性检测对 walkdir 错误**保持原 swallow 语义**：
+            // 真实枚举错误会在后续 manifest::real_files 阶段被收集并 bail。
+            // 让稳定性检测也 bail 会让单个"权限拒绝"在第一关就把项目挡掉，
+            // 用户看不到 manifest 阶段更详细的多文件错误汇总。
+            continue;
+        };
+        if !e.file_type().is_file() { continue; }
+        if let Ok(meta) = e.metadata() {
+            if let Ok(mt) = meta.modified() {
+                if mt > cutoff {
+                    return StableCheck { stable: false, reason: format!(
+                        "最近被修改：{}", e.file_name().to_string_lossy()
+                    )};
+                }
+            }
+        }
+        if let Err(err) = File::open(e.path()) {
+            return StableCheck { stable: false, reason: format!(
+                "被占用/无法读取：{}（{}）", e.file_name().to_string_lossy(), err
+            )};
+        }
+    }
+    StableCheck { stable: true, reason: String::new() }
+}
+```
+
+副效应：被 antivirus 锁的 Thumbs.db / .DS_Store 不再触发"未稳定"。
+
 ### 4.3 `manifest::build` 与 metadata 错误
 
 `build` 内部已经是 `.with_context(...)?` 立即抛错 —— 这本来就是 strict 行为。但要按 D4 调整为「收集所有 metadata 错误后一次报告」：
@@ -272,9 +323,11 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 }
 ```
 
-### 4.4 verify.rs：小改（**user review 后修订**）
+### 4.4 verify.rs：两处改（**user-review 三轮累计**）
 
-P2.2 指出 verify.rs 的 `WalkDir::new(&proj_dir)` 在 `let Ok(entry) = entry else { continue }` 处 swallow walkdir 错误。verify 是"扫一遍出报告"型命令（不像 archive 是"成功才算数"型），所以我们**不**让 verify 早退；但 walkdir 错误必须**计入 bad 总数**让用户看见，不是默默 continue。
+verify 有**两条**遍历路径，要分别处理：
+
+**(a) 清单外多余文件扫描**（已在 verify.rs:130 附近）—— P2.2 + 三轮 P2-A 修复：用 `cruft::walk`，walkdir 错误计入 bad：
 
 ```rust
 for entry in cruft::walk(&proj_dir) {
@@ -286,11 +339,35 @@ for entry in cruft::walk(&proj_dir) {
             continue;
         }
     };
-    // ... 余下逻辑不变
+    // ... 余下逻辑不变（检查是否在 expected 里，不在则 extra++）
 }
 ```
 
-副带好处：verify 也用 `cruft::walk` → 不会再报 cruft 文件「多余(清单外)」（之前的 verify 因为不知道 cruft 概念，会把 Thumbs.db 当作"清单外多余"warn）。
+副效应：verify 不会再把 cruft 文件当"清单外多余"warn。
+
+**(b) 旧 manifest 逐行 check**（verify.rs:87 附近）—— **第三轮 P2 修复**：
+
+verify 第一条路是读 manifest 里的每个 `Rel` 去 check 文件存在 / 大小 / 哈希。如果旧 manifest **（Batch 3 之前归档的项目）**里登记过 `Thumbs.db`，新代码会让它变成"缺失"（用户手动删了）或"读取失败"（被锁）。
+
+修复：读 manifest 行时，如果 `Rel` 的叶子名命中 cruft 规则，**跳过该条目** —— 既不进 expected、也不 check。这相当于把"旧清单里的 cruft 条目"视为"工具不再关心的遗留"，跟新清单不再登记 cruft 行为一致。
+
+```rust
+for rec in rdr.records().flatten() {
+    let rel = rec.get(i_rel).unwrap_or("").to_string();
+    if let Some(leaf) = std::path::Path::new(&rel).file_name() {
+        let leaf_str = leaf.to_string_lossy();
+        if cruft::is_cruft_file(&leaf_str) {
+            // legacy cruft：旧清单有这条，但 Batch 3 后我们不再关心 cruft
+            // → 不加入 expected，不 check 存在/大小/哈希
+            // → 用户手动删 Thumbs.db 不会被报"缺失"；被 AV 锁也不会读取失败
+            continue;
+        }
+    }
+    // ... 余下逻辑不变（expected.insert + check）
+}
+```
+
+> 不对"旧 cruft 目录条目"做处理：cruft 目录不会出现在旧 manifest 里，因为 PowerShell 旧版和 Rust 之前的版本都只记录文件,不记目录。如果以后真出现这种边角情况,用户跑 verify 会看到"缺失"warn，这是可见信号，不会引起静默错误。
 
 ### 4.5 不改的地方
 
@@ -318,6 +395,8 @@ for entry in cruft::walk(&proj_dir) {
 4. `real_files`：含一个不可读子目录 → 返回 `Err`，错误信息提到该子目录
 5. `manifest::build`：3 个文件中 1 个 metadata 失败 → 错误信息列出失败的那 1 个的路径，不混淆其它 2 个
 6. 集成测试：`bftool archive --dry-run` 在含 cruft 的源目录上，输出"X 个文件"的统计**不**包含 cruft
+7. **`safety::folder_stable`（第三轮 P1）**：(a) 含一个 5 分钟前刚改的 Thumbs.db + 一个 1 小时前的真实项目文件 → 返回 stable=true（cruft 不算入稳定性）；(b) 含一个被独占锁住的 Thumbs.db → stable=true
+8. **`verify` legacy cruft（第三轮 P2-verify）**：(a) 手写一份旧 manifest 含 `Thumbs.db` 条目 + 盘上有 Thumbs.db → verify summary 报 0 缺失（不再 check 该条）；(b) 同上但 Thumbs.db 已被用户删 → 同样 0 缺失
 
 ## 7. 不做的事（明确边界）
 
@@ -334,7 +413,8 @@ for entry in cruft::walk(&proj_dir) {
 | `crates/bftool-core/src/engine/mod.rs` | `pub mod cruft;` |
 | `crates/bftool-core/src/engine/manifest.rs` | `real_files` 改签名 + 用 `cruft::walk` + 收集错误；`build` 改 metadata/hash 错误收集语义 |
 | `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail + 签名加 `reporter: &dyn Reporter`；新增 `FolderStats` 结构和 `folder_stats()` 函数（取代 `folder_size`）；`handle_one` 的 dry-run 分支报告"X 个文件 Y GB" |
-| `crates/bftool-core/src/engine/verify.rs` | 扫"清单外多余"那段改用 `cruft::walk`；walkdir 错误计入 bad 总数 |
+| `crates/bftool-core/src/engine/safety.rs` | `folder_stable` 改用 `cruft::walk`（第三轮 P1） |
+| `crates/bftool-core/src/engine/verify.rs` | 两处改：(a) 扫"清单外多余"那段改用 `cruft::walk` + walkdir 错误计入 bad；(b) 读旧 manifest 时跳过 legacy cruft 条目（第三轮 P2-verify） |
 | `README.md` | 「设计原则」一节加一条「OS 杂文件自动排除」；FAQ 加一条「我看 manifest 文件数少了几个，怎么回事」→「Thumbs.db 等已自动排除」 |
 
 CLI 不变、Cargo.toml 不变、CI 不变。
