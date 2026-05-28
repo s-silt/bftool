@@ -38,9 +38,14 @@ D3 / D5 即「简化」相对路线图原 Batch 3 的具体内容。
 
 ### 4.1 新增 `crates/bftool-core/src/engine/cruft.rs`
 
+包含 cruft 名单 + **共享的 cruft-aware walker**。manifest / copy / size 三处都用同一个 walker，保证 cruft 在所有路径上的处理一致 —— 不进 manifest、**不复制到机械盘**、不算入 folder_size。
+
 ```rust
-//! OS 注入的杂文件 / 目录，默认从 manifest 排除。
+//! OS 注入的杂文件 / 目录，默认从 manifest、复制、容量统计全部排除。
 //! 这些不是项目内容，无须用户配置。
+use anyhow::Result;
+use std::path::Path;
+use walkdir::{DirEntry, WalkDir};
 
 /// 文件名精确匹配（不分大小写）
 pub const CRUFT_FILES: &[&str] = &[
@@ -72,43 +77,51 @@ pub fn is_cruft_file(name: &str) -> bool {
 pub fn is_cruft_dir(name: &str) -> bool {
     CRUFT_DIRS.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
+
+/// 共享的 cruft-aware 遍历器。
+///
+/// 调用方拿到的 `DirEntry` 序列已经过滤掉：
+/// - cruft 目录（递归整段跳过；root 自身豁免，depth==0 不当 cruft）
+/// - cruft 文件名（精确 + `._` 前缀）
+/// - 不跟 symlink / junction（follow_links=false）
+///
+/// **不**屏蔽 walkdir 自身的错误 —— 错误透传，由调用方决定怎么处理
+/// (manifest::real_files: 收集后 bail；archive_test::test_folder: 同；
+/// archive::copy_folder: 收集后 bail；verify: 计入 bad)。
+pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            // depth==0 是 root 自身，不当 cruft
+            if e.depth() == 0 { return true; }
+            let name = e.file_name().to_string_lossy();
+            if e.file_type().is_dir() {
+                !is_cruft_dir(&name)
+            } else {
+                !is_cruft_file(&name)
+            }
+        })
+}
 ```
+
+> `filter_entry` 在 walkdir 里的行为：对目录返回 `false` 时整段跳过递归；对文件返回 `false` 时仅跳过该文件。完全契合我们的需求。**注意**：`filter_entry` 对返回 `Err` 的 entry 不调用 predicate，错误会直接 yield 出来 —— 这正是我们要的"错误透传"语义。
 
 ### 4.2 改造 `manifest::real_files`
 
-**签名变化**：`Vec<PathBuf>` → `Result<Vec<PathBuf>>`
+**签名变化**：`Vec<PathBuf>` → `Result<Vec<PathBuf>>`。cruft 过滤靠共享 walker，本函数只剩"收集错误 + 收集文件"的薄逻辑：
 
 ```rust
 fn real_files(root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut errors: Vec<String> = Vec::new();  // 收集后一次报告（D4）
-    let mut walker = WalkDir::new(root).follow_links(false).into_iter();
 
-    loop {
-        let entry = match walker.next() {
-            None => break,
-            Some(Ok(e)) => e,
-            Some(Err(err)) => {
-                errors.push(format!("{}", err));
-                continue;  // 继续走完，最后一次性 bail
-            }
-        };
-
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if entry.file_type().is_dir() {
-            // 保护：root 本身不应被当 cruft（用户的 ready_root 不可能是 $RECYCLE.BIN，但严谨起见排除 depth==0）
-            if entry.depth() > 0 && cruft::is_cruft_dir(&name) {
-                walker.skip_current_dir();
-                continue;
-            }
-        } else if entry.file_type().is_file() {
-            if cruft::is_cruft_file(&name) {
-                continue;
-            }
-            out.push(entry.into_path());
+    for entry in cruft::walk(root) {
+        match entry {
+            Ok(e) if e.file_type().is_file() => out.push(e.into_path()),
+            Ok(_) => continue,  // 目录、symlink 等，本步不收
+            Err(err) => errors.push(format!("{}", err)),
         }
-        // 其它（symlink、reparse point）：walkdir follow_links=false 已经不递归，跳过即可
     }
 
     if !errors.is_empty() {
@@ -123,6 +136,59 @@ fn real_files(root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 ```
+
+### 4.2b 改造 `archive::copy_folder`（**新增改动，原 spec 漏了**）
+
+P1.1 修复：cruft 在复制阶段也必须排除，否则虽不入 manifest 但物理存在于备份盘上、verify 会报「清单外多余」。改用共享 walker：
+
+```rust
+fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
+    fs::create_dir_all(dst).ok();
+    let mut errors: Vec<String> = Vec::new();
+    for entry in cruft::walk(src) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => { errors.push(format!("{}", err)); continue; }
+        };
+        let path = entry.path();
+        let rel = path.strip_prefix(src)?;
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).ok();
+        } else if entry.file_type().is_file() {
+            // 已存在且大小一致 → 视为已传，跳过（与 robocopy 默认行为一致）
+            if let (Ok(meta_src), Ok(meta_dst)) = (path.metadata(), target.metadata()) {
+                if meta_src.len() == meta_dst.len() { continue; }
+            }
+            if let Some(p) = target.parent() { fs::create_dir_all(p).ok(); }
+            fs::copy(path, &target)
+                .with_context(|| format!("复制失败：{} → {}", path.display(), target.display()))?;
+        }
+    }
+    if !errors.is_empty() {
+        for e in &errors { reporter.error(&format!("复制阶段枚举源失败：{}", e)); }
+        anyhow::bail!("复制阶段枚举源失败 {} 项 → 本项目跳过。", errors.len());
+    }
+    Ok(())
+}
+```
+
+### 4.2c 改造 `archive::folder_size`（**新增改动，原 spec 漏了**）
+
+容量预估不能算 cruft，否则跟 manifest / copy 不一致：
+
+```rust
+fn folder_size(p: &Path) -> u64 {
+    cruft::walk(p)
+        .filter_map(|e| e.ok())  // size 估算是 best-effort，错误不阻塞
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+```
+
+`folder_size` 本身是"best effort 估算"，walkdir 错误这里**仍允许 swallow**（不影响安全性，因为后续 `real_files` 会再次扫一遍并 bail 真实错误）。这一处是有意保留的 swallow。
 
 ### 4.3 `manifest::build` 与 metadata 错误
 
@@ -176,11 +242,30 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 }
 ```
 
-### 4.4 不改的地方
+### 4.4 verify.rs：小改（**user review 后修订**）
+
+P2.2 指出 verify.rs 的 `WalkDir::new(&proj_dir)` 在 `let Ok(entry) = entry else { continue }` 处 swallow walkdir 错误。verify 是"扫一遍出报告"型命令（不像 archive 是"成功才算数"型），所以我们**不**让 verify 早退；但 walkdir 错误必须**计入 bad 总数**让用户看见，不是默默 continue。
+
+```rust
+for entry in cruft::walk(&proj_dir) {
+    let entry = match entry {
+        Ok(e) => e,
+        Err(err) => {
+            reporter.error(&format!("  枚举失败: {}", err));
+            bad += 1;
+            continue;
+        }
+    };
+    // ... 余下逻辑不变
+}
+```
+
+副带好处：verify 也用 `cruft::walk` → 不会再报 cruft 文件「多余(清单外)」（之前的 verify 因为不知道 cruft 概念，会把 Thumbs.db 当作"清单外多余"warn）。
+
+### 4.5 不改的地方
 
 - `crates/bftool-cli/src/cli.rs`：**不增加任何 flag**（D3）
-- `crates/bftool-core/src/engine/verify.rs`：**不动**，仍是「扫一遍出报告」语义（D1）
-- `crates/bftool-core/src/engine/archive.rs`：**不动**，已有的 `handle_one` 外层 `match` 自然处理冒泡上来的错误（写 `需人工处理.txt` + 跳到下一项目）
+- `crates/bftool-core/src/engine/archive.rs::handle_one`：**外层逻辑不动**，已有的"项目级 try/catch"自然处理 `real_files` / `copy_folder` 冒泡上来的错误（写 `需人工处理.txt` + 跳到下一项目）。只是 `copy_folder` 和 `folder_size` 这两个 helper 内部用了共享 walker（见 4.2b / 4.2c）。
 
 ## 5. 错误处理与人机交互
 
@@ -215,12 +300,14 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 
 | 文件 | 改动 |
 |---|---|
-| `crates/bftool-core/src/engine/cruft.rs` | 新建 |
+| `crates/bftool-core/src/engine/cruft.rs` | 新建：名单 + 共享 `walk()` |
 | `crates/bftool-core/src/engine/mod.rs` | `pub mod cruft;` |
-| `crates/bftool-core/src/engine/manifest.rs` | `real_files` 改签名 + cruft 跳过 + 收集错误；`build` 改 metadata/hash 错误收集语义 |
+| `crates/bftool-core/src/engine/manifest.rs` | `real_files` 改签名 + 用 `cruft::walk` + 收集错误；`build` 改 metadata/hash 错误收集语义 |
+| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail；`folder_size` 改用 `cruft::walk`；`copy_folder` 签名加 `reporter: &dyn Reporter` |
+| `crates/bftool-core/src/engine/verify.rs` | 扫"清单外多余"那段改用 `cruft::walk`；walkdir 错误计入 bad 总数 |
 | `README.md` | 「设计原则」一节加一条「OS 杂文件自动排除」；FAQ 加一条「我看 manifest 文件数少了几个，怎么回事」→「Thumbs.db 等已自动排除」 |
 
-CLI 不变、verify 不变、archive 不变、Cargo.toml 不变、CI 不变。
+CLI 不变、Cargo.toml 不变、CI 不变。
 
 ## 9. 向后兼容
 
