@@ -93,6 +93,30 @@ pub fn leaf_name_from_rel(rel: &str) -> &str {
     rel.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(rel)
 }
 
+/// 判断 manifest `Rel` 是否包含 cruft（**第七轮 P2 修复**）。
+///
+/// 旧 manifest 可能登记 cruft 目录下的文件，例如：
+/// - `$RECYCLE.BIN\foo.dat`（Windows 回收站子项）
+/// - `.Trashes\1000\bar`（macOS 移动硬盘垃圾）
+/// - `.fseventsd\checkpoint`（macOS FSEvents 状态）
+///
+/// 之前只查叶子名会漏判（叶子是 foo.dat / bar / checkpoint，都不命中 cruft 名单）。
+///
+/// 修复：按 `\` 和 `/` 切**全部**路径段，任何一段命中 `is_cruft_dir` 或者叶子段命中
+/// `is_cruft_file` → 整条 rel 视为 cruft。
+pub fn rel_has_cruft_component(rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split(|c| c == '\\' || c == '/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() { return false; }
+    // 中间段（任一目录段）命中 cruft 目录 → 是
+    for seg in &parts[..parts.len() - 1] {
+        if is_cruft_dir(seg) { return true; }
+    }
+    // 叶子段：文件名命中 → 是
+    is_cruft_file(parts[parts.len() - 1])
+}
+
 /// 共享的 cruft-aware 遍历器。
 ///
 /// 调用方拿到的 `DirEntry` 序列已经过滤掉：
@@ -198,9 +222,11 @@ pub struct FolderStats {
     pub files: u64,
     pub bytes: u64,
     /// walkdir 枚举错误描述（第四轮 P2 修复）。
-    /// 容量判断时忽略（best-effort），但 dry-run 输出要向用户暴露：
-    /// "你看到的'X 个文件'可能不完整，请先解决环境问题再正式跑"。
+    /// 容量判断时忽略（best-effort），但 dry-run 输出要向用户暴露。
     pub enum_errors: Vec<String>,
+    /// metadata 失败描述（**第七轮 P1 修复**：之前 silently 漏字节，dry-run 显示偏小 GB 无 warn）。
+    /// 正式 archive 时 manifest::build 会因 metadata 失败 bail，dry-run 必须主动暴露。
+    pub metadata_errors: Vec<String>,
 }
 
 fn folder_stats(p: &Path) -> FolderStats {
@@ -209,8 +235,11 @@ fn folder_stats(p: &Path) -> FolderStats {
         match entry {
             Ok(e) if e.file_type().is_file() => {
                 s.files += 1;
-                if let Ok(m) = e.metadata() {
-                    s.bytes += m.len();
+                match e.metadata() {
+                    Ok(m) => s.bytes += m.len(),
+                    Err(err) => s.metadata_errors.push(
+                        format!("{}: {}", e.path().display(), err)
+                    ),
                 }
             }
             Ok(_) => continue,
@@ -221,7 +250,7 @@ fn folder_stats(p: &Path) -> FolderStats {
 }
 ```
 
-`handle_one` 的 dry-run 分支改为（**第四轮 P2 修复**：dry-run 报告统计可能不完整）：
+`handle_one` 的 dry-run 分支改为（**第四轮 P2 + 第七轮 P1**：dry-run 同时报告枚举和 metadata 不完整）：
 
 ```rust
 let stats = folder_stats(proj_path);
@@ -230,14 +259,18 @@ if opts.dry_run {
         "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
         name, stats.files, stats.bytes as f64 / 1024.0 / 1024.0 / 1024.0, drive.id
     ));
-    if !stats.enum_errors.is_empty() {
+    if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
         for e in &stats.enum_errors {
             reporter.warn(&format!("[演练] 枚举失败：{}", e));
         }
+        for e in &stats.metadata_errors {
+            reporter.warn(&format!("[演练] 读元数据失败：{}", e));
+        }
         reporter.warn(&format!(
-            "[演练] {} 项目的统计可能不完整 ({} 个枚举错误)。正式归档会因为同样的错误失败 \
-             —— 请先解决环境问题（权限拒绝？路径过长？被 AV 锁住？）再去掉 --dry-run 跑。",
-            name, stats.enum_errors.len()
+            "[演练] {} 项目的统计可能不完整 ({} 个枚举错误 + {} 个 metadata 错误)。\
+             正式归档会因为同样的错误失败 —— 请先解决环境问题（权限拒绝？路径过长？\
+             被 AV 锁住？）再去掉 --dry-run 跑。",
+            name, stats.enum_errors.len(), stats.metadata_errors.len()
         ));
     }
     return Ok(HandleOutcome::Done);
@@ -384,20 +417,20 @@ verify 第一条路是读 manifest 里的每个 `Rel` 去 check 文件存在 / �
 ```rust
 for rec in rdr.records().flatten() {
     let rel = rec.get(i_rel).unwrap_or("").to_string();
-    // 第四轮 P3 修复：用 cruft::leaf_name_from_rel 而不是 Path::file_name
-    // —— manifest Rel 永远 \\ 分隔，跨平台 Path::file_name 会漏判
-    let leaf = cruft::leaf_name_from_rel(&rel);
-    if cruft::is_cruft_file(leaf) {
+    // 第七轮 P2 修复：用 rel_has_cruft_component 检查全部路径段
+    // 漏点修复:之前只查叶子文件名,会漏 $RECYCLE.BIN\foo.dat 这类
+    // cruft 目录下的文件条目(叶子 foo.dat 不命中 cruft 名单)
+    if cruft::rel_has_cruft_component(&rel) {
         // legacy cruft：旧清单有这条，但 Batch 3 后我们不再关心 cruft
         // → 不加入 expected，不 check 存在/大小/哈希
-        // → 用户手动删 Thumbs.db 不会被报"缺失"；被 AV 锁也不会读取失败
+        // → 用户手动删 Thumbs.db / .Trashes 不会被报"缺失"；被 AV 锁也不会读取失败
         continue;
     }
     // ... 余下逻辑不变（expected.insert + check）
 }
 ```
 
-> 不对"旧 cruft 目录条目"做处理：cruft 目录不会出现在旧 manifest 里，因为 PowerShell 旧版和 Rust 之前的版本都只记录文件,不记目录。如果以后真出现这种边角情况,用户跑 verify 会看到"缺失"warn，这是可见信号，不会引起静默错误。
+> **第七轮 P2 修复更新**：原本以为"cruft 目录不会出现在旧 manifest"，但**目录下的文件**会出现 —— 比如 PowerShell 旧版可能登记过 `$RECYCLE.BIN\foo.dat` `.Trashes\bar` `.fseventsd\checkpoint` 这类条目（因为以前的代码确实会枚举到这些）。`rel_has_cruft_component` 现在按 `\` 和 `/` 切**全部段**：任一中间段是 cruft 目录、或叶子是 cruft 文件 → 整条 rel 跳过。这覆盖了三种 legacy 情况：(a) `Thumbs.db`、(b) `子目录\Thumbs.db`、(c) `$RECYCLE.BIN\foo.dat`。
 
 ### 4.5 不改的地方
 
@@ -426,17 +459,24 @@ for rec in rdr.records().flatten() {
 5. `manifest::build`：3 个文件中 1 个 metadata 失败 → 错误信息列出失败的那 1 个的路径，不混淆其它 2 个
 6. 集成测试：`bftool archive --dry-run` 在含 cruft 的源目录上，输出"X 个文件"的统计**不**包含 cruft
 7. **`safety::folder_stable`（第三轮 P1）**：(a) 含一个 5 分钟前刚改的 Thumbs.db + 一个 1 小时前的真实项目文件 → 返回 stable=true（cruft 不算入稳定性）；(b) 含一个被独占锁住的 Thumbs.db → stable=true
-8. **`verify` legacy cruft（第三轮 P2-verify + 第四轮 P3）**：
+8. **`verify` legacy cruft（第三轮 P2-verify + 第四轮 P3 + 第七轮 P2）**：
    - (a) 手写一份旧 manifest 含 `Thumbs.db` 条目 + 盘上有 Thumbs.db → verify summary 报 0 缺失
    - (b) 同上但 Thumbs.db 已被用户删 → 同样 0 缺失
-   - (c) **跨平台**：旧 manifest 含 `子目录\\Thumbs.db` 条目（注意 `\\` 分隔，模拟 Windows 写入的旧清单）→ 不管在 Windows 还是 Linux 跑测试,`cruft::leaf_name_from_rel` 都正确取出 `Thumbs.db`,verify 0 缺失
-9. **第四轮 P2 `folder_stats` 错误暴露**：含一个不可读子目录的源目录 → `folder_stats` 返回 `enum_errors` 非空；`bftool archive --dry-run` 输出含 `[演练] 枚举失败：...` 和"统计可能不完整"warn
-10. **第四轮 P3 `cruft::leaf_name_from_rel`** 单元测试:
-    - `"Thumbs.db"` → `"Thumbs.db"`
-    - `"foo\\Thumbs.db"` → `"Thumbs.db"`
-    - `"a/b/Thumbs.db"` → `"Thumbs.db"`
-    - `"a/b\\Thumbs.db"` → `"Thumbs.db"`(混用)
-    - `""` → `""`
+   - (c) **跨平台**：旧 manifest 含 `子目录\\Thumbs.db` 条目（注意 `\\` 分隔）→ Windows 和 Linux 跑都 0 缺失
+   - (d) **第七轮 P2**：旧 manifest 含 `$RECYCLE.BIN\\foo.dat` 或 `.Trashes\\bar` 条目 → cruft 目录下文件也跳过 check，verify 0 缺失（之前 leaf-only 检查会漏判这种）
+9. **第四轮 P2 + 第七轮 P1 `folder_stats` 错误暴露**：
+   - (a) 含一个不可读子目录的源目录 → `folder_stats` 返回 `enum_errors` 非空；`bftool archive --dry-run` 输出含 `[演练] 枚举失败：...` 和"统计可能不完整"warn
+   - (b) **第七轮 P1**：含一个文件 metadata 读失败（mock 或 permission denied）→ `folder_stats` 返回 `metadata_errors` 非空，文件计数仍 +1 但 bytes 不加；dry-run 输出含 `[演练] 读元数据失败：...` 和"X 个枚举错误 + Y 个 metadata 错误,统计可能不完整"warn
+10. **`cruft` 模块单元测试**（第四轮 P3 + 第七轮 P2）:
+    - `leaf_name_from_rel`：`"Thumbs.db"` → `"Thumbs.db"`；`"foo\\Thumbs.db"` → `"Thumbs.db"`；`"a/b/Thumbs.db"` → `"Thumbs.db"`；`"a/b\\Thumbs.db"` 混用 → `"Thumbs.db"`；`""` → `""`
+    - **`rel_has_cruft_component`（第七轮 P2 新增）**：
+      - `"foo.txt"` → false
+      - `"Thumbs.db"` → true（叶子命中 cruft 文件）
+      - `"sub\\Thumbs.db"` → true（叶子命中）
+      - `"$RECYCLE.BIN\\foo.dat"` → **true**（中间段命中 cruft 目录;之前 leaf-only 漏判）
+      - `".Trashes\\1000\\bar"` → **true**（中间段命中）
+      - `"a/.fseventsd/checkpoint"` → **true**（混用分隔符 + 中间命中）
+      - `"normal/path/foo.txt"` → false
 
 ## 7. 不做的事（明确边界）
 
@@ -449,12 +489,12 @@ for rec in rdr.records().flatten() {
 
 | 文件 | 改动 |
 |---|---|
-| `crates/bftool-core/src/engine/cruft.rs` | 新建：名单 + 共享 `walk()` + 跨平台 `leaf_name_from_rel(rel)`（第四轮 P3） |
+| `crates/bftool-core/src/engine/cruft.rs` | 新建：名单 + 共享 `walk()` + 跨平台 `leaf_name_from_rel(rel)`（第四轮 P3）+ `rel_has_cruft_component(rel)`（第七轮 P2,覆盖 cruft 目录下的旧条目） |
 | `crates/bftool-core/src/engine/mod.rs` | `pub mod cruft;` |
 | `crates/bftool-core/src/engine/manifest.rs` | `real_files` 改签名 + 用 `cruft::walk` + 收集错误；`build` 改 metadata/hash 错误收集语义 |
-| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail + 签名加 `reporter: &dyn Reporter`；新增 `FolderStats { files, bytes, enum_errors }` 结构和 `folder_stats()` 函数（取代 `folder_size`，**含 enum_errors 暴露**——第四轮 P2）；`handle_one` 的 dry-run 分支报告"X 个文件 Y GB"，**有枚举错误时输出 warn 提示统计可能不完整**（第四轮 P2） |
+| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail + 签名加 `reporter: &dyn Reporter`；新增 `FolderStats { files, bytes, enum_errors, metadata_errors }` 结构和 `folder_stats()` 函数（取代 `folder_size`，**enum_errors + metadata_errors 都暴露**——第四轮 P2 + 第七轮 P1）；`handle_one` 的 dry-run 分支报告"X 个文件 Y GB"，**有枚举/metadata 错误时输出 warn 提示统计可能不完整**（含两类错误数） |
 | `crates/bftool-core/src/engine/safety.rs` | `folder_stable` 改用 `cruft::walk`（第三轮 P1） |
-| `crates/bftool-core/src/engine/verify.rs` | 两处改：(a) 扫"清单外多余"那段改用 `cruft::walk` + walkdir 错误计入 bad；(b) 读旧 manifest 时跳过 legacy cruft 条目（第三轮 P2-verify） |
+| `crates/bftool-core/src/engine/verify.rs` | 两处改：(a) 扫"清单外多余"那段改用 `cruft::walk` + walkdir 错误计入 bad；(b) 读旧 manifest 时用 `cruft::rel_has_cruft_component(rel)` 跳过 legacy cruft 条目（第三轮 P2-verify + 第四轮 P3 + **第七轮 P2 覆盖目录下条目**） |
 | `README.md` | 「设计原则」一节加一条「OS 杂文件自动排除」；FAQ 加一条「我看 manifest 文件数少了几个，怎么回事」→「Thumbs.db 等已自动排除」 |
 
 CLI 不变、Cargo.toml 不变、CI 不变。
