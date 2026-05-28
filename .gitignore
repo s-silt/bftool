@@ -10,6 +10,9 @@
 *.swp
 *.swo
 
+# 代码索引（本地 MCP 工具产物，不入库）
+/.codegraph
+
 # OS
 Thumbs.db
 .DS_Store
