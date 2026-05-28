@@ -11,9 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
-
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::engine::archive_test::{self, Tester, TesterPaths};
@@ -36,9 +34,12 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     if opts.no_hash && (!cfg.test_archives || opts.no_test_archives) {
         anyhow::bail!(
             "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
-             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\
+             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
              这是 core 级 fail-closed 拦截,调用方应该在传 Options 之前就做合并检查\
-             (CLI dispatch 已经做了一次更友好的)。"
+             (CLI dispatch 已经做了一次更友好的)。\n\
+             如何修：\n\
+               - 去掉 no_hash 让 SHA256 兜底；或\n\
+               - 不要把 test_archives 设成 false 也不要把 no_test_archives 设成 true"
         );
     }
 
@@ -153,7 +154,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
             Ok(HandleOutcome::Skipped) => {}
             Ok(HandleOutcome::DriveSealed) => {
                 reporter.action(
-                    "本盘已封盘,本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
+                    "本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
                 );
                 break;
             }
@@ -301,8 +302,8 @@ fn handle_one(
     if let Some((kind, path)) = tester_opt {
         let r = archive_test::test_folder(proj_path, (*kind, path.as_path()), reporter);
         if !r.ok {
-            for line in r.details() {
-                reporter.error(&line);
+            for detail in r.details() {
+                reporter.error(&detail);
             }
             append_manual(cfg, &name, &format!("源压缩包测试失败：{}", r.summary()))?;
             if !r.tester_errors.is_empty() {
@@ -398,8 +399,8 @@ fn handle_one(
     if let Some((kind, path)) = tester_opt {
         let r = archive_test::test_folder(&dest, (*kind, path.as_path()), reporter);
         if !r.ok {
-            for line in r.details() {
-                reporter.error(&line);
+            for detail in r.details() {
+                reporter.error(&detail);
             }
             if !r.archive_failed.is_empty() {
                 let quar = paths::drive_quarantine_dir(&drive.root).join(&name);
