@@ -25,6 +25,7 @@
 5. **每盘自洽**。盘里自带索引、校验清单、日志、README，离线也能自我说明。
 6. **事务式**。"写标记 → 移动源 → 写索引 → 删标记"，宁可漏写索引（可人工补），也不要"写了索引却没真正归档"。
 7. **新手友好**。错误信息一定带"具体怎么修"；默认值偏保守；不传任何参数 `bftool` 会给你看当前状态 + 可用命令。
+8. **OS 杂文件自动排除**。`Thumbs.db` / `desktop.ini` / `.DS_Store` / `$RECYCLE.BIN` / `System Volume Information` 等系统注入文件**不进 manifest、不复制到机械盘、verify 也不当"清单外多余"报**。这些不是项目内容，排除它们让新手不会因为 antivirus 锁 Thumbs.db 莫名其妙整项目失败。
 
 > **备份不等于"复制完了"**。借自 [rsure](https://github.com/d3zd3z/rsure) 的提醒：*backups aren't useful unless you've tested them.* 跑 `bftool verify <盘符>` 才算"已验证的备份"，建议每 6–12 个月一次。
 
