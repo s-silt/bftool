@@ -27,3 +27,15 @@ min_drive_gb = 200
 
 # 备份盘命名前缀，会得到「备份1、备份2…」；改成 "BK" 就是 BK1、BK2
 name_prefix = "备份"
+
+# -------- 压缩包内部测试(Spec B / Batch 3.5) --------
+# 默认开。装了 7-Zip / WinRAR / Bandizip 任一就自动用,新手不用动这一段。
+
+# 默认 true。--no-test-archives 关掉(关时与 --unsafe-no-hash 互斥)。
+test_archives = true
+
+# WinRAR(优先) / Bandizip / 7-Zip 路径。装哪个就保留哪个对应行有效路径。
+# 没装的话保持默认值也行 —— detect 会按 is_file 找,找不到一次性 warn 后继续 SHA256。
+winrar_path   = "C:\\Program Files\\WinRAR\\WinRAR.exe"
+bandizip_path = "C:\\Program Files\\Bandizip\\bz.exe"
+seven_zip_path = "C:\\Program Files\\7-Zip\\7z.exe"

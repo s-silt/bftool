@@ -28,6 +28,23 @@ pub struct Config {
     /// 备份盘命名前缀：「备份1」「备份2」…
     #[serde(default = "default_name_prefix")]
     pub name_prefix: String,
+
+    // -------- Spec B: 压缩包测试(默认开,新手不用动) --------
+    /// 默认开启压缩包内部测试(D1)。用 --no-test-archives 关掉。
+    #[serde(default = "default_true")]
+    pub test_archives: bool,
+
+    /// WinRAR 路径(优先,返回码最明确)。默认值是 PowerShell 旧版 = Windows 安装位置。
+    #[serde(default = "default_winrar")]
+    pub winrar_path: PathBuf,
+
+    /// Bandizip 路径(次选,控制台版 bz.exe)。
+    #[serde(default = "default_bandizip")]
+    pub bandizip_path: PathBuf,
+
+    /// 7-Zip 路径(免费开源,推荐新手装这个)。
+    #[serde(default = "default_seven_zip")]
+    pub seven_zip_path: PathBuf,
 }
 
 fn default_reserve_gb() -> u64 {
@@ -43,6 +60,22 @@ fn default_name_prefix() -> String {
     "备份".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_seven_zip() -> PathBuf {
+    PathBuf::from(r"C:\Program Files\7-Zip\7z.exe")
+}
+
+fn default_winrar() -> PathBuf {
+    PathBuf::from(r"C:\Program Files\WinRAR\WinRAR.exe")
+}
+
+fn default_bandizip() -> PathBuf {
+    PathBuf::from(r"C:\Program Files\Bandizip\bz.exe")
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -53,6 +86,11 @@ impl Default for Config {
             stable_minutes: default_stable_minutes(),
             min_drive_gb: default_min_drive_gb(),
             name_prefix: default_name_prefix(),
+            // 新加:
+            test_archives: default_true(),
+            winrar_path: default_winrar(),
+            bandizip_path: default_bandizip(),
+            seven_zip_path: default_seven_zip(),
         }
     }
 }
