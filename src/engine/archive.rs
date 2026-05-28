@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config::Config;
 use crate::engine::drive::{self, DriveInfo};
@@ -88,7 +88,10 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
         ui::info("待备份 中没有待归档项目，结束。");
         return Ok(());
     }
-    ui::info(format!("发现 {} 个待归档项目（按编号升序处理）。", projects.len()));
+    ui::info(format!(
+        "发现 {} 个待归档项目（按编号升序处理）。",
+        projects.len()
+    ));
 
     let mut handled = 0usize;
     for proj in &projects {
@@ -103,12 +106,20 @@ pub fn run(cfg: &Config, opts: Options) -> Result<()> {
             Ok(HandleOutcome::Done) => handled += 1,
             Ok(HandleOutcome::Skipped) => {}
             Ok(HandleOutcome::DriveSealed) => {
-                ui::action("本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。");
+                ui::action(
+                    "本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
+                );
                 break;
             }
             Err(e) => {
-                let name = proj.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                ui::error(format!("项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。", name, e));
+                let name = proj
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                ui::error(format!(
+                    "项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。",
+                    name, e
+                ));
                 append_manual(cfg, &name, &format!("未捕获异常：{}", e))?;
             }
         }
@@ -123,7 +134,12 @@ enum HandleOutcome {
     DriveSealed,
 }
 
-fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options) -> Result<HandleOutcome> {
+fn handle_one(
+    cfg: &Config,
+    drive: &DriveInfo,
+    proj_path: &Path,
+    opts: &Options,
+) -> Result<HandleOutcome> {
     let name = proj_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -166,7 +182,11 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
             "项目 {:.2}GB 超过单盘容量，空盘也放不下 → 需人工拆分",
             size_gb
         ));
-        append_manual(cfg, &name, &format!("{:.2}GB 超过单盘容量，需拆分或显式跨盘", size_gb))?;
+        append_manual(
+            cfg,
+            &name,
+            &format!("{:.2}GB 超过单盘容量，需拆分或显式跨盘", size_gb),
+        )?;
         return Ok(HandleOutcome::Skipped);
     }
     if need.saturating_add(reserve) > drive.free_bytes {
@@ -185,13 +205,21 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
     }
 
     if opts.dry_run {
-        ui::info(format!("[演练] 将归档 {} ({:.2}GB) → {}", name, size_gb, drive.id));
+        ui::info(format!(
+            "[演练] 将归档 {} ({:.2}GB) → {}",
+            name, size_gb, drive.id
+        ));
         return Ok(HandleOutcome::Done);
     }
 
     // 生成源清单
     ui::info(format!("生成源清单/校验和（{:.2}GB，可能较慢）…", size_gb));
-    let src = manifest::build(proj_path, ManifestOpts { no_hash: opts.no_hash })?;
+    let src = manifest::build(
+        proj_path,
+        ManifestOpts {
+            no_hash: opts.no_hash,
+        },
+    )?;
 
     // 复制
     fs::create_dir_all(&dest).context("创建目标目录失败")?;
@@ -200,10 +228,18 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
     ui::info("复制完成，开始校验…");
 
     // 目标清单 + 比对
-    let dst = manifest::build(&dest, ManifestOpts { no_hash: opts.no_hash })?;
+    let dst = manifest::build(
+        &dest,
+        ManifestOpts {
+            no_hash: opts.no_hash,
+        },
+    )?;
     let d = manifest::diff(&src, &dst, !opts.no_hash);
     if !d.ok {
-        ui::error(format!("校验失败：{} → 不写索引、不移动源。", d.reasons.join("; ")));
+        ui::error(format!(
+            "校验失败：{} → 不写索引、不移动源。",
+            d.reasons.join("; ")
+        ));
         // 隔离坏文件，让下次 robocopy 风格的"补传"再来一遍
         if !d.bad_dst_rels.is_empty() {
             let quar = paths::drive_quarantine_dir(&drive.root).join(&name);
@@ -216,7 +252,12 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
                         fs::create_dir_all(p).ok();
                     }
                     if let Err(e) = fs::rename(&src_p, &dst_p) {
-                        ui::warn(format!("隔离失败 {}：{}（请手动检查 {}）", rel, e, src_p.display()));
+                        ui::warn(format!(
+                            "隔离失败 {}：{}（请手动检查 {}）",
+                            rel,
+                            e,
+                            src_p.display()
+                        ));
                     } else {
                         moved += 1;
                     }
@@ -234,7 +275,12 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
 
     // 复核源在复制期间未变化
     ui::info("复核源文件在复制期间未变化…");
-    let src2 = manifest::build(proj_path, ManifestOpts { no_hash: opts.no_hash })?;
+    let src2 = manifest::build(
+        proj_path,
+        ManifestOpts {
+            no_hash: opts.no_hash,
+        },
+    )?;
     let (changed, why) = manifest::source_changed(&src, &src2, opts.no_hash);
     if changed {
         ui::error(format!(
@@ -250,8 +296,13 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
     let utc = Utc::now().to_rfc3339();
     let src_bytes = src.total_bytes();
     let size_gbval = src_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    let verify_status = if opts.no_hash { "SIZE+COUNT" } else { "SHA256-OK" };
-    let manifest_path = paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
+    let verify_status = if opts.no_hash {
+        "SIZE+COUNT"
+    } else {
+        "SHA256-OK"
+    };
+    let manifest_path =
+        paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
     let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
     let mut arch_dest = cfg.archived_root.join(&name);
     if arch_dest.exists() {
@@ -293,7 +344,11 @@ fn handle_one(cfg: &Config, drive: &DriveInfo, proj_path: &Path, opts: &Options)
             archived_utc: utc.clone(),
             verify_status: verify_status.to_string(),
             status: "Complete".to_string(),
-            notes: if dup_in_drive { format!("原名 {}", name) } else { String::new() },
+            notes: if dup_in_drive {
+                format!("原名 {}", name)
+            } else {
+                String::new()
+            },
         },
     )?;
     append_global_catalog(

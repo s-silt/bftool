@@ -39,7 +39,8 @@ pub fn bytes_bar(total: u64, label: &str) -> ProgressBar {
     pb
 }
 
-/// 按文件数创建简单进度条
+/// 按文件数创建简单进度条（archive 子命令暂未使用；verify / 未来批量校验时会用）
+#[allow(dead_code)]
 pub fn items_bar(total: u64, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(

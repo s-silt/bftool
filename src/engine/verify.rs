@@ -23,7 +23,9 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
             drives
                 .into_iter()
                 .find(|d| d.letter == letter)
-                .ok_or_else(|| anyhow::anyhow!("找不到盘 {}:（用 `bftool drives` 看一下）", letter))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("找不到盘 {}:（用 `bftool drives` 看一下）", letter)
+                })?
         }
         None => {
             if drives.len() == 1 {
@@ -53,11 +55,7 @@ pub fn run(cfg: &Config, drive_letter: Option<&str>) -> Result<()> {
 
     let mut manifest_files: Vec<_> = fs::read_dir(&mdir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".sha256.csv")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".sha256.csv"))
         .collect();
     manifest_files.sort_by_key(|e| e.file_name());
 

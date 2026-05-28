@@ -106,8 +106,7 @@ pub enum Command {
 }
 
 pub fn dispatch(args: Cli) -> Result<()> {
-    let cfg = Config::load(args.config.as_deref())
-        .context("加载配置失败")?;
+    let cfg = Config::load(args.config.as_deref()).context("加载配置失败")?;
 
     match args.cmd {
         None => engine::status::run(&cfg),
@@ -126,19 +125,27 @@ pub fn dispatch(args: Cli) -> Result<()> {
             if let Some(r) = reserve_gb {
                 cfg.reserve_gb = r;
             }
-            engine::archive::run(&cfg, engine::archive::Options {
-                dry_run,
-                no_hash,
-                limit,
-                drive_letter_override: drive,
-            })
+            engine::archive::run(
+                &cfg,
+                engine::archive::Options {
+                    dry_run,
+                    no_hash,
+                    limit,
+                    drive_letter_override: drive,
+                },
+            )
         }
-        Some(Command::Init { drive, id, force }) => engine::drive::init(&cfg, &drive, id.as_deref(), force),
+        Some(Command::Init { drive, id, force }) => {
+            engine::drive::init(&cfg, &drive, id.as_deref(), force)
+        }
         Some(Command::Verify { drive }) => engine::verify::run(&cfg, drive.as_deref()),
         Some(Command::Find { keyword }) => engine::find::run(&cfg, &keyword),
         Some(Command::Drives) => engine::drive::list_mounted(&cfg),
         Some(Command::ConfigShow) => {
-            println!("{}", toml::to_string_pretty(&cfg).context("序列化配置失败")?);
+            println!(
+                "{}",
+                toml::to_string_pretty(&cfg).context("序列化配置失败")?
+            );
             Ok(())
         }
     }

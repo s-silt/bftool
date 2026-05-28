@@ -49,7 +49,8 @@ impl PendingTxn {
 
     pub fn clear(path: &Path) -> Result<()> {
         if path.exists() {
-            fs::remove_file(path).with_context(|| format!("清除事务标记失败：{}", path.display()))?;
+            fs::remove_file(path)
+                .with_context(|| format!("清除事务标记失败：{}", path.display()))?;
         }
         Ok(())
     }

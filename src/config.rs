@@ -30,10 +30,18 @@ pub struct Config {
     pub name_prefix: String,
 }
 
-fn default_reserve_gb() -> u64 { 30 }
-fn default_stable_minutes() -> u64 { 30 }
-fn default_min_drive_gb() -> u64 { 200 }
-fn default_name_prefix() -> String { "备份".to_string() }
+fn default_reserve_gb() -> u64 {
+    30
+}
+fn default_stable_minutes() -> u64 {
+    30
+}
+fn default_min_drive_gb() -> u64 {
+    200
+}
+fn default_name_prefix() -> String {
+    "备份".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -52,7 +60,8 @@ impl Default for Config {
 impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         if let Some(p) = explicit {
-            return Self::from_path(p).with_context(|| format!("读取 --config 指定的配置文件失败：{}", p.display()));
+            return Self::from_path(p)
+                .with_context(|| format!("读取 --config 指定的配置文件失败：{}", p.display()));
         }
 
         for candidate in Self::candidate_paths() {

@@ -26,8 +26,8 @@ pub fn run(cfg: &Config, keyword: &str) -> Result<()> {
 
     let mut count = 0usize;
     println!(
-        "{:<28}{:<10}{:<20}{:<8}{:<24}{}",
-        "文件夹名", "备份盘", "备份时间", "编号", "盘内路径", "校验"
+        "{:<28}{:<10}{:<20}{:<8}{:<24}校验",
+        "文件夹名", "备份盘", "备份时间", "编号", "盘内路径"
     );
     println!("{}", "-".repeat(110));
     for rec in rdr.records().flatten() {

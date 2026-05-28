@@ -62,7 +62,11 @@ impl Manifest {
             hash: &'a str,
         }
         for e in &self.entries {
-            wtr.serialize(Row { rel: &e.rel, size: e.size, hash: &e.hash })?;
+            wtr.serialize(Row {
+                rel: &e.rel,
+                size: e.size,
+                hash: &e.hash,
+            })?;
         }
         wtr.flush()?;
         Ok(())
@@ -113,7 +117,9 @@ pub fn build(root: &Path, opts: ManifestOpts) -> Result<Manifest> {
     let mut entries = Vec::with_capacity(files.len());
 
     for f in &files {
-        let meta = f.metadata().with_context(|| format!("读元数据失败：{}", f.display()))?;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("读元数据失败：{}", f.display()))?;
         let size = meta.len();
         let mtime = system_time_to_rfc3339(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         let rel = path_relative(&base, f);
@@ -125,7 +131,12 @@ pub fn build(root: &Path, opts: ManifestOpts) -> Result<Manifest> {
         };
 
         bar.inc(size);
-        entries.push(Entry { rel, size, hash, mtime });
+        entries.push(Entry {
+            rel,
+            size,
+            hash,
+            mtime,
+        });
     }
     bar.finish_and_clear();
     Ok(Manifest { entries })
@@ -174,17 +185,24 @@ pub struct Diff {
 
 /// 用源清单核对目标清单：数量、字节、逐文件相对路径 + 大小 (+ 哈希)。
 pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
-    let mut d = Diff::default();
-    d.ok = true;
+    let mut d = Diff {
+        ok: true,
+        reasons: Vec::new(),
+        bad_dst_rels: Vec::new(),
+    };
 
     if src.count() != dst.count() {
         d.ok = false;
-        d.reasons.push(format!("文件数 src={} dst={}", src.count(), dst.count()));
+        d.reasons
+            .push(format!("文件数 src={} dst={}", src.count(), dst.count()));
     }
     if src.total_bytes() != dst.total_bytes() {
         d.ok = false;
-        d.reasons
-            .push(format!("总字节 src={} dst={}", src.total_bytes(), dst.total_bytes()));
+        d.reasons.push(format!(
+            "总字节 src={} dst={}",
+            src.total_bytes(),
+            dst.total_bytes()
+        ));
     }
     let smap: HashMap<&str, &Entry> = src.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
     for ent in &dst.entries {
@@ -210,7 +228,11 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
 }
 
 /// 复制期间源是否变化（在「移动源 → 写索引」之前最后一道防线）。
-pub fn source_changed(initial: &Manifest, current: &Manifest, no_hash: bool) -> (bool, Vec<String>) {
+pub fn source_changed(
+    initial: &Manifest,
+    current: &Manifest,
+    no_hash: bool,
+) -> (bool, Vec<String>) {
     let mut reasons = Vec::new();
     let mut changed = false;
     if initial.count() != current.count() {
@@ -219,10 +241,18 @@ pub fn source_changed(initial: &Manifest, current: &Manifest, no_hash: bool) -> 
     }
     if initial.total_bytes() != current.total_bytes() {
         changed = true;
-        reasons.push(format!("总字节 {}→{}", initial.total_bytes(), current.total_bytes()));
+        reasons.push(format!(
+            "总字节 {}→{}",
+            initial.total_bytes(),
+            current.total_bytes()
+        ));
     }
     if !changed {
-        let cmap: HashMap<&str, &Entry> = current.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
+        let cmap: HashMap<&str, &Entry> = current
+            .entries
+            .iter()
+            .map(|e| (e.rel.as_str(), e))
+            .collect();
         for i in &initial.entries {
             let Some(j) = cmap.get(i.rel.as_str()) else {
                 changed = true;

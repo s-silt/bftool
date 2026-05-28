@@ -24,14 +24,23 @@ pub fn check_paths(
     if is_inside(&a, &r) {
         bail!(
             "已备份({}) 不能位于 待备份({}) 之内，否则会被当作待归档项目处理。",
-            a.display(), r.display()
+            a.display(),
+            r.display()
         );
     }
     if is_inside(&s, &r) {
-        bail!("备份系统({}) 不能位于 待备份({}) 之内。", s.display(), r.display());
+        bail!(
+            "备份系统({}) 不能位于 待备份({}) 之内。",
+            s.display(),
+            r.display()
+        );
     }
     if is_inside(&r, &a) {
-        bail!("待备份({}) 不能位于 已备份({}) 之内。", r.display(), a.display());
+        bail!(
+            "待备份({}) 不能位于 已备份({}) 之内。",
+            r.display(),
+            a.display()
+        );
     }
 
     if let Some(drive) = drive_root {
@@ -40,7 +49,9 @@ pub fn check_paths(
             if qualifier(p).eq_ignore_ascii_case(&drive_q) {
                 bail!(
                     "{}({}) 位于当前备份盘 {} 上 —— 会把源/索引写到备份盘自身。请改到固态盘。",
-                    name, p.display(), drive_q
+                    name,
+                    p.display(),
+                    drive_q
                 );
             }
         }
@@ -60,7 +71,8 @@ fn canon(p: &Path) -> PathBuf {
 }
 
 fn eq_ci(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&*b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(b.to_string_lossy().as_ref())
 }
 
 fn is_inside(child: &Path, parent: &Path) -> bool {
@@ -98,10 +110,7 @@ pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
                 if mt > cutoff {
                     return StableCheck {
                         stable: false,
-                        reason: format!(
-                            "最近被修改：{}",
-                            e.file_name().to_string_lossy()
-                        ),
+                        reason: format!("最近被修改：{}", e.file_name().to_string_lossy()),
                     };
                 }
             }

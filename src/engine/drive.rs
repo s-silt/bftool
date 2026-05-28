@@ -3,7 +3,7 @@
 //! 「认盘」靠盘内 `本盘信息\本盘编号.txt`，不依赖盘符也不依赖卷标。
 //! 一旦盘里有这个文件 + 未封盘，就是一块可写入的备份盘。
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 use serde::Serialize;
 use std::fs;
@@ -15,9 +15,9 @@ use crate::ui;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DriveInfo {
-    pub letter: String,         // "E"
-    pub root: PathBuf,          // "E:\"
-    pub id: String,             // "备份3"
+    pub letter: String, // "E"
+    pub root: PathBuf,  // "E:\"
+    pub id: String,     // "备份3"
     pub sealed: bool,
     pub free_bytes: u64,
     pub total_bytes: u64,
@@ -31,7 +31,11 @@ pub fn list_mounted(cfg: &Config) -> Result<()> {
         return Ok(());
     }
     for d in &drives {
-        let tag = if d.sealed { "[已封盘]" } else { "[可用]  " };
+        let tag = if d.sealed {
+            "[已封盘]"
+        } else {
+            "[可用]  "
+        };
         println!(
             "  {}  {} ({}:)  剩余 {:.1} GB / 共 {:.0} GB",
             tag,
@@ -51,7 +55,9 @@ pub fn scan_mounted() -> Result<Vec<DriveInfo>> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     for d in disks.list() {
         let mount = d.mount_point();
-        let Some(letter) = drive_letter_of(mount) else { continue };
+        let Some(letter) = drive_letter_of(mount) else {
+            continue;
+        };
         let root = PathBuf::from(format!("{}:\\", letter));
         let id_file = paths::drive_id_path(&root);
         if !id_file.is_file() {
@@ -183,7 +189,9 @@ pub fn init(cfg: &Config, drive_letter: &str, id: Option<&str>, force: bool) -> 
     ui::ok(format!("已初始化备份盘 {} ({}:)", id, letter));
     if !force && paths::drive_id_path(&root).is_file() {
         // 提示用户可以接着 archive
-        ui::info("现在可以运行 `bftool archive` 开始归档；先 `bftool archive --dry-run` 演练一下更稳。");
+        ui::info(
+            "现在可以运行 `bftool archive` 开始归档；先 `bftool archive --dry-run` 演练一下更稳。",
+        );
     }
     Ok(())
 }
@@ -260,7 +268,9 @@ pub fn seal(drive: &DriveInfo) -> Result<()> {
                 total += 1;
                 if let Some(c) = bcol {
                     if let Some(s) = r.get(c) {
-                        if let Ok(n) = s.parse::<u64>() { total_bytes += n }
+                        if let Ok(n) = s.parse::<u64>() {
+                            total_bytes += n
+                        }
                     }
                 }
             }
@@ -311,7 +321,13 @@ pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
     let root = root_from_letter(&letter)?;
     let id_file = paths::drive_id_path(&root);
     let id = fs::read_to_string(&id_file)
-        .with_context(|| format!("{}: 不是一块已初始化的备份盘（找不到 {}）", letter, id_file.display()))?
+        .with_context(|| {
+            format!(
+                "{}: 不是一块已初始化的备份盘（找不到 {}）",
+                letter,
+                id_file.display()
+            )
+        })?
         .trim()
         .to_string();
     // 容量信息：从 sysinfo 兜底；失败则填 0

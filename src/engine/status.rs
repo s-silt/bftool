@@ -12,8 +12,10 @@ pub fn run(cfg: &Config) -> Result<()> {
     println!("  待备份(源)  : {}", display_root(&cfg.ready_root));
     println!("  已备份      : {}", display_root(&cfg.archived_root));
     println!("  备份系统    : {}", display_root(&cfg.system_root));
-    println!("  预留余量    : {} GB    稳定期 : {} 分钟    认盘最小容量 : {} GB",
-        cfg.reserve_gb, cfg.stable_minutes, cfg.min_drive_gb);
+    println!(
+        "  预留余量    : {} GB    稳定期 : {} 分钟    认盘最小容量 : {} GB",
+        cfg.reserve_gb, cfg.stable_minutes, cfg.min_drive_gb
+    );
     println!("-----------------------------------------------------------");
 
     // 检测当前在线的备份盘
@@ -22,7 +24,11 @@ pub fn run(cfg: &Config) -> Result<()> {
         println!("  机械盘 · 当前在线 : 无（插入空盘后执行 `bftool init <盘符>` 初始化）");
     } else {
         for d in &drives {
-            let tag = if d.sealed { "[已封盘]" } else { "[可用]  " };
+            let tag = if d.sealed {
+                "[已封盘]"
+            } else {
+                "[可用]  "
+            };
             println!(
                 "  机械盘 · 当前在线 : {}  {} ({}:)  剩余 {:.1}/{:.0} GB",
                 tag,
@@ -47,7 +53,9 @@ pub fn run(cfg: &Config) -> Result<()> {
 
     println!("===========================================================");
     println!("常用命令：");
-    println!("  bftool init <盘符>            初始化一块空盘为下一个「备份N」（例：bftool init E）");
+    println!(
+        "  bftool init <盘符>            初始化一块空盘为下一个「备份N」（例：bftool init E）"
+    );
     println!("  bftool archive --dry-run     演练（不真正复制）");
     println!("  bftool archive               正式归档");
     println!("  bftool verify [盘符]         复查：重算 SHA256 比对清单");
