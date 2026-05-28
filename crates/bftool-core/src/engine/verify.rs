@@ -9,7 +9,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use crate::config::Config;
-use crate::engine::{drive, paths};
+use crate::engine::{cruft, drive, paths};
 use crate::reporter::Reporter;
 
 pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) -> Result<()> {
@@ -86,6 +86,12 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
 
         for rec in rdr.records().flatten() {
             let rel = rec.get(i_rel).unwrap_or("").to_string();
+            // 第七轮 P2:用 rel_has_cruft_component 检查全部路径段,覆盖 cruft 目录下的旧条目
+            if cruft::rel_has_cruft_component(&rel) {
+                // legacy cruft:旧清单有这条,但 Batch 3 后我们不再关心 cruft
+                // → 不加入 expected,不 check 存在/大小/哈希
+                continue;
+            }
             let size = i_size
                 .and_then(|c| rec.get(c))
                 .and_then(|s| s.parse::<u64>().ok())
@@ -131,8 +137,15 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
         // 报告清单外的多余文件（不删除）
         if proj_dir.is_dir() {
             let base = proj_dir.canonicalize().unwrap_or(proj_dir.clone());
-            for entry in walkdir::WalkDir::new(&proj_dir).follow_links(false) {
-                let Ok(entry) = entry else { continue };
+            for entry in cruft::walk(&proj_dir) {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        reporter.error(&format!("  枚举失败: {}", err));
+                        bad += 1;
+                        continue;
+                    }
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
