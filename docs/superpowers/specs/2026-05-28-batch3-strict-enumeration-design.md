@@ -26,7 +26,7 @@
 
 | # | 决策 | 选项 |
 |---|---|---|
-| D1 | 作用范围 | 只在 archive 流程；verify 始终严格 |
+| D1 | 作用范围 | **archive 全流程**用 cruft-aware walker + strict 枚举(stable/manifest/copy/stats 四处);**verify 保持"扫一遍出报告"语义**(不像 archive 是"成功才算数"),但同样纳入 cruft-aware 扫描 + walkdir 错误计 bad + 旧清单 legacy cruft 跳过 (§4.4)。"verify 始终严格" 的含义是"verify 不接收 --allow-skip-errors 之类放宽 flag"(D3 已锁,verify 也不存在),不是"verify 一字不改" |
 | D2 | OS 杂文件 | 默认 hardcoded 排除，不可配置（独立于错误处理） |
 | D3 | 是否提供放宽 flag | **不提供** `--allow-skip-errors`、不提供双确认 flag |
 | D4 | 错误传播 | 收集后一次输出（不 first-error 立即停） |
