@@ -5,7 +5,7 @@
 //! - 所有默认值都偏保守（不自动认盘、完整 SHA256、不删源）
 //! - 错误信息要带「具体怎么修」的提示
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -51,9 +51,16 @@ pub enum Command {
         #[arg(short = 'n', long, alias = "what-if")]
         dry_run: bool,
 
-        /// 跳过 SHA256（只比对相对路径 + 大小 + 修改时间）；快但挡不住静默损坏
+        /// 危险模式：跳过 SHA256 内容校验，只比对相对路径 + 大小 + 修改时间。
+        /// 速度快但**挡不住静默损坏（比特腐烂）**，不适合不可再生的资料。
+        /// 必须同时传 --i-understand-this-can-miss-bitrot 才会生效。
         #[arg(long)]
-        no_hash: bool,
+        unsafe_no_hash: bool,
+
+        /// 与 --unsafe-no-hash 必须同时出现的"我懂这能漏掉比特腐烂"确认开关。
+        /// 单独传它没用；存在的目的是让"不校验内容"难以误开。
+        #[arg(long, requires = "unsafe_no_hash")]
+        i_understand_this_can_miss_bitrot: bool,
 
         /// 本次最多处理几个项目（0 = 不限）
         #[arg(long, default_value_t = 0)]
@@ -112,12 +119,24 @@ pub fn dispatch(args: Cli) -> Result<()> {
         None => engine::status::run(&cfg),
         Some(Command::Archive {
             dry_run,
-            no_hash,
+            unsafe_no_hash,
+            i_understand_this_can_miss_bitrot,
             limit,
             stable_minutes,
             reserve_gb,
             drive,
         }) => {
+            // 强制二次确认：让"不校验内容"难以误开。重要资料应当走完整 SHA256。
+            if unsafe_no_hash && !i_understand_this_can_miss_bitrot {
+                bail!(
+                    "拒绝运行：--unsafe-no-hash 是危险模式，跳过 SHA256 内容校验会让\n\
+                     比特腐烂（静默损坏）无法被发现。\n\
+                     如果你**确实**理解风险（仅用于大量素材、且接受静默损坏不可见），\n\
+                     请再次显式加上：\n\
+                       --i-understand-this-can-miss-bitrot\n\
+                     重要资料/不可再生资料：请去掉 --unsafe-no-hash，走完整 SHA256。"
+                );
+            }
             let mut cfg = cfg;
             if let Some(m) = stable_minutes {
                 cfg.stable_minutes = m;
@@ -129,7 +148,8 @@ pub fn dispatch(args: Cli) -> Result<()> {
                 &cfg,
                 engine::archive::Options {
                     dry_run,
-                    no_hash,
+                    // core API 仍叫 no_hash：CLI 层负责让"开启它"变得困难。
+                    no_hash: unsafe_no_hash,
                     limit,
                     drive_letter_override: drive,
                 },

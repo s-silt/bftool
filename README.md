@@ -109,7 +109,7 @@ bftool find 关键词
 | `bftool` | 显示当前状态 + 可用子命令 |
 | `bftool archive` | 归档：处理 待备份 下所有就绪项目 |
 | `bftool archive --dry-run` | 演练（不复制、不写索引、不移动源） |
-| `bftool archive --no-hash` | 跳过 SHA256（快但挡不住静默损坏；不推荐重要资料） |
+| `bftool archive --unsafe-no-hash --i-understand-this-can-miss-bitrot` | **危险**：跳过 SHA256 内容校验，挡不住静默损坏（比特腐烂）。必须两个开关同时传才生效，单独 `--unsafe-no-hash` 会被拒绝。仅适合海量素材类、且接受静默损坏不可见的场景；**不可再生的资料请保持完整 SHA256**。 |
 | `bftool archive --limit 1` | 本次只处理一个项目 |
 | `bftool init <盘符>` | 初始化一块空盘为下一个「备份N」 |
 | `bftool init <盘符> --force` | 跳过防呆（系统盘/资料库盘/非空盘）；风险自负 |
