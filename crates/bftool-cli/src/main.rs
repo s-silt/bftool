@@ -8,10 +8,8 @@
 use anyhow::Result;
 use clap::Parser;
 
+// 所有业务模块都在 bftool-core；本 crate 只负责命令行解析 + 文本渲染。
 mod cli;
-mod config;
-mod engine;
-mod ui;
 
 fn main() -> Result<()> {
     // Windows 控制台默认是 GBK；把 stdout/stderr 切到 UTF-8，否则中文会乱码

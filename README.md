@@ -175,6 +175,37 @@ cargo build --release
 
 产物在 `target\release\bftool.exe`（静态链接 CRT，可直接拷走运行）。
 
+## 项目结构（Cargo workspace）
+
+```
+bftool/
+├─ Cargo.toml                  workspace 配置（成员、依赖版本、release profile）
+├─ crates/
+│   ├─ bftool-core/            核心引擎库（与界面无关）
+│   │   └─ src/
+│   │       ├─ lib.rs
+│   │       ├─ config.rs       TOML 配置加载
+│   │       ├─ ui.rs           终端输出辅助（后续会改为事件流）
+│   │       └─ engine/
+│   │           ├─ archive.rs  主归档流程
+│   │           ├─ drive.rs    备份盘检测/初始化/序号管理
+│   │           ├─ manifest.rs 清单生成 + 三重比对
+│   │           ├─ safety.rs   路径安全检查 + 稳定性检测
+│   │           ├─ txn.rs      事务标记
+│   │           ├─ verify.rs   复查
+│   │           ├─ find.rs     全局索引查询
+│   │           ├─ status.rs   状态总览
+│   │           └─ paths.rs    盘内路径常量
+│   └─ bftool-cli/             命令行入口（bftool.exe）
+│       └─ src/
+│           ├─ main.rs         调用 bftool_core::*
+│           └─ cli.rs          clap 子命令定义
+└─ .github/workflows/build.yml CI（windows-latest，cargo check + clippy + release zip）
+```
+
+`bftool-core` 是业务引擎，未来桌面版（Tauri / egui）会**直接调用**它，
+不会通过 shell 调 `bftool.exe`。
+
 ## License
 
 [MIT](LICENSE)

@@ -1,0 +1,20 @@
+[package]
+name        = "bftool-cli"
+description = "归档备份工具 CLI 入口：clap 子命令解析 + 把核心事件渲染成中文文本"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+# 产物仍叫 bftool.exe，不变；用户的命令体验完全没变。
+[[bin]]
+name = "bftool"
+path = "src/main.rs"
+
+[dependencies]
+bftool-core = { path = "../bftool-core" }
+clap.workspace   = true
+anyhow.workspace = true
+toml.workspace   = true

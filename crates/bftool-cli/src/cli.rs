@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::Config;
-use crate::engine;
+use bftool_core::config::Config;
+use bftool_core::engine;
 
 #[derive(Parser, Debug)]
 #[command(

@@ -23,9 +23,9 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true   # 格式不阻断构建，留作 advisory
       - name: cargo check
-        run: cargo check --all-targets --locked || cargo check --all-targets
+        run: cargo check --workspace --all-targets --locked || cargo check --workspace --all-targets
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
         continue-on-error: true   # MVP 阶段先 advisory，稳定后再 strict
 
   build:
@@ -46,7 +46,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --workspace --release --target ${{ matrix.target }}
       - name: package
         shell: pwsh
         run: |
