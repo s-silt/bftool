@@ -78,6 +78,12 @@ pub enum Command {
         /// 覆盖配置中的备份盘符（例如 E）。一般不用：默认会自动找
         #[arg(long)]
         drive: Option<String>,
+
+        /// 关闭压缩包内部结构测试（默认开启）。仅 SHA256 字节级校验时可用。
+        /// 关掉后 SHA256 校验仍在，但压缩包内部结构损坏的可能被漏判。
+        /// 与 --unsafe-no-hash 互斥：同时关 SHA256 + archive test 只剩 size+count+mtime ≈ 无校验。
+        #[arg(long)]
+        no_test_archives: bool,
     },
 
     /// 初始化一块空盘为下一个「备份N」（写本盘信息、设卷标）
@@ -126,6 +132,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             stable_minutes,
             reserve_gb,
             drive,
+            no_test_archives,
         }) => {
             // 强制二次确认：让"不校验内容"难以误开。重要资料应当走完整 SHA256。
             if unsafe_no_hash && !i_understand_this_can_miss_bitrot {
@@ -138,6 +145,21 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                      重要资料/不可再生资料：请去掉 --unsafe-no-hash，走完整 SHA256。"
                 );
             }
+
+            // Batch 3.5：--unsafe-no-hash + 任何方式关 archive test = 几乎无校验
+            let effective_test_archives = cfg.test_archives && !no_test_archives;
+            if unsafe_no_hash && !effective_test_archives {
+                bail!(
+                    "拒绝运行：--unsafe-no-hash 与「压缩包测试关闭」不能同时存在。\n\
+                     同时关掉 SHA256 内容校验和压缩包内部测试 → 只剩文件数 + 大小 + 修改时间，\n\
+                     这等价于「没在做完整性校验」，任何静默损坏都查不出。\n\
+                     如何修：\n\
+                       - 想保留压缩包测试 → 去掉 --no-test-archives 或 bftool.toml 改 test_archives = true\n\
+                       - 想用完整 SHA256 → 去掉 --unsafe-no-hash\n\
+                       - 两个都要关 → 抱歉，工具拒绝这种组合"
+                );
+            }
+
             let mut cfg = cfg;
             if let Some(m) = stable_minutes {
                 cfg.stable_minutes = m;
@@ -154,6 +176,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                     no_hash: unsafe_no_hash,
                     limit,
                     drive_letter_override: drive,
+                    no_test_archives,
                 },
             )
         }

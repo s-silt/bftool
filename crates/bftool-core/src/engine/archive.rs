@@ -25,6 +25,7 @@ pub struct Options {
     pub no_hash: bool,
     pub limit: usize,
     pub drive_letter_override: Option<String>,
+    pub no_test_archives: bool,
 }
 
 pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
