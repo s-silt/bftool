@@ -1,7 +1,7 @@
 //! OS 注入的杂文件 / 目录,默认从 manifest、复制、容量统计、verify 全部排除。
 //! 这些不是项目内容,无须用户配置。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
 /// 文件名精确匹配（不分大小写）
@@ -100,10 +100,6 @@ pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
             }
         })
 }
-
-// 让 PathBuf 在 archive_test 用,避免 unused import 警告(Spec B 后续 task 用)
-#[allow(dead_code)]
-fn _path_buf_marker(_: PathBuf) {}
 
 #[cfg(test)]
 mod tests {
