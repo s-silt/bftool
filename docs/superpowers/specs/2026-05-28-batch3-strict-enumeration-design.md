@@ -38,7 +38,7 @@ D3 / D5 即「简化」相对路线图原 Batch 3 的具体内容。
 
 ### 4.1 新增 `crates/bftool-core/src/engine/cruft.rs`
 
-包含 cruft 名单 + **共享的 cruft-aware walker**。manifest / copy / size 三处都用同一个 walker，保证 cruft 在所有路径上的处理一致 —— 不进 manifest、**不复制到机械盘**、不算入 folder_size。
+包含 cruft 名单 + **共享的 cruft-aware walker**。manifest / copy / size 统计 / verify 四处都用同一个 walker，保证 cruft 在所有路径上的处理一致 —— 不进 manifest、**不复制到机械盘**、不算入 folder_stats、verify 也不报"清单外多余"。
 
 ```rust
 //! OS 注入的杂文件 / 目录，默认从 manifest、复制、容量统计全部排除。
@@ -173,22 +173,52 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
 }
 ```
 
-### 4.2c 改造 `archive::folder_size`（**新增改动，原 spec 漏了**）
+### 4.2c 改造 `archive::folder_size` → 新增 `folder_stats`（**新增改动**）
 
-容量预估不能算 cruft，否则跟 manifest / copy 不一致：
+容量预估不能算 cruft，否则跟 manifest / copy 不一致。同时按 user review (P3-dry-run)，dry-run 既要报 GB 也要报"X 个文件"，所以把单一字节数改为双字段：
 
 ```rust
-fn folder_size(p: &Path) -> u64 {
-    cruft::walk(p)
-        .filter_map(|e| e.ok())  // size 估算是 best-effort，错误不阻塞
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FolderStats {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// best-effort 统计：walkdir 错误 swallow（folder_stats 仅给容量判断和 dry-run 摘要用；
+/// 真实错误会在后续 manifest::build / copy_folder 里被收集并 bail）。
+fn folder_stats(p: &Path) -> FolderStats {
+    let mut s = FolderStats::default();
+    for e in cruft::walk(p).filter_map(|e| e.ok()) {
+        if e.file_type().is_file() {
+            s.files += 1;
+            if let Ok(m) = e.metadata() {
+                s.bytes += m.len();
+            }
+        }
+    }
+    s
+}
+
+// 兼容旧调用点：folder_size 改为 folder_stats(...).bytes 的薄包装（或直接删除调用点改用 folder_stats）。
+```
+
+`handle_one` 的 dry-run 分支改为：
+
+```rust
+let stats = folder_stats(proj_path);
+if opts.dry_run {
+    reporter.info(&format!(
+        "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
+        name, stats.files, stats.bytes as f64 / 1024.0 / 1024.0 / 1024.0, drive.id
+    ));
+    return Ok(HandleOutcome::Done);
 }
 ```
 
-`folder_size` 本身是"best effort 估算"，walkdir 错误这里**仍允许 swallow**（不影响安全性，因为后续 `real_files` 会再次扫一遍并 bail 真实错误）。这一处是有意保留的 swallow。
+`folder_stats` 本身仍允许 swallow walkdir 错误 —— 这是有意的，因为：
+1. 它只服务于"容量判断 + dry-run 摘要"两个场景
+2. 真实错误会在后续 `manifest::build` 调用 `real_files` 时被收集并 bail（Spec §4.2）
+3. 让 folder_stats 也 bail 会导致 dry-run 在仅"想看看会做什么"的场景下也直接报错，反而不友好
 
 ### 4.3 `manifest::build` 与 metadata 错误
 
@@ -265,7 +295,7 @@ for entry in cruft::walk(&proj_dir) {
 ### 4.5 不改的地方
 
 - `crates/bftool-cli/src/cli.rs`：**不增加任何 flag**（D3）
-- `crates/bftool-core/src/engine/archive.rs::handle_one`：**外层逻辑不动**，已有的"项目级 try/catch"自然处理 `real_files` / `copy_folder` 冒泡上来的错误（写 `需人工处理.txt` + 跳到下一项目）。只是 `copy_folder` 和 `folder_size` 这两个 helper 内部用了共享 walker（见 4.2b / 4.2c）。
+- `crates/bftool-core/src/engine/archive.rs::handle_one`：**外层 match 结构不变**，已有的"项目级 try/catch"自然处理 `real_files` / `copy_folder` 冒泡上来的错误。**仅有的内部改动**：dry-run 分支输出文字加"X 个文件"（见 §4.2c）。`copy_folder` 和原 `folder_size`（现 `folder_stats`）两个 helper 内部用共享 walker。
 
 ## 5. 错误处理与人机交互
 
@@ -294,7 +324,7 @@ for entry in cruft::walk(&proj_dir) {
 - 不做 `--allow-skip-errors`、不做 `--strict-enumeration` 之类 flag（D3）
 - 不做 `skipped-files.csv`（D5，因为没有 skip 的概念了）
 - 不做用户可配置的 `extra_excludes = [...]`（D2 已锁 hardcoded；以后真有人需要再说）
-- 不动 `verify.rs`（D1）
+- ~~不动 `verify.rs`~~ —— **本节作废**。原本意是"verify 仍是报告型语义"，但 §4.4 已确认要改 verify 的实现细节（cruft::walk + walkdir 错误计 bad）。**verify 的「报告型」整体语义不变，但实现要按 §4.4 改**。
 
 ## 8. 影响范围
 
@@ -303,7 +333,7 @@ for entry in cruft::walk(&proj_dir) {
 | `crates/bftool-core/src/engine/cruft.rs` | 新建：名单 + 共享 `walk()` |
 | `crates/bftool-core/src/engine/mod.rs` | `pub mod cruft;` |
 | `crates/bftool-core/src/engine/manifest.rs` | `real_files` 改签名 + 用 `cruft::walk` + 收集错误；`build` 改 metadata/hash 错误收集语义 |
-| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail；`folder_size` 改用 `cruft::walk`；`copy_folder` 签名加 `reporter: &dyn Reporter` |
+| `crates/bftool-core/src/engine/archive.rs` | `copy_folder` 改用 `cruft::walk` + 错误收集后 bail + 签名加 `reporter: &dyn Reporter`；新增 `FolderStats` 结构和 `folder_stats()` 函数（取代 `folder_size`）；`handle_one` 的 dry-run 分支报告"X 个文件 Y GB" |
 | `crates/bftool-core/src/engine/verify.rs` | 扫"清单外多余"那段改用 `cruft::walk`；walkdir 错误计入 bad 总数 |
 | `README.md` | 「设计原则」一节加一条「OS 杂文件自动排除」；FAQ 加一条「我看 manifest 文件数少了几个，怎么回事」→「Thumbs.db 等已自动排除」 |
 
@@ -312,7 +342,10 @@ CLI 不变、Cargo.toml 不变、CI 不变。
 ## 9. 向后兼容
 
 - 已有备份盘的 manifest 不重写；既有 SHA256 校验清单不变
-- 老的 cruft 文件（已经备份过的 Thumbs.db）仍在盘里，下次 `verify` 会报「多余(清单外)」warn —— 这没问题，跟其它「之前漏算的杂项」一样的处理
+- 老的 cruft 文件（已经备份过的 Thumbs.db）仍在盘里：
+  - §4.4 改动后 verify 走 `cruft::walk` → **不**会把它们当作"清单外多余"报
+  - 它们物理上还在盘上，但不再触发 verify warn，也不影响 archive 流程
+  - 用户想清理可以人工删；工具不主动动
 - 用户不需要任何迁移动作
 
 ## 10. 一句话给新手
