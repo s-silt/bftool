@@ -13,7 +13,10 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
+use std::path::PathBuf;
+
 use crate::config::Config;
+use crate::engine::archive_test::{self, Tester, TesterPaths};
 use crate::engine::drive::{self, DriveInfo};
 use crate::engine::manifest::{self, ManifestOpts};
 use crate::engine::{cruft, paths, safety, txn};
@@ -29,6 +32,16 @@ pub struct Options {
 }
 
 pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
+    // Spec B D14/D15 core-level fail-closed guard
+    if opts.no_hash && (!cfg.test_archives || opts.no_test_archives) {
+        anyhow::bail!(
+            "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
+             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\
+             这是 core 级 fail-closed 拦截,调用方应该在传 Options 之前就做合并检查\
+             (CLI dispatch 已经做了一次更友好的)。"
+        );
+    }
+
     // 准备系统目录
     fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
     fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
@@ -70,6 +83,38 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
         reporter.warn(&w);
     }
 
+    // Spec B 顶层 tester detection:本轮只 detect 一次、只 warn 一次
+    let mut tester_opt: Option<(Tester, PathBuf)> = if cfg.test_archives && !opts.no_test_archives {
+        let p = TesterPaths {
+            winrar: cfg.winrar_path.clone(),
+            bandizip: cfg.bandizip_path.clone(),
+            seven_zip: cfg.seven_zip_path.clone(),
+        };
+        match archive_test::detect(&p) {
+            Some(t) => Some(t),
+            None => {
+                if opts.no_hash {
+                    anyhow::bail!(
+                        "拒绝运行：开启了 --unsafe-no-hash 但**机器上一个压缩包测试器都没装**。\n\
+                         此时 SHA256 没在跑,archive test 也跑不起来 —— 只剩\n\
+                         文件数+大小+修改时间,等价于「没在做完整性校验」。\n\
+                         如何修：\n\
+                           - 装一个测试器：推荐 7-Zip(免费开源 https://7-zip.org);或\n\
+                           - 去掉 --unsafe-no-hash,让 SHA256 兜底"
+                    );
+                }
+                reporter.warn(
+                    "未检测到 WinRAR / Bandizip / 7-Zip —— 压缩包内部结构无法测试。\
+                     重要资料建议装一个(推荐 7-Zip 免费开源：https://7-zip.org)。\
+                     SHA256 整文件校验仍在正常进行。",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 列出待归档项目
     if !cfg.ready_root.is_dir() {
         reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
@@ -103,14 +148,29 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
             ));
             break;
         }
-        match handle_one(cfg, reporter, &drive, proj, &opts) {
+        match handle_one(cfg, reporter, &drive, proj, &opts, tester_opt.as_ref()) {
             Ok(HandleOutcome::Done) => handled += 1,
             Ok(HandleOutcome::Skipped) => {}
             Ok(HandleOutcome::DriveSealed) => {
                 reporter.action(
-                    "本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
+                    "本盘已封盘,本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
                 );
                 break;
+            }
+            Ok(HandleOutcome::TesterFatallyDisabled) => {
+                if opts.no_hash {
+                    reporter.error(
+                        "测试器运行时失效(spawn/被信号杀/exe 被 AV 拦),同时 --unsafe-no-hash 已开 \
+                         —— 后续项目将落到「无 SHA256 + 无 archive test」无校验状态。本轮停止。\n\
+                         如何修：去掉 --unsafe-no-hash 让 SHA256 兜底,或修复测试器环境后重跑。",
+                    );
+                    break;
+                }
+                reporter.warn(
+                    "测试器自身异常 —— 本轮剩下的项目跳过压缩包测试；SHA256 整文件校验仍在。\
+                     请检查配置的测试器路径是否正确、exe 是否被 AV 拦截。",
+                );
+                tester_opt = None;
             }
             Err(e) => {
                 let name = proj
@@ -133,6 +193,7 @@ enum HandleOutcome {
     Done,
     Skipped,
     DriveSealed,
+    TesterFatallyDisabled,
 }
 
 fn handle_one(
@@ -141,6 +202,7 @@ fn handle_one(
     drive: &DriveInfo,
     proj_path: &Path,
     opts: &Options,
+    tester_opt: Option<&(Tester, PathBuf)>,
 ) -> Result<HandleOutcome> {
     let name = proj_path
         .file_name()
@@ -235,6 +297,40 @@ fn handle_one(
         return Ok(HandleOutcome::Done);
     }
 
+    // Spec B 源压缩包测试 —— 在 dry_run check 之后,在生成 manifest 之前
+    if let Some((kind, path)) = tester_opt {
+        let r = archive_test::test_folder(proj_path, (*kind, path.as_path()), reporter);
+        if !r.ok {
+            for line in r.details() {
+                reporter.error(&line);
+            }
+            append_manual(cfg, &name, &format!("源压缩包测试失败：{}", r.summary()))?;
+            if !r.tester_errors.is_empty() {
+                return Ok(HandleOutcome::TesterFatallyDisabled);
+            }
+            return Ok(HandleOutcome::Skipped);
+        }
+
+        if opts.no_hash && r.uncovered_files > 0 {
+            reporter.error(&format!(
+                "本项目有 {} 个未被 archive test 覆盖的文件,开启了 --unsafe-no-hash —— \
+                 这些文件没有 SHA256,只剩 size+count+mtime,违反完整性校验底线。",
+                r.uncovered_files
+            ));
+            append_manual(
+                cfg,
+                &name,
+                &format!(
+                    "unsafe_no_hash 模式下项目有 {} 个未覆盖文件 → 这些文件无完整性校验。\
+                     请去掉 --unsafe-no-hash 让 SHA256 兜底,或把非压缩包内容打包成一个\
+                     压缩包后再归档。",
+                    r.uncovered_files
+                ),
+            )?;
+            return Ok(HandleOutcome::Skipped);
+        }
+    }
+
     // 生成源清单
     reporter.info(&format!("生成源清单/校验和（{:.2}GB，可能较慢）…", size_gb));
     let src = manifest::build(
@@ -296,6 +392,43 @@ fn handle_one(
         }
         append_manual(cfg, &name, &format!("校验失败：{}", d.reasons.join("; ")))?;
         return Ok(HandleOutcome::Skipped);
+    }
+
+    // Spec B 目标压缩包测试 —— 在 SHA256 校验通过后、源复核之前
+    if let Some((kind, path)) = tester_opt {
+        let r = archive_test::test_folder(&dest, (*kind, path.as_path()), reporter);
+        if !r.ok {
+            for line in r.details() {
+                reporter.error(&line);
+            }
+            if !r.archive_failed.is_empty() {
+                let quar = paths::drive_quarantine_dir(&drive.root).join(&name);
+                let mut moved = 0usize;
+                for (bad, _reason) in &r.archive_failed {
+                    if let Ok(rel) = bad.strip_prefix(&dest) {
+                        let to = quar.join(rel);
+                        if let Some(p) = to.parent() {
+                            fs::create_dir_all(p).ok();
+                        }
+                        if let Err(e) = fs::rename(bad, &to) {
+                            reporter.warn(&format!("隔离失败 {}：{}", bad.display(), e));
+                        } else {
+                            moved += 1;
+                        }
+                    }
+                }
+                reporter.action(&format!(
+                    "已隔离 {} 个损坏压缩包到 {}；下次运行会自动补传并重测。",
+                    moved,
+                    quar.display()
+                ));
+            }
+            append_manual(cfg, &name, &format!("目标压缩包测试失败：{}", r.summary()))?;
+            if !r.tester_errors.is_empty() {
+                return Ok(HandleOutcome::TesterFatallyDisabled);
+            }
+            return Ok(HandleOutcome::Skipped);
+        }
     }
 
     // 复核源在复制期间未变化
