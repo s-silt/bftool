@@ -125,7 +125,7 @@ pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
             return StableCheck {
                 stable: false,
                 reason: format!(
-                    "被占用/无法读取：{}（{}）",
+                    "被占用/无法读取：{}({})",
                     e.file_name().to_string_lossy(),
                     err
                 ),
