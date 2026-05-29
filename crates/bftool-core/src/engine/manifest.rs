@@ -1,4 +1,4 @@
-//! 项目清单：枚举文件夹下所有「真实文件」（不进 junction、跳过 reparse point），
+//! 项目清单：枚举文件夹下所有「真实文件」（follow_links=false,不跟随目录 symlink/junction），
 //! 算大小 / SHA256 / 修改时间。复制前生成源清单，复制后生成目标清单做三重比对。
 
 use anyhow::{Context, Result};
@@ -80,8 +80,7 @@ impl Manifest {
 }
 
 /// 列举一个文件夹下所有真实文件。
-/// - 不进入目录链接（symlink/junction）
-/// - 跳过文件 reparse point
+/// - 不跟随目录链接（symlink/junction；follow_links=false）
 /// - 跳过 cruft（Thumbs.db、$RECYCLE.BIN 等）
 /// - 枚举失败 → 收集所有错误,本项目 bail（D4 一次输出）；本项目跳过,不影响后续项目；下次运行重做。
 fn real_files(root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {

@@ -33,7 +33,7 @@
 
 ### 1. 下载
 
-到 [Releases](https://github.com/s-silt/bftool/releases) 下载 `bftool-x86_64-pc-windows-msvc.zip`，解压得到 `bftool.exe` 和 `bftool.toml.example`。把它们放到任意目录（比如 `C:\Tools\bftool\`）即可。
+到 [Releases](https://github.com/s-silt/bftool/releases) 下载 `bftool-x86_64-pc-windows-msvc.zip`，解压得到 `bftool.exe`、`bftool.toml.example`、`README.md`、`LICENSE`。把它们放到任意目录（比如 `C:\Tools\bftool\`）即可。
 
 > **不需要安装 Visual C++ Redistributable**：本工具静态链接 CRT，单 `.exe` 文件无外部 .dll 依赖。
 
@@ -194,22 +194,26 @@ bftool/
 │   ├─ bftool-core/            核心引擎库（与界面无关）
 │   │   └─ src/
 │   │       ├─ lib.rs
-│   │       ├─ config.rs       TOML 配置加载
-│   │       ├─ ui.rs           终端输出辅助（后续会改为事件流）
+│   │       ├─ config.rs       TOML 配置加载 + 校验
+│   │       ├─ reporter.rs     Reporter trait（与界面解耦的输出接口）
 │   │       └─ engine/
-│   │           ├─ archive.rs  主归档流程
-│   │           ├─ drive.rs    备份盘检测/初始化/序号管理
-│   │           ├─ manifest.rs 清单生成 + 三重比对
-│   │           ├─ safety.rs   路径安全检查 + 稳定性检测
-│   │           ├─ txn.rs      事务标记
-│   │           ├─ verify.rs   复查
-│   │           ├─ find.rs     全局索引查询
-│   │           ├─ status.rs   状态总览
-│   │           └─ paths.rs    盘内路径常量
+│   │           ├─ archive.rs       主归档流程
+│   │           ├─ archive_test.rs  压缩包内部结构测试（7-Zip/WinRAR/Bandizip）
+│   │           ├─ cruft.rs         OS 杂文件名单 + cruft-aware walker
+│   │           ├─ drive.rs         备份盘检测/初始化/序号管理
+│   │           ├─ durable.rs       写文件后 fsync 落盘
+│   │           ├─ manifest.rs      清单生成 + 三重比对
+│   │           ├─ safety.rs        路径安全检查 + 稳定性检测
+│   │           ├─ txn.rs           事务标记
+│   │           ├─ verify.rs        复查
+│   │           ├─ find.rs          全局索引查询
+│   │           ├─ status.rs        状态总览
+│   │           └─ paths.rs         盘内路径常量
 │   └─ bftool-cli/             命令行入口（bftool.exe）
 │       └─ src/
-│           ├─ main.rs         调用 bftool_core::*
-│           └─ cli.rs          clap 子命令定义
+│           ├─ main.rs              调用 bftool_core::*
+│           ├─ cli.rs               clap 子命令定义
+│           └─ terminal_reporter.rs 终端渲染 Reporter
 └─ .github/workflows/build.yml CI（windows-latest，cargo check + clippy + release zip）
 ```
 

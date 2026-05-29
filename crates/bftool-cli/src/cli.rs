@@ -36,7 +36,7 @@ use bftool_core::reporter::Reporter;
 "
 )]
 pub struct Cli {
-    /// 配置文件路径；不传则按当前目录 → 可执行文件目录 → %APPDATA%\bftool\config.toml 顺序查找
+    /// 配置文件路径；不传则按 当前目录\bftool.toml → 可执行文件目录\bftool.toml → %APPDATA%\bftool\config.toml 顺序查找
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
@@ -86,7 +86,7 @@ pub enum Command {
         no_test_archives: bool,
     },
 
-    /// 初始化一块空盘为下一个「备份N」（写本盘信息、设卷标）
+    /// 初始化一块空盘为下一个「备份N」（写本盘信息）
     Init {
         /// 要初始化的盘符（例如 E、F）
         drive: String,
