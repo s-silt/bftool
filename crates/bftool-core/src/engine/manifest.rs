@@ -265,6 +265,16 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
             d.bad_dst_rels.push(ent.rel.clone());
         }
     }
+    // 对称检查:源有但目标缺的文件,显式报告,不只靠 count/total_bytes 聚合量兜底
+    // (聚合量在 cruft 过滤不对称时可能被凑平 → 漏检;reason 也更准)。缺失文件不进
+    // bad_dst_rels(目标侧无此文件可隔离),copy_folder 下轮会自动补传。(ledger L-002)
+    let dmap: HashMap<&str, &Entry> = dst.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
+    for ent in &src.entries {
+        if !dmap.contains_key(ent.rel.as_str()) {
+            d.ok = false;
+            d.reasons.push(format!("源有目标缺 {}", ent.rel));
+        }
+    }
     d
 }
 
@@ -377,5 +387,54 @@ mod tests {
             entries: vec![e("x", 10, "", "2026-02-02T00:00:00+00:00")],
         };
         assert!(source_changed(&a, &b, true).0);
+    }
+
+    // ── L-002: diff 显式报告"源有目标缺",不只靠 count/bytes 兜底 ──
+    #[test]
+    fn diff_reports_missing_source_file_explicitly() {
+        // 同 count、同字节,但 b 缺失、c 多出(改名/替换):旧实现只报"目标多出 c",
+        // 漏报缺 b;现在应同时显式报"源有目标缺 b"。
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("b", 10, "h2", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("c", 10, "h3", "")],
+        };
+        let d = diff(&src, &dst, true);
+        assert!(!d.ok);
+        assert!(
+            d.reasons
+                .iter()
+                .any(|r| r.contains("源有目标缺") && r.contains('b')),
+            "应显式报告缺失的源文件 b,实际 reasons={:?}",
+            d.reasons
+        );
+    }
+
+    #[test]
+    fn diff_missing_in_dst_sets_not_ok() {
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("b", 10, "h2", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let d = diff(&src, &dst, true);
+        assert!(!d.ok);
+        assert!(d
+            .reasons
+            .iter()
+            .any(|r| r.contains("源有目标缺") && r.contains('b')));
+    }
+
+    #[test]
+    fn diff_identical_is_ok() {
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        assert!(diff(&src, &dst, true).ok);
     }
 }
