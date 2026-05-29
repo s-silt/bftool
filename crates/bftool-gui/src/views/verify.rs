@@ -172,12 +172,16 @@ fn start_verify_one(app: &mut App, target: PathBuf) {
 }
 
 /// 复查摘要文案。纯函数,可测。
+/// 结论与 core `VerifyOutcome`/`outcome_label` 对齐:取消 > 损坏 > 多余 > 完好。
+/// extra-only(无损坏但有清单外多余文件)是**警示态**,不能标"完好"。(BF-VERIFY-SUMMARY-EXTRA)
 fn verify_summary(checked: u64, bad: u64, extra: u64, cancelled: bool) -> String {
     let mut s = format!("检查 {} · 损坏/缺失 {} · 多余 {}", checked, bad, extra);
     if cancelled {
         s.push_str(" · 已取消");
-    } else if bad == 0 {
+    } else if bad == 0 && extra == 0 {
         s.push_str(" · 完好");
+    } else if bad == 0 {
+        s.push_str(" · 有多余文件");
     }
     s
 }
@@ -194,5 +198,13 @@ mod tests {
         assert!(s.contains("多余 1"));
         assert!(!s.contains("完好"), "有损坏不应显示完好");
         assert!(verify_summary(5, 0, 0, true).contains("已取消"));
+    }
+
+    // ── BF-VERIFY-SUMMARY-EXTRA: extra-only(无损坏但有多余文件)不能标"完好" ──
+    #[test]
+    fn verify_summary_extra_only_is_not_clean() {
+        let s = verify_summary(10, 0, 3, false);
+        assert!(!s.contains("完好"), "有多余文件不应显示完好;实际:{s}");
+        assert!(s.contains("有多余文件"), "应提示有多余文件;实际:{s}");
     }
 }
