@@ -50,7 +50,7 @@ GUI 直接调 core,需把"只为 CLI 打印"的查询改成**返回结构化数�
 - `find::search(cfg, keyword) -> Result<Vec<FindMatch>>`(`FindMatch { folder, drive_id, in_drive_path }`)。(取代 `find::run` 的 `println!`;配 L-042 测试)
 - `status::gather(cfg) -> Result<StatusReport>`(`StatusReport { current_drive: Option<BackupDrive>, pending_count, last_verify: Option<LastVerify>, drives: Vec<BackupDrive> }`)。`last_verify` 数据来源见 §4.4。(取代 status 的 `println!`)
 - `drives::gather() -> Result<Vec<BackupDrive>>`(GUI 列盘;或直接 `scan_mounted()`)。
-- **`archive::plan(cfg, opts) -> Result<ArchivePlan>`(新增,Finding #1)**:不动数据算出本轮计划 —— `ArchivePlan { drive: BackupDrive, items: Vec<PlanItem> }`,`PlanItem { name, est_bytes, action: PlanAction }`。**`PlanAction = Archive { dest_name } | RenameAndArchive { dest_name }(重名)| Skip(reason)(未稳定 / 0 文件 …)| SealAndStop(reason)`**(余量不足 → **封盘并停止本轮**,而非 skip 该项目继续——对应现有 archive.rs 行为,Finding #2)。**dry-run = 渲染 plan;GUI 备份页列项目用 plan;正式 archive 与 plan 共享同一 per-project 决策逻辑**,不重复实现。CLI dry-run 改为渲染 ArchivePlan。
+- **`archive::plan(cfg, opts) -> Result<ArchivePlan>` + `archive::run_plan(cfg, plan, cancel, reporter) -> Result<ArchiveSummary>`(新增,Finding #1 + 本轮"冻结决策")**:`plan` 不动数据算出本轮计划 —— `ArchivePlan { drive: BackupDrive, items: Vec<PlanItem> }`,`PlanItem { name, est_bytes, action: PlanAction }`,**`PlanAction = Archive { dest_name } | RenameAndArchive { dest_name } | Skip(reason)(未稳定 / 0 文件 …)| SealAndStop(reason)`**(余量不足 → 封盘停本轮,非 skip 继续,Finding #2)。**`run_plan` 消费同一份 plan 执行**,冻结 plan 里的动态决策(`dest_name`——含重名时基于 `Local::now()` 的时间戳名、选盘、`SealAndStop`),保证 **dry-run / GUI 预览 = 正式执行**(否则各自重算时间戳会漂移)。run_plan 仍对每项做真实 manifest / 复制 / 校验 / 复核 / 事务提交(plan 冻的是"决策与命名",不是文件内容)。`archive::run = plan() + run_plan()`;CLI dry-run = 只 plan 并渲染;GUI:`plan()` → 预览 → `run_plan(该 plan)`。
 - **`VerifyReport` 扩明细(上轮 #2 + 本轮 #3 项目上下文)**:在 `checked/bad/extra` 计数外加 `issues: Vec<VerifyIssue>` 与 `extras: Vec<ExtraFile>`,**每条带项目上下文**(verify 逐 manifest/项目复查,同一 `rel` 在不同项目会重复):`VerifyIssue { project, rel, kind: Missing | SizeMismatch | Corrupt | Unverifiable | EnumError }`、`ExtraFile { project, rel }`。CLI 渲染成现有"· 项目名 / 逐行"文本;GUI 复查页能精确指向"哪个项目的哪个文件"。
 
 ### 4.2 类型化盘(L-021,分读写场景)
@@ -66,7 +66,7 @@ GUI 直接调 core,需把"只为 CLI 打印"的查询改成**返回结构化数�
 
 ### 4.4 last_verify 持久化(原 Finding #3;并解决 §3 "只读"冲突)
 **verify 对备份盘保持严格只读**——不写盘内任何文件。否则会违反 §3 "verify 只读"前提、让封盘/写保护盘无法复查、并把"元数据写失败"与"数据损坏"混为一谈。
-复查时间改记到**本地 `system_root`**:成功完成后写/更新 `备份系统\复查记录.csv`(列 `drive_id, last_verify_utc`)。`status::gather` 读它 → `last_verify: Option<LastVerify { drive_id, when }>`(无记录 = 未知/None)。这与 system_root 已承载全局索引/序号/状态一致;盘内仍自洽(校验清单在盘上,复查时间属本机操作记录)。**取消或失败的复查不更新该记录**。配测试(写+读往返、缺记录→None)。
+复查**结果**(不只时间)改记到**本地 `system_root`**:**跑完一轮复查后**(无论 clean 还是发现问题——verify 发现损坏仍是"跑完了",返回 `Ok`)写/更新 `备份系统\复查记录.csv`(列 `drive_id, last_verify_utc, status, bad, extra`)。`status::gather` 读它 → `last_verify: Option<LastVerify { drive_id, when, status }>`,**`status: VerifyOutcome = Clean | IssuesFound { bad } | ExtraOnly { extra }`**(Dashboard 要显示"上次复查时间 + 当次是否发现损坏",不能只显示时间)。无记录 = 未知/None。**取消 / 出错(没跑完)的复查不更新该记录**。这与 system_root 已承载全局索引/序号/状态一致;盘内仍自洽(校验清单在盘上,复查记录属本机操作记录)。配测试(三种 outcome 写+读往返、缺记录→None)。
 
 ### 4.5 取消钩子
 - `archive::run(.., cancel: &AtomicBool)`、`verify::run(.., cancel: &AtomicBool)`(CLI 传一个永不取消的常量,行为不变;GUI 传可置位的)。
