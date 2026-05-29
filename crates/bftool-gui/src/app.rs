@@ -60,11 +60,13 @@ pub struct App {
     pub progress: Arc<Mutex<ProgressState>>,
     /// 当前任务的日志接收端(任务结束后置 None)。
     pub rx: Option<Receiver<UiEvent>>,
-    /// 进行中的后台任务(None = 空闲)。
-    pub task: Option<BackgroundTask>,
+    /// 进行中的执行任务(archive run / verify;None = 空闲)。
+    pub task: Option<BackgroundTask<String>>,
+    /// 进行中的计划预览任务(archive::plan;只读、后台算,避免 UI 线程遍历大目录卡顿)。
+    pub plan_task: Option<BackgroundTask<ArchivePlan>>,
     /// 上一个任务的摘要(Done/Failed 文案),供结果区显示。
     pub last_summary: Option<String>,
-    /// 备份页的计划预览(archive::plan 的结果);T6 填充。
+    /// 备份页的计划预览(archive::plan 的结果)。
     pub archive_plan: Option<ArchivePlan>,
     /// 备份页高级设置的持久 UI 状态(跨帧保留)。
     pub archive_ui: crate::views::archive::ArchiveUiState,
@@ -102,6 +104,7 @@ impl App {
             progress: Arc::new(Mutex::new(ProgressState::default())),
             rx: None,
             task: None,
+            plan_task: None,
             last_summary: None,
             archive_plan: None,
             archive_ui: crate::views::archive::ArchiveUiState::default(),
@@ -122,8 +125,8 @@ impl App {
                 }
             }
         }
-        let finished = self.task.as_ref().map(|t| t.is_finished());
-        match finished {
+        // 执行任务(run/verify)→ 摘要
+        match self.task.as_ref().map(|t| t.is_finished()) {
             Some(true) => {
                 if let Some(outcome) = self.task.as_mut().and_then(|t| t.take_outcome()) {
                     self.last_summary = Some(match outcome {
@@ -134,14 +137,35 @@ impl App {
                 self.task = None;
                 self.rx = None;
             }
-            Some(false) => ctx.request_repaint(), // 任务进行中:持续刷新进度/日志
+            Some(false) => ctx.request_repaint(),
+            None => {}
+        }
+        // 计划预览任务(plan)→ archive_plan
+        match self.plan_task.as_ref().map(|t| t.is_finished()) {
+            Some(true) => {
+                if let Some(outcome) = self.plan_task.as_mut().and_then(|t| t.take_outcome()) {
+                    match outcome {
+                        TaskOutcome::Done(plan) => self.archive_plan = Some(plan),
+                        TaskOutcome::Failed(e) => {
+                            self.archive_plan = None;
+                            self.logs.push((LogLevel::Error, e));
+                        }
+                    }
+                }
+                self.plan_task = None;
+                // plan 期间用的也是 rx(GuiReporter 日志);算完释放
+                if self.task.is_none() {
+                    self.rx = None;
+                }
+            }
+            Some(false) => ctx.request_repaint(),
             None => {}
         }
     }
 
-    /// 是否有进行中的后台任务(导航/按钮据此禁用)。
+    /// 是否有进行中的后台任务(执行或计划预览)。导航/按钮据此禁用。
     pub fn is_busy(&self) -> bool {
-        self.task.is_some()
+        self.task.is_some() || self.plan_task.is_some()
     }
 }
 
