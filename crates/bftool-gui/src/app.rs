@@ -68,6 +68,8 @@ pub struct App {
     pub archive_plan: Option<ArchivePlan>,
     /// 备份页高级设置的持久 UI 状态(跨帧保留)。
     pub archive_ui: crate::views::archive::ArchiveUiState,
+    /// 盘列表缓存(None = 未扫;带「刷新」按钮,不每帧重扫)。
+    pub drives_cache: Option<Vec<bftool_core::engine::drive::DriveInfo>>,
 }
 
 impl App {
@@ -95,6 +97,7 @@ impl App {
             last_summary: None,
             archive_plan: None,
             archive_ui: crate::views::archive::ArchiveUiState::default(),
+            drives_cache: None,
         }
     }
 
@@ -156,6 +159,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
             View::Dashboard => crate::views::dashboard::ui(self, ui),
             View::Archive => crate::views::archive::ui(self, ui),
+            View::Drives => crate::views::drives::ui(self, ui),
             other => {
                 ui.heading(other.label());
                 ui.label("（此视图将在 Phase 3 接入）");
