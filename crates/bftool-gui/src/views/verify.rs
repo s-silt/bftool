@@ -1,6 +1,7 @@
 //! 复查视图:选盘 → 后台 verify::run(重算 SHA256 比对清单)。唯一长任务,复用 archive 的后台机制。
 //! 复查对盘**只读**(Spec D §4.4);逐项 issue 经 GuiReporter 进日志,摘要经 task 回传。(Spec D §3/§5)
 
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
@@ -85,6 +86,34 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
+    // ── 单目标:只复查一个备份文件夹 / 一个文件的哈希 ──
+    ui.add_space(6.0);
+    ui.label("或只复查单个目标(到备份盘「项目」下选文件夹或文件):");
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy, egui::Button::new("📁 选文件夹复查"))
+            .clicked()
+        {
+            if let Some(p) = rfd::FileDialog::new()
+                .set_title("选择要复查的备份项目文件夹")
+                .pick_folder()
+            {
+                start_verify_one(app, p);
+            }
+        }
+        if ui
+            .add_enabled(!busy, egui::Button::new("📄 选文件复查"))
+            .clicked()
+        {
+            if let Some(p) = rfd::FileDialog::new()
+                .set_title("选择要复查的备份文件")
+                .pick_file()
+            {
+                start_verify_one(app, p);
+            }
+        }
+    });
+
     ui.separator();
     util::progress_bar(&app.progress, ui);
     if let Some(s) = &app.last_summary {
@@ -119,6 +148,23 @@ fn start_verify(app: &mut App) {
     let sel = app.verify_ui.selected.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
         let r = verify::run(&cfg, &reporter, sel.as_deref(), cancel)?;
+        Ok(verify_summary(r.checked, r.bad, r.extra, r.cancelled))
+    }));
+}
+
+/// 后台复查单个目标(文件夹/文件)的哈希。core 自动定位所在盘 + 项目。
+fn start_verify_one(app: &mut App, target: PathBuf) {
+    app.logs.clear();
+    app.last_summary = None;
+    if let Ok(mut p) = app.progress.lock() {
+        *p = ProgressState::default();
+    }
+    let (tx, rx) = mpsc::channel();
+    let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
+    app.rx = Some(rx);
+    let cfg = app.cfg.clone();
+    app.task = Some(BackgroundTask::spawn(move |cancel| {
+        let r = verify::verify_one(&cfg, &reporter, &target, cancel)?;
         Ok(verify_summary(r.checked, r.bad, r.extra, r.cancelled))
     }));
 }

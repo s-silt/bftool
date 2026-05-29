@@ -71,9 +71,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         .num_columns(2)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
-            field(ui, "待备份(源)目录", &mut app.settings_ui.ready_root);
-            field(ui, "已备份目录", &mut app.settings_ui.archived_root);
-            field(ui, "备份系统目录", &mut app.settings_ui.system_root);
+            // 三个目录:点击选择(原生对话框),不手输路径。
+            dir_field(ui, "待备份(源)目录", &mut app.settings_ui.ready_root);
+            dir_field(ui, "已备份目录", &mut app.settings_ui.archived_root);
+            dir_field(ui, "备份系统目录", &mut app.settings_ui.system_root);
             field(ui, "预留余量(GB)", &mut app.settings_ui.reserve_gb);
             field(ui, "稳定期(分钟)", &mut app.settings_ui.stable_minutes);
             field(ui, "认盘最小容量(GB)", &mut app.settings_ui.min_drive_gb);
@@ -88,9 +89,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             .num_columns(2)
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
-                field(ui, "WinRAR", &mut app.settings_ui.winrar);
-                field(ui, "Bandizip", &mut app.settings_ui.bandizip);
-                field(ui, "7-Zip", &mut app.settings_ui.seven_zip);
+                // 测试器是 .exe 文件:点击选择文件(可清除)。
+                file_field(ui, "WinRAR", &mut app.settings_ui.winrar);
+                file_field(ui, "Bandizip", &mut app.settings_ui.bandizip);
+                file_field(ui, "7-Zip", &mut app.settings_ui.seven_zip);
             });
     });
 
@@ -139,6 +141,71 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.text_edit_singleline(value);
     ui.end_row();
+}
+
+/// 目录行:点击「选择目录…」弹原生对话框设置路径(不手输)。当前值只读显示(过长省略,hover 看全)。
+fn dir_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        if ui.button("选择目录…").clicked() {
+            let mut dlg = rfd::FileDialog::new().set_title(format!("选择{}", label));
+            let cur = value.trim();
+            if !cur.is_empty() {
+                dlg = dlg.set_directory(cur);
+            }
+            if let Some(p) = dlg.pick_folder() {
+                *value = p.display().to_string();
+            }
+        }
+        path_display(ui, value);
+    });
+    ui.end_row();
+}
+
+/// 文件行:点击「选择…」选 .exe(可「清除」)。当前值只读显示。
+fn file_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        if ui.button("选择…").clicked() {
+            let mut dlg = rfd::FileDialog::new()
+                .set_title(format!("选择 {} 可执行文件", label))
+                .add_filter("可执行文件", &["exe"]);
+            let cur = value.trim();
+            if !cur.is_empty() {
+                if let Some(parent) = std::path::Path::new(cur).parent() {
+                    dlg = dlg.set_directory(parent);
+                }
+            }
+            if let Some(p) = dlg.pick_file() {
+                *value = p.display().to_string();
+            }
+        }
+        if !value.trim().is_empty() && ui.button("清除").clicked() {
+            value.clear();
+        }
+        path_display(ui, value);
+    });
+    ui.end_row();
+}
+
+/// 路径只读显示:空 → "(未选择)";过长 → 省略中间,hover 看全。
+fn path_display(ui: &mut egui::Ui, value: &str) {
+    let v = value.trim();
+    if v.is_empty() {
+        ui.weak("(未选择)");
+    } else {
+        ui.monospace(elide(v, 44)).on_hover_text(v);
+    }
+}
+
+/// 过长字符串保留尾部(路径末段更有信息量),前面用 … 省略。
+fn elide(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let tail: String = chars[chars.len() - (max - 1)..].iter().collect();
+    format!("…{tail}")
 }
 
 fn do_save(app: &mut App) {
@@ -222,6 +289,16 @@ mod tests {
             test_archives: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn elide_keeps_short_and_truncates_long_with_tail() {
+        assert_eq!(elide("D:/r", 44), "D:/r");
+        let long = "C:/Users/somebody/Desktop/资料库/待备份/项目目录abcdefghij";
+        let e = elide(long, 20);
+        assert!(e.chars().count() <= 20);
+        assert!(e.starts_with('…'));
+        assert!(e.ends_with("abcdefghij"), "应保留尾部:{e}");
     }
 
     #[test]

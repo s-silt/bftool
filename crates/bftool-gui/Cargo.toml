@@ -19,6 +19,9 @@ eframe.workspace = true
 anyhow.workspace = true
 # 校验 CJK 字体能否解析 + 是否含中文字形(避免把坏字体喂给 egui 触发 panic / tofu)。
 ab_glyph = "0.2"
+# 原生文件/目录选择对话框(设置页选目录、复查页选文件夹/文件)。Windows 用系统 COM 对话框;
+# 关默认特性以免拉入 Linux GTK 依赖(本项目只构建 Windows 目标)。
+rfd = { version = "0.15", default-features = false }
 
 # 仅 Windows 构建:给 exe 嵌入图标 + 版本/产品信息(调 MSVC rc.exe)。
 [target.'cfg(windows)'.build-dependencies]
