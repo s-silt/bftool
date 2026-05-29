@@ -69,6 +69,12 @@ impl Manifest {
             })?;
         }
         wtr.flush()?;
+        // fsync:校验清单是恢复/复查的依据,必须先于"删事务标记"真正落盘。(ledger L-001)
+        let file = wtr
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("刷新校验清单缓冲失败：{}", e))?;
+        crate::engine::durable::sync_file(&file)
+            .with_context(|| format!("校验清单刷盘失败：{}", path.display()))?;
         Ok(())
     }
 }

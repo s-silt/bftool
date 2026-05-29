@@ -39,7 +39,10 @@ impl PendingTxn {
             self.move_to,
             self.started_at,
         );
-        fs::write(path, s).with_context(|| format!("写事务标记失败：{}", path.display()))?;
+        // 用 fsync 写入:事务标记必须先于"移源"真正落盘,否则断电后标记丢失、
+        // 源却已 rename → check_pending_txn 看不到标记 → 项目静默消失。(ledger L-001)
+        crate::engine::durable::write_synced(path, s.as_bytes())
+            .with_context(|| format!("写事务标记失败：{}", path.display()))?;
         Ok(())
     }
 

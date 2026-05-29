@@ -10,11 +10,13 @@
 //! - safety.rs   ── 路径安全检查 / 稳定性检测
 //! - txn.rs      ── 事务标记（进行中事务.txt）
 //! - paths.rs    ── 盘内/系统路径常量与构造
+//! - durable.rs  ── 写文件后 fsync,崩溃/断电后真正落盘
 
 pub mod archive;
 pub mod archive_test;
 pub mod cruft;
 pub mod drive;
+pub mod durable;
 pub mod find;
 pub mod manifest;
 pub mod paths;

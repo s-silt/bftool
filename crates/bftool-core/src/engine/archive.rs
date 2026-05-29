@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::engine::archive_test::{self, Tester, TesterPaths};
 use crate::engine::drive::{self, DriveInfo};
 use crate::engine::manifest::{self, ManifestOpts};
-use crate::engine::{cruft, paths, safety, txn};
+use crate::engine::{cruft, durable, paths, safety, txn};
 use crate::reporter::Reporter;
 
 #[derive(Debug, Default)]
@@ -590,6 +590,11 @@ fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
         .from_writer(file);
     wtr.serialize(row)?;
     wtr.flush()?;
+    // fsync:索引必须先于"删事务标记"真正落盘,否则断电后会出现"标记已删、索引未落"。(ledger L-001)
+    let f = wtr
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("刷新索引缓冲失败：{}", e))?;
+    durable::sync_file(&f).with_context(|| format!("索引刷盘失败：{}", path.display()))?;
     Ok(())
 }
 
@@ -607,6 +612,11 @@ fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
         .from_writer(file);
     wtr.serialize(row)?;
     wtr.flush()?;
+    // fsync:索引必须先于"删事务标记"真正落盘,否则断电后会出现"标记已删、索引未落"。(ledger L-001)
+    let f = wtr
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("刷新索引缓冲失败：{}", e))?;
+    durable::sync_file(&f).with_context(|| format!("索引刷盘失败：{}", path.display()))?;
     Ok(())
 }
 
