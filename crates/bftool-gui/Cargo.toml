@@ -1,0 +1,17 @@
+[package]
+name = "bftool-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "bftool-gui"
+path = "src/main.rs"
+
+[dependencies]
+bftool-core = { path = "../bftool-core" }
+eframe.workspace = true
+anyhow.workspace = true
