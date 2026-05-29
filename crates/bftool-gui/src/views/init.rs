@@ -10,6 +10,7 @@ use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
 use crate::reporter::{GuiReporter, UiEvent};
+use crate::views::util;
 
 /// 初始化页跨帧状态。
 #[derive(Debug, Default)]
@@ -50,10 +51,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                         ui.weak("可初始化");
                     } else {
                         ui.add_enabled(false, egui::Button::new(head));
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0x8a, 0x6d, 0x00),
-                            candidate_block(c),
-                        );
+                        ui.colored_label(util::level_color(LogLevel::Warn), candidate_block(c));
                     }
                 });
             }
@@ -95,7 +93,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     if app.init_ui.force && !app.init_ui.confirm_force {
         ui.colored_label(
-            egui::Color32::from_rgb(0x8a, 0x6d, 0x00),
+            util::level_color(LogLevel::Warn),
             "强制模式需勾选确认才能执行。",
         );
     }
