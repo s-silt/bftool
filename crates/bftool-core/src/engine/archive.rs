@@ -726,10 +726,25 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
-    let text = txn::PendingTxn::read_text(&path)?;
-    let pname = grab_field(&text, "项目").unwrap_or_default();
-    let psrc = grab_field(&text, "源名").unwrap_or_else(|| pname.clone());
-    let parch = grab_field(&text, "将移至").unwrap_or_default();
+    // 结构化读回(替代脆弱的 grab_field 标签抓取);解析失败 → 提示人工核对,不擅自删标记。(ledger L-022)
+    let pending = match txn::PendingTxn::read(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            reporter.error(&format!(
+                "→ 发现事务标记但解析失败({})。请人工核对该项目是否已归档,确认后删除：{}",
+                e,
+                path.display()
+            ));
+            return Ok(());
+        }
+    };
+    let pname = pending.project_dest_name.clone();
+    let psrc = if pending.project_src_name.is_empty() {
+        pname.clone()
+    } else {
+        pending.project_src_name.clone()
+    };
+    let parch = pending.move_to.clone();
     let in_ready = !psrc.is_empty() && cfg.ready_root.join(&psrc).exists();
     let moved = !parch.is_empty() && Path::new(&parch).exists();
     let global = paths::system_global_catalog(&cfg.system_root);
@@ -750,24 +765,11 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
         ));
     } else {
         reporter.error(&format!(
-            "→ 无法自动判定（源不在待备份、目标也未确认）。请按以下信息人工核对，标记保留：\n{}",
-            text
+            "→ 无法自动判定（源不在待备份、目标也未确认）。请人工核对事务标记后处理,标记保留：{}",
+            path.display()
         ));
     }
     Ok(())
-}
-
-fn grab_field(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        // 兼容 "key:" 和 "key  :" 写法（PowerShell 旧版用全角/空格混排）
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(key) {
-            let r = rest.trim_start();
-            let r = r.trim_start_matches([':', '：']).trim();
-            return Some(r.to_string());
-        }
-    }
-    None
 }
 
 fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
