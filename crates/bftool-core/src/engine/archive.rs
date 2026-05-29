@@ -37,9 +37,16 @@ pub struct ArchiveSummary {
     pub failed: usize,
 }
 
+/// 是否处于"没有任何内容完整性校验"的状态:跳过 SHA256(no_hash) 且 archive test 实际关闭。
+/// 等价于只剩 size+count+mtime,是禁止的组合。判定集中在此,core::run 守卫与 CLI 守卫共用
+/// 同一真值,避免两处条件漂移把"无校验后门"悄悄打开。(ledger L-008)
+pub fn verify_disabled(no_hash: bool, test_archives: bool, no_test_archives: bool) -> bool {
+    no_hash && (!test_archives || no_test_archives)
+}
+
 pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<ArchiveSummary> {
-    // Spec B D14/D15 core-level fail-closed guard
-    if opts.no_hash && (!cfg.test_archives || opts.no_test_archives) {
+    // Spec B D14/D15 core-level fail-closed guard(判定收口到 verify_disabled,与 CLI 共用)(ledger L-008)
+    if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
         anyhow::bail!(
             "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
              opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
@@ -824,4 +831,23 @@ fn leading_number(name: &str) -> Option<u64> {
 fn leading_digits(name: &str) -> String {
     let s = name.trim_start();
     s.chars().take_while(|c| c.is_ascii_digit()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── L-008: 无校验判定单一来源,core/cli 共用 verify_disabled ──
+    #[test]
+    fn verify_disabled_truth_table() {
+        // no_hash=false → 始终有 SHA256 兜底,绝不算无校验
+        assert!(!verify_disabled(false, true, false));
+        assert!(!verify_disabled(false, false, true));
+        // no_hash=true 且 archive test 开启 → 有压缩包测试兜底,允许
+        assert!(!verify_disabled(true, true, false));
+        // no_hash=true 且 test_archives=false → 无校验,禁止
+        assert!(verify_disabled(true, false, false));
+        // no_hash=true 且 no_test_archives=true → 无校验,禁止
+        assert!(verify_disabled(true, true, true));
+    }
 }

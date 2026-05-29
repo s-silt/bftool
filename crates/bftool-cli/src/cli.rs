@@ -146,9 +146,10 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                 );
             }
 
-            // Batch 3.5：--unsafe-no-hash + 任何方式关 archive test = 几乎无校验
-            let effective_test_archives = cfg.test_archives && !no_test_archives;
-            if unsafe_no_hash && !effective_test_archives {
+            // Batch 3.5：--unsafe-no-hash + 任何方式关 archive test = 几乎无校验。
+            // 判定收口到 core 的 verify_disabled,与 core::run 守卫同一真值(防漂移)。(ledger L-008)
+            if engine::archive::verify_disabled(unsafe_no_hash, cfg.test_archives, no_test_archives)
+            {
                 bail!(
                     "拒绝运行：--unsafe-no-hash 与「压缩包测试关闭」不能同时存在。\n\
                      同时关掉 SHA256 内容校验和压缩包内部测试 → 只剩文件数 + 大小 + 修改时间，\n\
