@@ -198,16 +198,7 @@ pub fn plan(cfg: &Config, opts: &Options, reporter: &dyn Reporter) -> Result<Arc
             opts: opts.clone(),
         });
     }
-    let mut projects: Vec<_> = fs::read_dir(&cfg.ready_root)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    // 按文件夹名前导数字升序，无数字前缀的排最后
-    projects.sort_by_key(|p| {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        leading_number(name).unwrap_or(u64::MAX)
-    });
+    let projects = discover_projects(&cfg.ready_root, reporter)?;
     if projects.is_empty() {
         reporter.info("待备份 中没有待归档项目，结束。");
     } else {
@@ -1365,6 +1356,15 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
             fs::rename(&part, &target).with_context(|| {
                 format!("提交复制失败：{} → {}", part.display(), target.display())
             })?;
+        } else {
+            // L-01(VulnGym 审计):既非普通目录也非普通文件 = 符号链接/junction/特殊条目。
+            // follow_links(false) 有意不跟随(防链接逃逸把链接外内容复制进备份),但**不静默丢弃**——
+            // warn 告知用户它没进备份,否则 manifest 同样漏登、verify 还会误报"完好"。
+            let rel = path.strip_prefix(src).unwrap_or(path);
+            reporter.warn(&format!(
+                "跳过链接(未复制):{} —— 不跟随符号链接/junction;其指向的内容若在项目内会作为普通文件单独备份。",
+                rel.display()
+            ));
         }
     }
     if !errors.is_empty() {
@@ -1374,6 +1374,37 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
         anyhow::bail!("复制阶段枚举源失败 {} 项 → 本项目跳过。", errors.len());
     }
     Ok(())
+}
+
+/// 列出 待备份 下的待归档项目目录(按文件夹名前导数字升序,无数字前缀的排最后)。
+///
+/// 顶层的符号链接 / junction **不**作为项目归档(本工具不跟随链接,防链接逃逸),
+/// 但逐个 `reporter.warn` 告知 —— 否则用户用 junction 把外部目录挂进待备份区时,
+/// 整个"项目"会被静默忽略、连"发现 N 个项目"的计数里都看不到。(L-05 VulnGym 审计)
+fn discover_projects(ready_root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {
+    let mut projects = Vec::new();
+    let mut linked = Vec::new();
+    for e in fs::read_dir(ready_root)?.filter_map(|e| e.ok()) {
+        let Ok(ft) = e.file_type() else { continue };
+        // is_symlink() 在 Windows 上对 junction(mount point)同样为 true,且此时 is_dir()==false。
+        if ft.is_symlink() {
+            linked.push(e.file_name().to_string_lossy().into_owned());
+        } else if ft.is_dir() {
+            projects.push(e.path());
+        }
+    }
+    for name in &linked {
+        reporter.warn(&format!(
+            "待备份下的链接「{}」不会被归档(本工具不跟随符号链接/junction);如需备份请改放实际目录。",
+            name
+        ));
+    }
+    // 按文件夹名前导数字升序，无数字前缀的排最后
+    projects.sort_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        leading_number(name).unwrap_or(u64::MAX)
+    });
+    Ok(projects)
 }
 
 fn leading_number(name: &str) -> Option<u64> {
@@ -1521,6 +1552,96 @@ mod tests {
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(fs::read(dst.join("sub").join("b.bin")).unwrap(), b"xyz");
         assert!(!dst.join("a.txt.bftool-part").exists(), "不应遗留 .part");
+    }
+
+    // ── L-01(VulnGym 审计):符号链接/junction 不静默丢弃,复制阶段 warn 告知;不跟随(防逃逸) ──
+    #[test]
+    fn copy_folder_warns_on_link_not_silent() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("t");
+        let target = d.path().join("target");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(src.join("real.txt"), b"hi").unwrap();
+        fs::write(target.join("inner.txt"), b"x").unwrap();
+        // 在 src 内建一个指向 target 的链接:Windows 用 junction(免管理员),Unix 用 symlink。
+        let link = src.join("jlink");
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+        if !made {
+            eprintln!("跳过 copy_folder_warns_on_link_not_silent：本环境无法创建链接");
+            return;
+        }
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        copy_folder(&src, &dst, &rep).unwrap();
+        assert!(dst.join("real.txt").is_file(), "普通文件应被复制");
+        assert!(
+            !dst.join("jlink").join("inner.txt").exists(),
+            "不应跟随链接把链接外内容复制进来(防逃逸)"
+        );
+        let logs = rep.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("Warn") && l.contains("jlink")),
+            "链接应被 warn 告知而非静默跳过,实际日志:{:?}",
+            logs
+        );
+    }
+
+    // ── L-05(VulnGym 审计):待备份下顶层若是链接,不归档但要 warn 告知(否则整项目静默忽略) ──
+    #[test]
+    fn discover_projects_warns_on_top_level_link_and_excludes_it() {
+        let d = tempfile::tempdir().unwrap();
+        let ready = d.path().join("ready");
+        let ext = d.path().join("external");
+        fs::create_dir_all(ready.join("001proj")).unwrap();
+        fs::create_dir_all(&ext).unwrap();
+        let link = ready.join("002link");
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&ext)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&ext, &link).is_ok();
+        if !made {
+            eprintln!("跳过 discover_projects_warns_on_top_level_link：本环境无法创建链接");
+            return;
+        }
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        let projects = discover_projects(&ready, &rep).unwrap();
+        assert!(
+            projects.iter().any(|p| p.file_name().unwrap() == "001proj"),
+            "正常项目应在列表"
+        );
+        assert!(
+            projects.iter().all(|p| p.file_name().unwrap() != "002link"),
+            "链接不应作为项目归档,实际:{:?}",
+            projects
+        );
+        let logs = rep.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("Warn") && l.contains("002link")),
+            "顶层链接应 warn 告知,实际:{:?}",
+            logs
+        );
     }
 
     // ── L-017 修订(Phase 4 F-4):本盘索引损坏 → fail-closed Skipped,不覆盖也不重复写盘 ──

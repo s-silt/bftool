@@ -13,6 +13,10 @@ use crate::engine::paths;
 /// 本机总索引来源在结果里的来源标签。源码与测试统一引用,避免中文字面量重复。(F5)
 pub const LOCAL_SOURCE: &str = "本机";
 
+/// 单个索引 CSV 的大小上限。多机汇总会读其它电脑的索引(半信任输入),
+/// `fs::read` 全量载入前先按此上限拦截,避免超大/畸形文件撑爆内存。(VulnGym 审计 CSV-1)
+const MAX_CATALOG_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+
 /// 一条查询命中(结构化,GUI 列表 / CLI 表格各自渲染)。
 #[derive(Debug, Clone)]
 pub struct FindMatch {
@@ -34,6 +38,8 @@ pub struct FindOutcome {
     pub sources_searched: usize,
     /// 读取失败的来源标签(额外来源不存在、或任何来源读取/解析失败)；本机索引**不存在**不算失败(=尚未归档)，但本机索引存在却读取失败会计入此列表。
     pub sources_failed: Vec<String>,
+    /// 跨所有成功读取来源累加的「格式错误被跳过」行数。>0 说明部分行未解析进结果,应提示用户。(CSV-2)
+    pub malformed_rows: usize,
 }
 
 /// 整行去重 key(全部展示字段)。只折叠"逐字段完全相同"的行 —— 即同一份索引被
@@ -84,7 +90,20 @@ fn read_catalog(
     keyword: &str,
     out: &mut Vec<FindMatch>,
     seen: &mut HashSet<RowKey>,
-) -> Result<()> {
+    max_bytes: u64,
+) -> Result<usize> {
+    // CSV-1:全量 fs::read 前先按大小上限拦截,避免超大/畸形他机索引撑爆内存。
+    let len = fs::metadata(path)
+        .with_context(|| format!("读索引元数据失败：{}", path.display()))?
+        .len();
+    if len > max_bytes {
+        anyhow::bail!(
+            "索引文件过大（{} 字节 > 上限 {} 字节），已跳过：{}",
+            len,
+            max_bytes,
+            path.display()
+        );
+    }
     let bytes = fs::read(path).with_context(|| format!("读索引失败：{}", path.display()))?;
     let mut rdr = csv::Reader::from_reader(std::io::Cursor::new(bytes));
     let headers = rdr.headers().cloned().unwrap_or_default();
@@ -108,7 +127,16 @@ fn read_catalog(
         i.and_then(|c| rec.get(c)).unwrap_or("").to_string()
     };
 
-    for rec in rdr.records().flatten() {
+    let mut malformed = 0usize;
+    for result in rdr.records() {
+        let rec = match result {
+            Ok(r) => r,
+            // CSV-2:坏行(列数不符等)不再被 flatten() 静默吞,计数后跳过,供调用方提示用户。
+            Err(_) => {
+                malformed += 1;
+                continue;
+            }
+        };
         let folder = get(&rec, i_folder);
         let no = get(&rec, i_no);
         if !folder.contains(keyword) && !no.contains(keyword) {
@@ -135,7 +163,7 @@ fn read_catalog(
             out.push(m);
         }
     }
-    Ok(())
+    Ok(malformed)
 }
 
 /// 读一个来源:能读则读、计入已检索;读失败只记为失败来源、绝不中断整次查询。
@@ -148,6 +176,7 @@ fn read_source(
     keyword: &str,
     out: &mut FindOutcome,
     seen: &mut HashSet<RowKey>,
+    max_bytes: u64,
 ) {
     if !path.is_file() {
         if !is_main {
@@ -155,8 +184,11 @@ fn read_source(
         }
         return;
     }
-    match read_catalog(path, label, keyword, &mut out.matches, seen) {
-        Ok(()) => out.sources_searched += 1,
+    match read_catalog(path, label, keyword, &mut out.matches, seen, max_bytes) {
+        Ok(bad) => {
+            out.sources_searched += 1;
+            out.malformed_rows += bad;
+        }
         Err(_) => out.sources_failed.push(label.to_string()),
     }
 }
@@ -168,11 +200,27 @@ pub fn search(cfg: &Config, keyword: &str) -> Result<FindOutcome> {
     let mut seen: HashSet<RowKey> = HashSet::new();
 
     let main = paths::system_global_catalog(&cfg.system_root);
-    read_source(&main, LOCAL_SOURCE, true, keyword, &mut out, &mut seen);
+    read_source(
+        &main,
+        LOCAL_SOURCE,
+        true,
+        keyword,
+        &mut out,
+        &mut seen,
+        MAX_CATALOG_BYTES,
+    );
 
     for p in &cfg.extra_catalogs {
         let label = catalog_label(p);
-        read_source(p, &label, false, keyword, &mut out, &mut seen);
+        read_source(
+            p,
+            &label,
+            false,
+            keyword,
+            &mut out,
+            &mut seen,
+            MAX_CATALOG_BYTES,
+        );
     }
 
     Ok(out)
@@ -220,6 +268,12 @@ pub fn run(cfg: &Config, keyword: &str) -> Result<()> {
             "注意：{} 个额外索引来源读取失败，已跳过：{}",
             outcome.sources_failed.len(),
             outcome.sources_failed.join("、")
+        );
+    }
+    if outcome.malformed_rows > 0 {
+        println!(
+            "注意：{} 行因格式错误被跳过（未计入结果，可能是索引文件损坏或列不齐）。",
+            outcome.malformed_rows
         );
     }
     Ok(())
@@ -393,6 +447,54 @@ mod tests {
         assert_eq!(r.matches.len(), 1, "本机仍查到");
         assert_eq!(r.sources_searched, 1, "无法识别的来源不计入已检索");
         assert_eq!(r.sources_failed, vec!["wrong".to_string()], "记为失败来源");
+    }
+
+    // ── CSV-2(VulnGym 审计):坏行不再被 flatten() 静默吞,而是计数 ──
+    #[test]
+    fn read_catalog_counts_malformed_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.csv");
+        // 表头 6 列;第二数据行列数不符 → csv 解析 Err(非 flexible)。
+        std::fs::write(
+            &p,
+            "文件夹名,备份盘名,备份时间,编号,盘内路径,校验方式\n\
+             proj,备份1,2026-05-29,001,项目\\001,SHA256-OK\n\
+             badrow,只有两列\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let malformed =
+            read_catalog(&p, "src", "proj", &mut out, &mut seen, MAX_CATALOG_BYTES).unwrap();
+        assert_eq!(out.len(), 1, "好行仍命中");
+        assert_eq!(malformed, 1, "坏行被计数而非静默吞");
+    }
+
+    // ── CSV-1(VulnGym 审计):超过大小上限的索引文件直接判失败,不全量载入内存 ──
+    #[test]
+    fn read_catalog_rejects_oversized_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("big.csv");
+        std::fs::write(&p, "文件夹名,编号\nproj,001\n").unwrap(); // 远超 5 字节
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let r = read_catalog(&p, "src", "proj", &mut out, &mut seen, 5);
+        assert!(r.is_err(), "超出 max_bytes 上限应返回 Err");
+    }
+
+    // ── 端到端:本机索引坏行计数汇入 outcome.malformed_rows ──
+    #[test]
+    fn search_reports_malformed_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_catalog(
+            d.path(),
+            "文件夹名,备份盘名,备份时间,编号,盘内路径,校验方式\n\
+             proj,备份1,2026-05-29,001,项目\\001,SHA256-OK\n\
+             bad,x\n",
+        );
+        let r = search(&cfg, "proj").unwrap();
+        assert_eq!(r.matches.len(), 1);
+        assert_eq!(r.malformed_rows, 1, "坏行计数汇入 outcome");
     }
 
     #[test]
