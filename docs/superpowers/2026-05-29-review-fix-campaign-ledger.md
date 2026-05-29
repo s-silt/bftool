@@ -67,7 +67,28 @@ code-reviewer + silent-failure-hunter 各自独立尝试推翻这批修复 → *
 - **L-021 / L-011 / L-012(P2)**:L-021 是最大的类型重构(`DriveInfo`→`WritableDrive`/`SealedDrive` 拆分,贯穿 drive/archive/verify),价值是"塑造 GUI 直接调用的 core API"——建议**与桌面版设计一并做**(届时才知 GUI 需要什么 API 形状),而非现在盲改。L-011/L-012 是事务恢复的微秒级崩溃窗口边角,数据已被 txn 标记机制守住(不丢、提示人工),价值低改动深,建议记 backlog。
 - P3 多为文档/小测,可随手清或留。
 
-## 下一步:Phase 5(CI 已硬化 `0792d66`,待 push 实跑)→ 桌面版设计
+### Phase 4 第 2 轮(收敛判定)
+
+独立 agent 复核 4 条残留修复 → 全部 verdict=**sound**;全局再扫**结论:本轮无新增 P0/P1/P2**。唯一新发现:
+- **F-N1 | P3**:`dup_in_drive`(重名再归档)用 wall-clock 时间戳拼 `dest_name`,崩溃后下一轮生成**不同**时间戳目录 → 续传失效 + 上轮半成品目录成孤儿。数据安全不变量未破(源留待备份、fail-closed),触发面窄(重名+崩溃)。记 backlog(修法:dup 后缀改用稳定派生而非 wall-clock)。
+
+**停止条件**:round 1 修残留 → round 2 对 P0/P1/P2 dry。视为**已收敛**(P3 可留)。
+
+## Phase 5 收尾
+
+- **CI 硬化**:`0792d66`,已 push,PR #1 触发实跑(fmt/build/test/clippy on windows + audit on ubuntu)。
+- **cargo-audit**:本机 ARM64 编译该工具失败(其依赖问题),但 audit 是平台无关(只读 Cargo.lock),已由 CI 的 ubuntu audit job 覆盖。
+- **推送**:分支 `campaign/review-fix-p2` 已 push;PR #1 → main。
+
+## DoD 评估(§10)
+
+1. 确认成立的 P0/P1/P2 全部已修 + 回归测试 + Phase 4 verified sound;L-021/L-011/L-012 **显式取舍**(L-021→桌面版 API、L-011/012→backlog),L-001 非 NTFS 残留如实记。✅(取舍项已用户确认)
+2. 无 `Needs-evidence` 残留。✅
+3. §6 门禁:本地全绿(fmt/build/test/clippy,79 测试);CI 实跑待 PR #1 结果。🟡
+4. ledger 归档 + README/spec drift 已修。✅
+5. P3 backlog 列出(F-N1、L-016/031/039/041/042/028/029/030),交用户。✅
+
+## 下一步:桌面版设计(L-021 等 core-API 重构在此一并落地)
 
 ---
 
