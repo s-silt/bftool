@@ -144,6 +144,7 @@ fn start_verify(app: &mut App) {
     let (tx, rx) = mpsc::channel();
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
     app.rx = Some(rx);
+    app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
     let sel = app.verify_ui.selected.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
@@ -162,6 +163,7 @@ fn start_verify_one(app: &mut App, target: PathBuf) {
     let (tx, rx) = mpsc::channel();
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
     app.rx = Some(rx);
+    app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
         let r = verify::verify_one(&cfg, &reporter, &target, cancel)?;

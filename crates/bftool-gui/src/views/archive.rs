@@ -213,6 +213,7 @@ fn start_archive(app: &mut App) {
     let (tx, rx) = mpsc::channel();
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
     app.rx = Some(rx);
+    app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
         let s = archive::run_plan(&cfg, &plan, cancel, &reporter)?;
