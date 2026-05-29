@@ -218,27 +218,27 @@ fn system_time_to_rfc3339(t: SystemTime) -> String {
 /// 三重比对结果
 #[derive(Debug, Default)]
 pub struct Diff {
-    pub ok: bool,
     pub reasons: Vec<String>,
     /// 目标侧有问题的相对路径（多余/大小不符/哈希不符），用来隔离重传
     pub bad_dst_rels: Vec<String>,
 }
 
+impl Diff {
+    /// 是否通过:由 reasons 派生(有任何 reason = 不通过),消除 ok 字段与 reasons 漂移的可能。(ledger L-024)
+    pub fn ok(&self) -> bool {
+        self.reasons.is_empty()
+    }
+}
+
 /// 用源清单核对目标清单：数量、字节、逐文件相对路径 + 大小 (+ 哈希)。
 pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
-    let mut d = Diff {
-        ok: true,
-        reasons: Vec::new(),
-        bad_dst_rels: Vec::new(),
-    };
+    let mut d = Diff::default();
 
     if src.count() != dst.count() {
-        d.ok = false;
         d.reasons
             .push(format!("文件数 src={} dst={}", src.count(), dst.count()));
     }
     if src.total_bytes() != dst.total_bytes() {
-        d.ok = false;
         d.reasons.push(format!(
             "总字节 src={} dst={}",
             src.total_bytes(),
@@ -248,19 +248,16 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
     let smap: HashMap<&str, &Entry> = src.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
     for ent in &dst.entries {
         let Some(s) = smap.get(ent.rel.as_str()) else {
-            d.ok = false;
             d.reasons.push(format!("目标多出 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
             continue;
         };
         if s.size != ent.size {
-            d.ok = false;
             d.reasons.push(format!("大小不一致 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
             continue;
         }
         if check_hash && !s.hash.is_empty() && s.hash != ent.hash {
-            d.ok = false;
             d.reasons.push(format!("哈希不一致 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
         }
@@ -271,7 +268,6 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
     let dmap: HashMap<&str, &Entry> = dst.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
     for ent in &src.entries {
         if !dmap.contains_key(ent.rel.as_str()) {
-            d.ok = false;
             d.reasons.push(format!("源有目标缺 {}", ent.rel));
         }
     }
@@ -401,7 +397,7 @@ mod tests {
             entries: vec![e("a", 10, "h1", ""), e("c", 10, "h3", "")],
         };
         let d = diff(&src, &dst, true);
-        assert!(!d.ok);
+        assert!(!d.ok());
         assert!(
             d.reasons
                 .iter()
@@ -420,7 +416,7 @@ mod tests {
             entries: vec![e("a", 10, "h1", "")],
         };
         let d = diff(&src, &dst, true);
-        assert!(!d.ok);
+        assert!(!d.ok());
         assert!(d
             .reasons
             .iter()
@@ -435,6 +431,6 @@ mod tests {
         let dst = Manifest {
             entries: vec![e("a", 10, "h1", "")],
         };
-        assert!(diff(&src, &dst, true).ok);
+        assert!(diff(&src, &dst, true).ok());
     }
 }

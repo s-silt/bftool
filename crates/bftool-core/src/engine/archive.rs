@@ -393,7 +393,7 @@ fn handle_one(
         reporter,
     )?;
     let d = manifest::diff(&src, &dst, !opts.no_hash);
-    if !d.ok {
+    if !d.ok() {
         reporter.error(&format!(
             "校验失败：{} → 不写索引、不移动源。",
             d.reasons.join("; ")
