@@ -83,7 +83,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        setup_style(&cc.egui_ctx);
         let mut logs = Vec::new();
         // 不吞错:配置加载失败时退默认,但把错误进日志面板让用户可见(Spec D §6 / 不掩盖 fail-closed)。
         let (cfg, config_source) = match Config::load_with_source(None) {
@@ -169,6 +170,44 @@ impl App {
     }
 }
 
+/// 启动时设置外观:装中文字体(关键!)+ 浅色主题(新手友好,贴近 Windows 风格)+ 略宽间距。
+fn setup_style(ctx: &egui::Context) {
+    install_cjk_font(ctx);
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::light();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    ctx.set_style(style);
+}
+
+/// 装一个系统自带的 CJK 字体(否则中文渲染成方块)。运行时从 Windows 字体目录读,
+/// 不内嵌(避免 ~16MB 二进制膨胀)。插在字体链首位,但保留 egui 默认字体作后备(emoji 仍可渲染)。
+/// 找不到任何 CJK 字体 → 退默认(中文可能方块,但不崩)。
+fn install_cjk_font(ctx: &egui::Context) {
+    const CANDIDATES: [&str; 4] = [
+        r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑(优先)
+        r"C:\Windows\Fonts\msyh.ttf",   // 旧版雅黑
+        r"C:\Windows\Fonts\simhei.ttf", // 黑体
+        r"C:\Windows\Fonts\simsun.ttc", // 宋体
+    ];
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "cjk".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump(ctx);
@@ -185,11 +224,20 @@ impl eframe::App for App {
                 for v in View::ALL {
                     // 任务进行中禁用导航,避免切走正在跑的备份页(简单稳妥;Phase 3 可放开只读视图)。
                     ui.add_enabled_ui(!busy || v == current, |ui| {
-                        if ui.selectable_label(current == v, v.label()).clicked() {
+                        if ui
+                            .selectable_label(current == v, v.label())
+                            .on_hover_text(v.label())
+                            .clicked()
+                        {
                             self.view = v;
                         }
                     });
                 }
+                // 底部版本号
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.add_space(6.0);
+                    ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
