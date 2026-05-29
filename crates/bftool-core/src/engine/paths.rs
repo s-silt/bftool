@@ -21,6 +21,7 @@ pub const GLOBAL_CATALOG_FILE: &str = "备份索引名单.csv";
 pub const PENDING_TXN_FILE: &str = "进行中事务.txt";
 pub const NEED_MANUAL_FILE: &str = "需人工处理.txt";
 pub const DRIVE_SEQ_FILE: &str = "盘号计数.txt";
+pub const VERIFY_LOG_FILE: &str = "复查记录.csv";
 
 pub fn drive_info_dir(drive_root: &Path) -> PathBuf {
     drive_root.join(DRIVE_INFO_DIR)
@@ -72,4 +73,8 @@ pub fn system_drive_seq(system_root: &Path) -> PathBuf {
 
 pub fn system_logs_dir(system_root: &Path) -> PathBuf {
     system_root.join(SYSTEM_LOGS_DIR)
+}
+
+pub fn system_verify_log(system_root: &Path) -> PathBuf {
+    system_root.join(VERIFY_LOG_FILE)
 }

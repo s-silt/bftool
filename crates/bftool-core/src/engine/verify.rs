@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
-use crate::engine::{cruft, drive, paths};
+use crate::engine::{cruft, drive, paths, verify_state};
 use crate::reporter::Reporter;
 
 /// 复查发现的一类问题(带项目上下文,GUI 能定位"哪个项目的哪个文件")。(Spec D §4.1 Finding #3)
@@ -140,13 +140,17 @@ pub fn run(
     ));
 
     let projects_dir = paths::drive_projects_dir(&target.root);
-    let _ = cfg; // 当前 verify 不需要 cfg；保留参数便于将来加 --full 整库交叉核对
 
     let report = verify_tree(&mdir, &projects_dir, cancel, reporter)?;
 
     if report.cancelled {
         reporter.warn("复查已取消(部分项目未检查)。");
         return Ok(report);
+    }
+
+    // 跑完(非取消)→ 把复查结果记到本地 system_root(verify 对盘只读);best-effort,失败只 warn。(Spec D §4.4)
+    if let Err(e) = verify_state::record_verify(&cfg.system_root, &target.id, &report.outcome()) {
+        reporter.warn(&format!("复查结果记录失败(不影响本次复查):{}", e));
     }
 
     let summary = format!(
