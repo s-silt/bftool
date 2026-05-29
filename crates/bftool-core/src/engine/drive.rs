@@ -23,6 +23,61 @@ pub struct DriveInfo {
     pub total_bytes: u64,
 }
 
+/// 已初始化的备份盘(通用类型,含封盘态)。scan / 列盘 / 复查 / 状态都用它。(Spec D §4.2 / L-021)
+pub type BackupDrive = DriveInfo;
+
+/// 可写入的备份盘:不变量 = 未封盘且容量达标。archive 写路径只接受它,编译期防"写错盘/封盘盘"。
+#[derive(Debug, Clone)]
+pub struct WritableDrive(BackupDrive);
+
+/// `try_into_writable` 失败原因(带"怎么修")。
+#[derive(Debug)]
+pub enum DriveError {
+    Sealed,
+    TooSmall { total_gb: u64, min_gb: u64 },
+}
+
+impl std::fmt::Display for DriveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriveError::Sealed => {
+                write!(f, "该盘已封盘,禁止写入。请换一块未封盘的备份盘,或 init 新盘。")
+            }
+            DriveError::TooSmall { total_gb, min_gb } => write!(
+                f,
+                "该盘仅 {total_gb}GB,低于最小 {min_gb}GB(防误抓 U 盘)。如确需用它,调低配置 min_drive_gb。"
+            ),
+        }
+    }
+}
+impl std::error::Error for DriveError {}
+
+impl DriveInfo {
+    /// 升级为可写盘:仅**未封盘且容量 ≥ min_drive_gb**时成功;阈值显式传入(来自 `cfg.min_drive_gb`)。
+    pub fn try_into_writable(self, min_drive_gb: u64) -> Result<WritableDrive, DriveError> {
+        if self.sealed {
+            return Err(DriveError::Sealed);
+        }
+        let min = min_drive_gb.saturating_mul(1024 * 1024 * 1024);
+        if self.total_bytes < min {
+            return Err(DriveError::TooSmall {
+                total_gb: self.total_bytes / (1024 * 1024 * 1024),
+                min_gb: min_drive_gb,
+            });
+        }
+        Ok(WritableDrive(self))
+    }
+}
+
+impl WritableDrive {
+    pub fn inner(&self) -> &BackupDrive {
+        &self.0
+    }
+    pub fn into_inner(self) -> BackupDrive {
+        self.0
+    }
+}
+
 pub fn list_mounted(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     let drives = scan_mounted()?;
     if drives.is_empty() {
@@ -405,6 +460,16 @@ mod tests {
             free_bytes: bytes,
             total_bytes: bytes,
         }
+    }
+
+    // ── Spec D §4.2 / L-021: try_into_writable 类型化盘 ──
+    #[test]
+    fn try_into_writable_rejects_sealed_and_small() {
+        assert!(di("E", 500, true).try_into_writable(200).is_err()); // 封盘
+        assert!(di("F", 8, false).try_into_writable(200).is_err()); // 过小
+        let w = di("E", 500, false).try_into_writable(200);
+        assert!(w.is_ok());
+        assert_eq!(w.unwrap().inner().letter, "E");
     }
 
     // ── L-006: min_drive_gb 真正生效,排除过小盘(防误抓 U 盘) ──
