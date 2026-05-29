@@ -9,7 +9,7 @@
 
 ## 进度(实时,Phase 3)
 
-测试数:0 → **62 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
+测试数:0 → **64 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
 
 **已修复(Fixed,待 Phase 4 对抗复审升 Verified):**
 
@@ -24,6 +24,8 @@
 | L-008 | P2 | `5662795` | verify_disabled 真值表 ×1 |
 | L-023 | P2 | `800c36e` | drive_letter_of/qualifier 字符安全 ×2 |
 | L-026 | P2 | `800c36e` | check_paths/is_inside ×6 |
+| L-003 | P2 | `672d890` | handle_one 空源(脚手架 temp_world)×1 |
+| L-017 | P2 | `e694c69` | dup 读失败保守 ×1 |
 
 **严重度修正(主控复核;拟交 Phase 4 确认):**
 - L-003 / L-005 / L-008 / L-009:P1 → **P2**。复核后均非"当前可触发的数据丢失/校验绕过",而是 fail-closed 缺口/维护性风险(L-003 空源假成功但不删数据;L-005 跨卷失败可经 check_pending_txn 恢复、不丢数据;L-008 core+cli 双 guard 当前都在、仅未来漂移风险;L-009 仅 no_hash 且 exit code=1 罕见)。仍会修。
