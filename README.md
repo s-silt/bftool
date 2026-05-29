@@ -32,6 +32,8 @@
 
 放到任意目录（比如 `C:\Tools\bftool\`）即可。
 
+> **只想要图形界面？** Release 页面里 `bftool-gui.exe` 是**独立文件**，单独下它一个就能用 —— 不必下整个 zip。配置在程序内「设置」视图点选生成（默认存 `%APPDATA%`），首次没有配置文件也能正常启动。zip 里其余文件都是可选的（`bftool.exe` 命令行版、文档、配置模板）。
+
 > **不需要安装 Visual C++ Redistributable**：单 `.exe` 文件静态链接 CRT，无任何外部 `.dll` 依赖。界面中文依赖系统已装中文字体（Windows 默认有微软雅黑）。
 
 ### 2. 双击 `bftool-gui.exe`
