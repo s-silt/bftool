@@ -9,5 +9,7 @@
 //! - `app`      ── App 壳 + View 路由 + 左侧栏(T4)
 //! - `views`    ── 各视图渲染(T4 起)
 
+pub mod app;
 pub mod reporter;
 pub mod task;
+pub mod views;
