@@ -97,20 +97,34 @@ impl Default for Config {
 
 impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        if let Some(p) = explicit {
-            return Self::from_path(p)
-                .with_context(|| format!("读取 --config 指定的配置文件失败：{}", p.display()));
-        }
+        let cfg = if let Some(p) = explicit {
+            Self::from_path(p)
+                .with_context(|| format!("读取 --config 指定的配置文件失败：{}", p.display()))?
+        } else if let Some(c) = Self::candidate_paths().iter().find(|c| c.is_file()) {
+            Self::from_path(c).with_context(|| format!("读取配置文件失败：{}", c.display()))?
+        } else {
+            // 找不到任何配置文件 → 用默认值；用户首次跑 `bftool` 会看到提示
+            Self::default()
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
 
-        for candidate in Self::candidate_paths() {
-            if candidate.is_file() {
-                return Self::from_path(&candidate)
-                    .with_context(|| format!("读取配置文件失败：{}", candidate.display()));
-            }
+    /// 加载后校验配置的内在不变量(不依赖具体备份盘;盘相关的根目录关系检查在 safety::check_paths)。
+    /// 此前 Config 反序列化后直接到处传,verify/find/drives 等都在用未校验配置。(ledger L-025)
+    pub fn validate(&self) -> Result<()> {
+        let p = self.name_prefix.trim();
+        if p.is_empty() {
+            anyhow::bail!("配置 name_prefix 不能为空(用于「备份N」编号识别);建议设为「备份」。");
         }
-
-        // 找不到任何配置文件 → 用默认值；用户首次跑 `bftool` 会看到提示
-        Ok(Self::default())
+        if p.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!(
+                "配置 name_prefix 不能是纯数字「{}」(会让备份盘编号无法解析、序号失效);\
+                 建议带非数字前缀,如「备份」。",
+                p
+            );
+        }
+        Ok(())
     }
 
     fn candidate_paths() -> Vec<PathBuf> {
@@ -133,5 +147,34 @@ impl Config {
         let text = fs::read_to_string(p)?;
         let cfg: Self = toml::from_str(&text).context("配置文件 TOML 解析失败")?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── L-025: Config::validate 守住内在不变量 ──
+    #[test]
+    fn validate_accepts_default() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_prefix() {
+        let c = Config {
+            name_prefix: String::new(),
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_all_digit_prefix() {
+        let c = Config {
+            name_prefix: "123".into(),
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
     }
 }
