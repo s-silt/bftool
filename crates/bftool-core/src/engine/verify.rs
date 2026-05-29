@@ -178,7 +178,8 @@ fn verify_tree(mdir: &Path, projects_dir: &Path, reporter: &dyn Reporter) -> Res
 
         // 报告清单外的多余文件（不删除）
         if proj_dir.is_dir() {
-            let base = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+            // 同 L-044:不 canonicalize,否则 `\\?\` 前缀与 walk 路径失配 → extra 全部误报。
+            let base = proj_dir.clone();
             for entry in cruft::walk(&proj_dir) {
                 let entry = match entry {
                     Ok(e) => e,
@@ -248,8 +249,8 @@ mod tests {
     }
 
     /// 在 dir 下铺一个最小"盘":校验清单 m/proj.sha256.csv + 项目 p/proj/<files>。
-    /// 返回 (mdir, projects_dir);projects_dir 已 canonicalize 以便 extra 检测的
-    /// strip_prefix 与 walk 前缀一致。
+    /// 返回 (mdir, projects_dir);projects_dir 用**非 canonical** 临时路径 —— 正是 L-044
+    /// 修复前会让 extra 检测把全部文件误报为"多余"的场景。
     fn setup(
         dir: &Path,
         rows: &[(&str, u64, &str)],
@@ -273,7 +274,7 @@ mod tests {
             let mut f = fs::File::create(&p).unwrap();
             f.write_all(bytes).unwrap();
         }
-        (mdir, pdir.canonicalize().unwrap())
+        (mdir, pdir)
     }
 
     #[test]

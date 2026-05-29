@@ -122,7 +122,10 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 
     let mut bar = reporter.progress_bytes(if opts.no_hash { "枚举" } else { "校验" }, total_bytes);
 
-    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // 不要 canonicalize:Windows 上它会加 `\\?\` 前缀,而 cruft::walk(WalkDir)产出的路径
+    // 不带前缀 → strip_prefix 失配 → rel 退化成绝对路径 → diff/verify 永远失败。
+    // WalkDir 产出的路径必以传入的 root 为前缀,直接用 root 做 base 即可。(ledger L-044)
+    let base = root.to_path_buf();
     let mut entries = Vec::with_capacity(files.len());
     let mut metadata_errors: Vec<String> = Vec::new();
     let mut hash_errors: Vec<String> = Vec::new();

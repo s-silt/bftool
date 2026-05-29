@@ -250,6 +250,26 @@ fn handle_one(
     let size = stats.bytes;
     let size_gb = size as f64 / 1024.0 / 1024.0 / 1024.0;
 
+    // 枚举/元数据错误:dry-run 与正式路径都要 fail-closed —— 此前只有 dry-run 报告,
+    // 正式路径靠后面 manifest::build 兜底但太晚,且容量按可能偏小的 size 误判。(ledger L-005)
+    if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
+        for e in &stats.enum_errors {
+            reporter.error(&format!("枚举失败：{}", e));
+        }
+        for e in &stats.metadata_errors {
+            reporter.error(&format!("读元数据失败：{}", e));
+        }
+        let msg = format!(
+            "统计不完整({} 个枚举错误 + {} 个 metadata 错误)→ 不归档。请先解决环境问题\
+             (权限拒绝？路径过长？被 AV 锁住？)再重试。",
+            stats.enum_errors.len(),
+            stats.metadata_errors.len()
+        );
+        reporter.error(&msg);
+        note_manual(cfg, reporter, &name, &msg);
+        return Ok(HandleOutcome::Skipped);
+    }
+
     // 重名保护
     let mut dest_name = name.clone();
     let catalog = paths::drive_catalog_path(&drive.root);
@@ -304,22 +324,6 @@ fn handle_one(
             "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
             name, stats.files, size_gb, drive.id
         ));
-        if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
-            for e in &stats.enum_errors {
-                reporter.warn(&format!("[演练] 枚举失败：{}", e));
-            }
-            for e in &stats.metadata_errors {
-                reporter.warn(&format!("[演练] 读元数据失败：{}", e));
-            }
-            reporter.warn(&format!(
-                "[演练] {} 项目的统计可能不完整 ({} 个枚举错误 + {} 个 metadata 错误)。\
-                 正式归档会因为同样的错误失败 —— 请先解决环境问题(权限拒绝？路径过长？\
-                 被 AV 锁住？)再去掉 --dry-run 跑。",
-                name,
-                stats.enum_errors.len(),
-                stats.metadata_errors.len()
-            ));
-        }
         return Ok(HandleOutcome::Done);
     }
 
@@ -917,6 +921,21 @@ mod tests {
         }
     }
 
+    struct RecordingReporter(std::sync::Mutex<Vec<String>>);
+    impl crate::reporter::Reporter for RecordingReporter {
+        fn log(&self, level: crate::reporter::LogLevel, msg: &str) {
+            self.0.lock().unwrap().push(format!("{:?} {}", level, msg));
+        }
+        fn progress_bytes(&self, _l: &str, _t: u64) -> Box<dyn crate::reporter::ProgressHandle> {
+            struct P;
+            impl crate::reporter::ProgressHandle for P {
+                fn inc(&mut self, _: u64) {}
+                fn finish(&mut self) {}
+            }
+            Box::new(P)
+        }
+    }
+
     // ── L-003: 空源(0 真实文件)不被记成功、不移源 ──
     #[test]
     fn handle_one_empty_source_does_not_move() {
@@ -926,6 +945,38 @@ mod tests {
         let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
         assert!(matches!(outcome, HandleOutcome::Skipped), "空源应 Skipped");
         assert!(proj.is_dir(), "空源不应被移走(应仍在 待备份)");
+    }
+
+    // ── happy-path:正常项目完整走通 复制→校验→提交→移源(覆盖 L-001 fsync 提交链路) ──
+    #[test]
+    fn handle_one_happy_path_archives_and_moves() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        fs::write(proj.join("b.bin"), b"world!!").unwrap();
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        let outcome = handle_one(&cfg, &rep, &drive, &proj, &test_opts(), None).unwrap();
+        let log = rep.0.lock().unwrap().join("\n");
+        assert!(
+            matches!(outcome, HandleOutcome::Done),
+            "正常项目应 Done;日志:\n{}",
+            log
+        );
+        assert!(!proj.exists(), "源应已移到 已备份");
+        assert!(cfg.archived_root.join("001proj").is_dir(), "源应在 已备份");
+        assert!(
+            paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .is_dir(),
+            "目标盘应有项目副本"
+        );
+        assert!(
+            paths::drive_manifest_dir(&drive.root)
+                .join("001proj.sha256.csv")
+                .is_file(),
+            "应写出校验清单"
+        );
     }
 
     // ── L-017: 读本盘索引失败时保守视为重名(避免覆盖旧备份) ──
