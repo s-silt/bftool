@@ -244,13 +244,18 @@ pub fn parse_drive_number(prefix: &str, id: &str) -> Option<u32> {
     id.strip_prefix(prefix).and_then(|s| s.parse::<u32>().ok())
 }
 
+/// 下一个编号 = 所有已知「备份N」里的最大值 + 1(空 → 1)。纯函数,保证单调不碰撞。(ledger L-027)
+fn next_number(found: &[u32]) -> u32 {
+    found.iter().copied().max().unwrap_or(0) + 1
+}
+
 /// 计算下一个可用「备份N」编号 = max(序号文件, 全局索引里出现过的「备份N」, 当前挂载盘里的「备份N」) + 1
 fn next_drive_number(cfg: &Config) -> Result<u32> {
-    let mut max = 0u32;
+    let mut found: Vec<u32> = Vec::new();
     let seq_file = paths::system_drive_seq(&cfg.system_root);
     if let Ok(text) = fs::read_to_string(&seq_file) {
         if let Ok(n) = text.trim().parse::<u32>() {
-            max = max.max(n);
+            found.push(n);
         }
     }
     let gc = paths::system_global_catalog(&cfg.system_root);
@@ -262,7 +267,7 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
                 for rec in rdr.records().flatten() {
                     if let Some(v) = rec.get(col) {
                         if let Some(n) = parse_drive_number(&cfg.name_prefix, v.trim()) {
-                            max = max.max(n);
+                            found.push(n);
                         }
                     }
                 }
@@ -271,10 +276,10 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
     }
     for d in scan_mounted()? {
         if let Some(n) = parse_drive_number(&cfg.name_prefix, &d.id) {
-            max = max.max(n);
+            found.push(n);
         }
     }
-    Ok(max + 1)
+    Ok(next_number(&found))
 }
 
 fn bump_drive_seq(cfg: &Config, n: u32) -> Result<()> {
@@ -446,5 +451,22 @@ mod tests {
         assert_eq!(drive_letter_of(Path::new("")), None);
         // qualifier_letter 复用 drive_letter_of
         assert_eq!(qualifier_letter(Path::new("E:\\")), Some("E".to_string()));
+    }
+
+    // ── L-027: 盘编号单调不碰撞 ──
+    #[test]
+    fn next_number_is_max_plus_one() {
+        assert_eq!(next_number(&[]), 1);
+        assert_eq!(next_number(&[1, 2, 3]), 4);
+        assert_eq!(next_number(&[5, 2, 5]), 6); // 乱序 + 重复
+        assert_eq!(next_number(&[10]), 11);
+    }
+
+    #[test]
+    fn parse_drive_number_basic() {
+        assert_eq!(parse_drive_number("备份", "备份12"), Some(12));
+        assert_eq!(parse_drive_number("备份", "备份"), None);
+        assert_eq!(parse_drive_number("备份", "X3"), None);
+        assert_eq!(parse_drive_number("备份", "备份0"), Some(0));
     }
 }
