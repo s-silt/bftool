@@ -7,3 +7,4 @@ pub mod drives;
 pub mod find;
 pub mod init;
 pub mod util;
+pub mod verify;
