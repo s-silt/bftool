@@ -2,8 +2,33 @@
 
 * 关联 spec：[Spec C 方法论](specs/2026-05-29-review-fix-campaign-design.md)、实施计划：[plans/2026-05-29](plans/2026-05-29-review-fix-campaign-implementation.md)
 * 分支：`campaign/review-fix-p2`
-* 状态：Phase 1（并行静态审）完成 → Phase 2（分级）完成 → Phase 3（TDD 修复）**待 MSVC 就绪**
+* 状态：Phase 3（TDD 修复）进行中。MSVC 已就位,门禁 fmt/build/test/clippy 全绿;cargo-llvm-cov 已装,cargo-audit 待装(留 Phase 5)。
 * 字段：`ID | 模块 | 维度 | 严重度 | 描述 | Broken invariant | 证据 | 来源 | 状态`
+
+---
+
+## 进度(实时,Phase 3)
+
+测试数:0 → **52 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
+
+**已修复(Fixed,待 Phase 4 对抗复审升 Verified):**
+
+| ID | 严重 | commit | 回归测试 |
+|---|---|---|---|
+| L-001 | P0 | `810e38e` | durable::write_synced ×2 |
+| L-004 | P1 | `6473cab` | source_changed no_hash ×3 |
+| L-002 | P2 | `cf0acf2` | diff 对称 ×3 |
+| L-006 | P1 | `76c0448` | usable_drives ×4 |
+| L-007 | P1 | `b37e2fe` | verify_tree 损坏检测 ×5 |
+
+**严重度修正(主控复核;拟交 Phase 4 确认):**
+- L-003 / L-005 / L-008 / L-009:P1 → **P2**。复核后均非"当前可触发的数据丢失/校验绕过",而是 fail-closed 缺口/维护性风险(L-003 空源假成功但不删数据;L-005 跨卷失败可经 check_pending_txn 恢复、不丢数据;L-008 core+cli 双 guard 当前都在、仅未来漂移风险;L-009 仅 no_hash 且 exit code=1 罕见)。仍会修。
+- L-002:P1 → **P2**。清单一致 + rel 唯一时缺文件必被 count/extra 捕获;真正静默漏检需 cruft 不对称 → 属脆弱性 + reason 误导。已修。
+
+**新增发现:**
+- L-043 | P3 | verify.rs:178 | `proj_dir.canonicalize()`(\\?\ 前缀)与 `cruft::walk` 的非 canonical 路径前缀做 strip_prefix 可能不匹配 → 真实盘上 extra 检测或把全部文件误报为"多余"。来源:主控写 L-007 测试时发现。待核/修。
+
+剩余:P2(L-003/005/008/009/010–027 未修者)、P3 文档批量、Phase 4 对抗复审、Phase 5(CI 硬化 + cargo-audit + DoD)。
 
 ---
 
