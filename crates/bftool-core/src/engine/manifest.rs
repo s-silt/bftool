@@ -21,9 +21,9 @@ pub struct Entry {
     pub rel: String,
     #[serde(rename = "Size")]
     pub size: u64,
-    /// SHA256 大写十六进制；`no_hash` 模式下为空串
+    /// SHA256 大写十六进制；`no_hash` 模式下为 `None`(不再用空串当"没算哈希"的哨兵)。(ledger L-019)
     #[serde(rename = "Hash")]
-    pub hash: String,
+    pub hash: Option<String>,
     /// 修改时间，RFC3339 UTC；用于 `no_hash` 模式的源稳定性二次复核
     #[serde(rename = "Mtime")]
     pub mtime: String,
@@ -65,7 +65,7 @@ impl Manifest {
             wtr.serialize(Row {
                 rel: &e.rel,
                 size: e.size,
-                hash: &e.hash,
+                hash: e.hash.as_deref().unwrap_or(""),
             })?;
         }
         wtr.flush()?;
@@ -148,10 +148,10 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
         let rel = path_relative(&base, f);
 
         let hash = if opts.no_hash {
-            String::new()
+            None
         } else {
             match sha256_hex(f) {
-                Ok(h) => h,
+                Ok(h) => Some(h),
                 Err(e) => {
                     hash_errors.push(format!("{}: {}", f.display(), e));
                     continue;
@@ -259,7 +259,7 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
             d.bad_dst_rels.push(ent.rel.clone());
             continue;
         }
-        if check_hash && !s.hash.is_empty() && s.hash != ent.hash {
+        if check_hash && s.hash.is_some() && s.hash != ent.hash {
             d.reasons.push(format!("哈希不一致 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
         }
@@ -343,7 +343,11 @@ mod tests {
         Entry {
             rel: rel.into(),
             size,
-            hash: hash.into(),
+            hash: if hash.is_empty() {
+                None
+            } else {
+                Some(hash.to_string())
+            },
             mtime: mtime.into(),
         }
     }
