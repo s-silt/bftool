@@ -131,12 +131,13 @@ fn verify_tree(mdir: &Path, projects_dir: &Path, reporter: &dyn Reporter) -> Res
             if cruft::rel_has_cruft_component(&rel) {
                 continue;
             }
+            // size 为 Option:列缺失/不可解析 = 未知(不校验大小);存在(含 0)就精确比对。
+            // 旧实现的 `size>0 &&` 守卫会让"清单记 0、实际非 0"的真实 0 字节文件被篡改时漏判。(ledger L-013)
             let size = i_size
                 .and_then(|c| rec.get(c))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+                .and_then(|s| s.parse::<u64>().ok());
             let hash = i_hash.and_then(|c| rec.get(c)).unwrap_or("").to_string();
-            expected.insert(rel.clone(), (size, hash.clone()));
+            expected.insert(rel.clone(), (size.unwrap_or(0), hash.clone()));
 
             let f = proj_dir.join(&rel);
             report.checked += 1;
@@ -153,10 +154,12 @@ fn verify_tree(mdir: &Path, projects_dir: &Path, reporter: &dyn Reporter) -> Res
                     continue;
                 }
             };
-            if size > 0 && meta.len() != size {
-                reporter.error(&format!("  大小不一致: {}", rel));
-                report.bad += 1;
-                continue;
+            if let Some(sz) = size {
+                if meta.len() != sz {
+                    reporter.error(&format!("  大小不一致: {}", rel));
+                    report.bad += 1;
+                    continue;
+                }
             }
             if !hash.is_empty() {
                 match sha256_hex(&f) {
@@ -317,6 +320,24 @@ mod tests {
         );
         let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
         assert_eq!(r.bad, 1, "等长内容篡改必须靠 SHA 抓出");
+    }
+
+    // ── L-013: 清单记 size=0 不能跳过大小校验 ──
+    #[test]
+    fn verify_tree_detects_tampered_zero_byte_file() {
+        let d = tempfile::tempdir().unwrap();
+        // 清单记 size=0、无 hash(no_hash 模式),但实际文件被塞了内容
+        let (mdir, pdir) = setup(d.path(), &[("z.txt", 0, "")], &[("z.txt", b"surprise")]);
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1, "清单记 0 字节、实际非 0 必须报大小不一致");
+    }
+
+    #[test]
+    fn verify_tree_real_zero_byte_file_is_ok() {
+        let d = tempfile::tempdir().unwrap();
+        let (mdir, pdir) = setup(d.path(), &[("z.txt", 0, "")], &[("z.txt", b"")]);
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "真实 0 字节文件应通过");
     }
 
     #[test]
