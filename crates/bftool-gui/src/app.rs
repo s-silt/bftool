@@ -64,6 +64,8 @@ pub struct App {
     pub task: Option<BackgroundTask<String>>,
     /// 进行中的计划预览任务(archive::plan;只读、后台算,避免 UI 线程遍历大目录卡顿)。
     pub plan_task: Option<BackgroundTask<ArchivePlan>>,
+    /// 执行任务的开始时刻(算"已用时间";None=空闲)。在 archive/verify 启动处置位,pump 完成处清空。
+    pub task_started: Option<std::time::Instant>,
     /// 上一个任务的摘要(Done/Failed 文案),供结果区显示。
     pub last_summary: Option<String>,
     /// 备份页的计划预览(archive::plan 的结果)。
@@ -84,9 +86,8 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 先装中文字体(否则界面中文渲染成方块),状态记进日志便于排查;再应用主题。
-        let font_status = install_cjk_font(&cc.egui_ctx);
-        apply_visuals(&cc.egui_ctx);
+        // 应用主题(浅色扁平 + 装中文字体);返回字体状态进日志便于排查中文显示。
+        let font_status = crate::views::theme::apply(&cc.egui_ctx);
         let mut logs = vec![(LogLevel::Info, font_status)];
         // 不吞错:配置加载失败时退默认,但把错误进日志面板让用户可见(Spec D §6 / 不掩盖 fail-closed)。
         let (cfg, config_source) = match Config::load_with_source(None) {
@@ -108,6 +109,7 @@ impl App {
             rx: None,
             task: None,
             plan_task: None,
+            task_started: None,
             last_summary: None,
             archive_plan: None,
             archive_ui: crate::views::archive::ArchiveUiState::default(),
@@ -138,6 +140,7 @@ impl App {
                     });
                 }
                 self.task = None;
+                self.task_started = None;
                 self.rx = None;
             }
             Some(false) => ctx.request_repaint(),
@@ -170,60 +173,127 @@ impl App {
     pub fn is_busy(&self) -> bool {
         self.task.is_some() || self.plan_task.is_some()
     }
-}
 
-/// 外观:浅色主题(新手友好,贴近 Windows 风格)+ 略宽间距/按钮内边距。
-fn apply_visuals(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::light();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    ctx.set_style(style);
-}
-
-/// 装一个系统自带的 CJK 字体(否则界面中文渲染成方块)。运行时从 Windows 字体目录读,
-/// 不内嵌(避免 ~16MB 二进制膨胀)。**先用 ab_glyph 校验能解析且含中文字形**——绝不把坏字体
-/// 喂给 egui(epaint 解析失败会 panic)。选中的插入字体链首位,保留 egui 默认字体作后备(emoji 仍渲染)。
-/// 返回一行人类可读状态(记进日志 + 打到终端),把"字体到底加载了什么"变成可观测事实。
-fn install_cjk_font(ctx: &egui::Context) -> String {
-    use ab_glyph::{Font, FontRef};
-    const CANDIDATES: [&str; 4] = [
-        r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑(优先)
-        r"C:\Windows\Fonts\msyh.ttf",   // 旧版雅黑
-        r"C:\Windows\Fonts\simhei.ttf", // 黑体
-        r"C:\Windows\Fonts\simsun.ttc", // 宋体
-    ];
-    for path in CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        // 校验:face 0 能解析 + 含中文字形('备' 非 .notdef)。借用在本语句结束即释放,随后可移动 bytes。
-        let usable = FontRef::try_from_slice_and_index(&bytes, 0)
-            .map(|f| f.glyph_id('备').0 != 0)
-            .unwrap_or(false);
-        if !usable {
-            continue;
-        }
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "cjk".to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .insert(0, "cjk".to_owned());
-        }
-        ctx.set_fonts(fonts);
-        let msg = format!("已加载中文字体: {path}");
-        eprintln!("[bftool-gui] {msg}");
-        return msg;
+    /// 底部全局状态栏:区分 执行任务(可取消)/ 生成计划(不可取消)/ 空闲。
+    /// 进度只显示 core 上报的字节进度(=某遍 SHA256 校验);复制/间隙阶段不伪造百分比。
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        use crate::views::theme;
+        egui::TopBottomPanel::bottom("status")
+            .exact_height(34.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if self.task.is_some() {
+                        // 真·可取消的执行任务(备份 run / 复查)
+                        ui.add(egui::Spinner::new().size(14.0).color(theme::PRIMARY));
+                        ui.add_space(6.0);
+                        let snap = self
+                            .progress
+                            .lock()
+                            .ok()
+                            .filter(|p| p.active && p.total > 0)
+                            .map(|p| (p.label.clone(), p.current as f32 / p.total as f32));
+                        let elapsed = self
+                            .task_started
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let line = match snap {
+                            Some((phase, frac)) => format!(
+                                "运行中 · {phase} {:.0}%　已用 {}",
+                                frac * 100.0,
+                                fmt_dur(elapsed)
+                            ),
+                            // 复制阶段/阶段间隙:core 无字节进度,不伪造百分比。
+                            None => format!("运行中 · 处理中…　已用 {}", fmt_dur(elapsed)),
+                        };
+                        ui.colored_label(theme::PRIMARY, line);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let cancelling = self
+                                .task
+                                .as_ref()
+                                .map(|t| t.cancel_requested())
+                                .unwrap_or(false);
+                            if cancelling {
+                                ui.add_enabled(false, egui::Button::new("取消中…"));
+                            } else if ui.button("✕ 取消").clicked() {
+                                if let Some(t) = &self.task {
+                                    t.request_cancel();
+                                }
+                            }
+                        });
+                    } else if self.plan_task.is_some() {
+                        // 生成计划:只读、不可中途取消 → 不给取消按钮。
+                        ui.add(egui::Spinner::new().size(14.0).color(theme::PRIMARY));
+                        ui.add_space(6.0);
+                        ui.colored_label(theme::PRIMARY, "正在生成计划…");
+                    } else {
+                        // 空闲
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.0, theme::OK);
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            theme::TEXT_BODY,
+                            self.last_summary
+                                .clone()
+                                .unwrap_or_else(|| "就绪".to_string()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let go = egui::Button::new(
+                                egui::RichText::new("去备份").color(egui::Color32::WHITE),
+                            )
+                            .fill(theme::PRIMARY);
+                            if ui.add(go).clicked() {
+                                self.view = View::Archive;
+                            }
+                        });
+                    }
+                });
+            });
     }
-    let msg = "未找到可用中文字体,界面中文可能显示为方块(请确认系统装有中文字体)".to_string();
-    eprintln!("[bftool-gui] 警告: {msg}");
-    msg
+}
+
+/// 秒 → mm:ss 或 hh:mm:ss。
+fn fmt_dur(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// 扁平导航项:选中→浅蓝底 + 左侧主色竖条;hover→浅底。整行可点。
+fn nav_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    use crate::views::theme;
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, egui::CornerRadius::same(8), theme::PRIMARY_SOFT);
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+        p.rect_filled(bar, egui::CornerRadius::same(2), theme::PRIMARY);
+    } else if resp.hovered() {
+        p.rect_filled(rect, egui::CornerRadius::same(8), theme::BG);
+    }
+    let color = if selected {
+        theme::PRIMARY
+    } else {
+        theme::TEXT_BODY
+    };
+    p.text(
+        rect.left_center() + egui::vec2(14.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        color,
+    );
+    resp
 }
 
 impl eframe::App for App {
@@ -232,24 +302,34 @@ impl eframe::App for App {
 
         egui::SidePanel::left("nav")
             .resizable(false)
-            .exact_width(140.0)
+            .exact_width(150.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(crate::views::theme::CARD)
+                    .inner_margin(egui::Margin::same(10)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("bftool");
-                ui.separator();
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("bftool")
+                        .font(egui::FontId::new(
+                            18.0,
+                            egui::FontFamily::Name("semibold".into()),
+                        ))
+                        .color(crate::views::theme::PRIMARY),
+                );
+                ui.add_space(10.0);
                 let busy = self.is_busy();
                 let current = self.view;
                 for v in View::ALL {
-                    // 任务进行中禁用导航,避免切走正在跑的备份页(简单稳妥;Phase 3 可放开只读视图)。
-                    ui.add_enabled_ui(!busy || v == current, |ui| {
-                        if ui
-                            .selectable_label(current == v, v.label())
-                            .on_hover_text(v.label())
-                            .clicked()
-                        {
+                    let selected = current == v;
+                    // 任务进行中禁用导航(选中项除外),避免切走正在跑的任务。
+                    ui.add_enabled_ui(!busy || selected, |ui| {
+                        if nav_item(ui, selected, v.label()).clicked() {
                             self.view = v;
                         }
                     });
+                    ui.add_space(2.0);
                 }
                 // 底部版本号
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -257,6 +337,9 @@ impl eframe::App for App {
                     ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
                 });
             });
+
+        // 全局底部状态栏(在 CentralPanel 之前挂)。
+        self.status_bar(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
             View::Dashboard => crate::views::dashboard::ui(self, ui),
