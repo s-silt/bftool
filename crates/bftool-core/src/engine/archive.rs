@@ -436,7 +436,16 @@ fn handle_one(
                 if src_p.exists() {
                     let dst_p = quar.join(rel);
                     if let Some(p) = dst_p.parent() {
-                        fs::create_dir_all(p).ok();
+                        if let Err(e) = fs::create_dir_all(p) {
+                            // 不 swallow:建隔离目录失败时明确归因、跳过该文件隔离。(ledger L-015)
+                            reporter.warn(&format!(
+                                "建隔离目录失败 {}:{} —— 坏文件 {} 未隔离,请手动检查。",
+                                p.display(),
+                                e,
+                                src_p.display()
+                            ));
+                            continue;
+                        }
                     }
                     if let Err(e) = fs::rename(&src_p, &dst_p) {
                         reporter.warn(&format!(
@@ -474,7 +483,15 @@ fn handle_one(
                     if let Ok(rel) = bad.strip_prefix(&dest) {
                         let to = quar.join(rel);
                         if let Some(p) = to.parent() {
-                            fs::create_dir_all(p).ok();
+                            if let Err(e) = fs::create_dir_all(p) {
+                                reporter.warn(&format!(
+                                    "建隔离目录失败 {}:{} —— 坏压缩包 {} 未隔离,请手动检查。",
+                                    p.display(),
+                                    e,
+                                    bad.display()
+                                ));
+                                continue;
+                            }
                         }
                         if let Err(e) = fs::rename(bad, &to) {
                             reporter.warn(&format!("隔离失败 {}：{}", bad.display(), e));
