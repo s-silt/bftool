@@ -12,15 +12,16 @@ use chrono::{Local, Utc};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
 use crate::engine::archive_test::{self, Tester, TesterPaths};
-use crate::engine::drive::{self, DriveInfo};
+use crate::engine::drive::{self, BackupDrive, DriveInfo};
 use crate::engine::manifest::{self, ManifestOpts};
 use crate::engine::{cruft, durable, paths, safety, txn};
 use crate::reporter::Reporter;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Options {
     pub dry_run: bool,
     pub no_hash: bool,
@@ -31,11 +32,57 @@ pub struct Options {
 
 /// 一轮归档的结果汇总。`failed>0` = 有项目处理失败 —— CLI 据此设非零退出码,
 /// 自动化/计划任务才能识别"批量归档里有失败"(此前总是 exit 0)。(ledger L-007)
+/// `cancelled`/`sealed_stopped` 是独立态,**不计入 failed**(取消≠失败,封盘停≠失败)。(Spec D §4.5/§4.1)
 #[derive(Debug, Default, Clone)]
 pub struct ArchiveSummary {
     pub handled: usize,
     pub failed: usize,
+    pub cancelled: bool,
+    pub sealed_stopped: bool,
 }
+
+/// 本轮计划里的一项(GUI 预览 / CLI dry-run 渲染;`run_plan` 据此执行)。(Spec D §4.1)
+#[derive(Debug, Clone)]
+pub struct PlanItem {
+    pub name: String,
+    pub est_bytes: u64,
+    pub action: PlanAction,
+}
+
+/// 对单个项目的计划动作。`dest_name` 在 `plan()` 阶段**冻结**(含重名时基于 `Local::now()`
+/// 的时间戳名),保证预览的目标名 = 正式执行的目标名(不各自重算时间戳漂移)。(Spec D §4.1)
+#[derive(Debug, Clone)]
+pub enum PlanAction {
+    /// 正常归档到 `dest_name`。
+    Archive { dest_name: String },
+    /// 本盘已有同名历史备份 → 改用唯一名 `dest_name` 归档。
+    RenameAndArchive { dest_name: String },
+    /// 不归档本项目(未稳定 / 0 文件 / 超单盘容量 / 索引损坏 …),`reason` 给原因。
+    Skip(String),
+    /// 余量不足放下本项目 → 封盘停本轮(非 skip:其后项目本轮不再尝试)。(Finding #2)
+    SealAndStop(String),
+}
+
+/// 本轮归档计划:选定的盘 + 各项目动作 + 冻结的执行选项。
+/// `plan()` 不动数据算出它;`run_plan()` 消费同一份执行(冻"意图"、不冻"安全判断")。(Spec D §4.1)
+#[derive(Debug, Clone)]
+pub struct ArchivePlan {
+    pub drive: BackupDrive,
+    pub items: Vec<PlanItem>,
+    /// 冻结的执行选项(no_hash/no_test_archives/limit);`dry_run`/`drive_letter_override` 已在
+    /// `plan()` 阶段消费。让 `run_plan(cfg, plan, cancel, reporter)` 维持 4 参签名。
+    pub opts: Options,
+}
+
+/// `plan()` 选不出可写盘时的友好信号(不是错误,CLI/GUI 据此提示插盘 init,退出码 0)。
+#[derive(Debug)]
+struct NoWritableDrive;
+impl std::fmt::Display for NoWritableDrive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "未发现可写入的备份盘")
+    }
+}
+impl std::error::Error for NoWritableDrive {}
 
 /// 是否处于"没有任何内容完整性校验"的状态:跳过 SHA256(no_hash) 且 archive test 实际关闭。
 /// 等价于只剩 size+count+mtime,是禁止的组合。判定集中在此,core::run 守卫与 CLI 守卫共用
@@ -68,29 +115,35 @@ impl VerifyStatus {
     }
 }
 
-pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<ArchiveSummary> {
-    // Spec B D14/D15 core-level fail-closed guard(判定收口到 verify_disabled,与 CLI 共用)(ledger L-008)
-    if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
-        anyhow::bail!(
-            "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
-             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
-             这是 core 级 fail-closed 拦截,调用方应该在传 Options 之前就做合并检查\
-             (CLI dispatch 已经做了一次更友好的)。\n\
-             如何修：\n\
-               - 去掉 no_hash 让 SHA256 兜底；或\n\
-               - 不要把 test_archives 设成 false 也不要把 no_test_archives 设成 true"
-        );
+/// 一轮归档 = 算计划 + 执行计划。`dry_run` 时只算计划并渲染、不执行。(Spec D §4.1)
+/// CLI 传永不取消的 `cancel`(行为不变);GUI 传可置位的。(Spec D §4.5)
+pub fn run(
+    cfg: &Config,
+    reporter: &dyn Reporter,
+    opts: Options,
+    cancel: &AtomicBool,
+) -> Result<ArchiveSummary> {
+    let plan = match plan(cfg, &opts, reporter) {
+        Ok(p) => p,
+        // 选不出可写盘:友好提示已由 plan() 打过,这里按"无事可做"返回(退出码 0,行为不变)。
+        Err(e) if e.downcast_ref::<NoWritableDrive>().is_some() => {
+            return Ok(ArchiveSummary::default())
+        }
+        Err(e) => return Err(e),
+    };
+    if opts.dry_run {
+        return Ok(render_dry_run(&plan, reporter));
     }
+    run_plan(cfg, &plan, cancel, reporter)
+}
 
-    // 准备系统目录
-    fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
-    fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
-    fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
+/// 算出本轮计划——**不动任何数据**(只 folder_stats / 读本盘索引)。选盘失败 → `NoWritableDrive`
+/// 信号(plan 内已打友好提示)。`ready_root` 缺失/无项目 → 空 items(由 run/run_plan 收尾)。(Spec D §4.1)
+pub fn plan(cfg: &Config, opts: &Options, reporter: &dyn Reporter) -> Result<ArchivePlan> {
+    // Spec B D14/D15 fail-closed:无校验组合连预览都不给(判定收口到 verify_disabled)。(ledger L-008)
+    guard_verify_enabled(cfg, opts)?;
 
-    // 启动自检：上次的事务标记是不是残留？
-    check_pending_txn(cfg, reporter)?;
-
-    // 找当前可用备份盘
+    // 选盘:override 走 info_by_letter,否则 pick_active(唯一未封盘且达标)。
     let drive = match opts.drive_letter_override.as_deref() {
         Some(letter) => drive::info_by_letter(letter)?,
         None => match drive::pick_active(cfg.min_drive_gb, reporter)? {
@@ -98,67 +151,32 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<Archi
             None => {
                 reporter.error("未发现已初始化且未封盘的备份盘。");
                 reporter.info("插入空盘后运行：bftool init <盘符>（例：bftool init E）");
-                return Ok(ArchiveSummary::default());
+                return Err(NoWritableDrive.into());
             }
         },
     };
-    if drive.sealed {
-        reporter.error(&format!(
-            "盘 {} ({}:) 已封盘，禁止写入。请换上一块未封盘的备份盘或初始化新盘。",
-            drive.id, drive.letter
-        ));
-        return Ok(ArchiveSummary::default());
-    }
-
+    // 类型化盘:封盘/过小在此挡掉(编译期挡"写错盘"的运行期对等)。(Spec D §4.2 / L-021)
+    let drive = match drive.clone().try_into_writable(cfg.min_drive_gb) {
+        Ok(w) => w.into_inner(),
+        Err(e) => {
+            reporter.error(&format!(
+                "盘 {} ({}:) 不可写入：{}",
+                drive.id, drive.letter, e
+            ));
+            return Err(NoWritableDrive.into());
+        }
+    };
     reporter.ok(&format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
 
-    // 路径安全检查
-    let warnings = safety::check_paths(
-        &cfg.ready_root,
-        &cfg.archived_root,
-        &cfg.system_root,
-        Some(&drive.root),
-    )?;
-    for w in warnings {
-        reporter.warn(&w);
-    }
-
-    // Spec B 顶层 tester detection:本轮只 detect 一次、只 warn 一次
-    let mut tester_opt: Option<(Tester, PathBuf)> = if cfg.test_archives && !opts.no_test_archives {
-        let p = TesterPaths {
-            winrar: cfg.winrar_path.clone(),
-            bandizip: cfg.bandizip_path.clone(),
-            seven_zip: cfg.seven_zip_path.clone(),
-        };
-        match archive_test::detect(&p) {
-            Some(t) => Some(t),
-            None => {
-                if opts.no_hash {
-                    anyhow::bail!(
-                        "拒绝运行：开启了 --unsafe-no-hash 但**机器上一个压缩包测试器都没装**。\n\
-                         此时 SHA256 没在跑,archive test 也跑不起来 —— 只剩\n\
-                         文件数+大小+修改时间,等价于「没在做完整性校验」。\n\
-                         如何修：\n\
-                           - 装一个测试器：推荐 7-Zip(免费开源 https://7-zip.org);或\n\
-                           - 去掉 --unsafe-no-hash,让 SHA256 兜底"
-                    );
-                }
-                reporter.warn(
-                    "未检测到 WinRAR / Bandizip / 7-Zip —— 压缩包内部结构无法测试。\
-                     重要资料建议装一个(推荐 7-Zip 免费开源：https://7-zip.org)。\
-                     SHA256 整文件校验仍在正常进行。",
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // 列出待归档项目
+    // 列出待归档项目(读不到/为空 → 空计划,友好提示)。
+    let mut items = Vec::new();
     if !cfg.ready_root.is_dir() {
         reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
-        return Ok(ArchiveSummary::default());
+        return Ok(ArchivePlan {
+            drive,
+            items,
+            opts: opts.clone(),
+        });
     }
     let mut projects: Vec<_> = fs::read_dir(&cfg.ready_root)?
         .filter_map(|e| e.ok())
@@ -172,27 +190,267 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<Archi
     });
     if projects.is_empty() {
         reporter.info("待备份 中没有待归档项目，结束。");
+    } else {
+        reporter.info(&format!(
+            "发现 {} 个待归档项目（按编号升序处理）。",
+            projects.len()
+        ));
+    }
+    for proj in &projects {
+        items.push(decide(cfg, &drive, proj));
+    }
+    Ok(ArchivePlan {
+        drive,
+        items,
+        opts: opts.clone(),
+    })
+}
+
+/// 对单个项目算计划动作——**只读**(folder_stats + 读本盘索引,不 build manifest、不写盘)。
+/// 重名时在此**冻结**时间戳目标名(预览=执行同名)。容量判定与 handle_one 同序:先"超单盘容量"再"余量不足"。
+fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
+    let name = match proj_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return PlanItem {
+                name: proj_path.display().to_string(),
+                est_bytes: 0,
+                action: PlanAction::Skip("无效的项目目录名".into()),
+            }
+        }
+    };
+    let skip = |est: u64, reason: String| PlanItem {
+        name: name.clone(),
+        est_bytes: est,
+        action: PlanAction::Skip(reason),
+    };
+
+    // 稳定性(未稳定是暂态:跳过不记台账,下轮再来)
+    let st = safety::folder_stable(proj_path, cfg.stable_minutes);
+    if !st.stable {
+        return skip(0, format!("未稳定：{}", st.reason));
+    }
+    // 统计 + 枚举/元数据错误(fail-closed)
+    let stats = folder_stats(proj_path);
+    if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
+        return skip(
+            stats.bytes,
+            format!(
+                "统计不完整({} 个枚举错误 + {} 个 metadata 错误)→ 不归档,请先解决环境问题(权限/超长路径/AV 锁)再重试。",
+                stats.enum_errors.len(),
+                stats.metadata_errors.len()
+            ),
+        );
+    }
+    // 0 真实文件(空目录或全 cruft):不归档不移源
+    if stats.files == 0 {
+        return skip(
+            0,
+            "项目内没有可备份的真实文件(空目录或全是 cruft)——不归档、不移源,请人工确认。".into(),
+        );
+    }
+    let size = stats.bytes;
+    let size_gb = size as f64 / 1024.0 / 1024.0 / 1024.0;
+    // 重名(读本盘索引;损坏 → fail-closed skip)
+    let catalog = paths::drive_catalog_path(&drive.root);
+    let dup = match catalog_has_project(&catalog, &name) {
+        Ok(b) => b,
+        Err(e) => {
+            return skip(
+                size,
+                format!(
+                "读本盘索引失败({}):无法判断是否重名 → 跳过,避免覆盖旧备份或重复写盘。请检查 {}",
+                e,
+                catalog.display()
+            ),
+            )
+        }
+    };
+    // 超单盘容量(空盘也放不下)
+    let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
+    if size > drive.total_bytes.saturating_sub(reserve) {
+        return skip(
+            size,
+            format!(
+                "项目 {:.2}GB 超过单盘容量，空盘也放不下 → 需人工拆分",
+                size_gb
+            ),
+        );
+    }
+    // 冻结目标名(重名 → 唯一时间戳名)
+    let dest_name = if dup {
+        format!("{}_{}", name, Local::now().format("%Y%m%d%H%M%S"))
+    } else {
+        name.clone()
+    };
+    // 余量(断点续传时仅按"还需写入"判断)→ 不足则封盘停本轮
+    let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
+    let dest_have = if dest.is_dir() {
+        folder_stats(&dest).bytes
+    } else {
+        0
+    };
+    let need = size.saturating_sub(dest_have);
+    if need.saturating_add(reserve) > drive.free_bytes {
+        let need_gb = need as f64 / 1024.0 / 1024.0 / 1024.0;
+        let free_gb = drive.free_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        let reason = format!(
+            "盘 {} 余量不足以放下 {}（还需约 {:.2}GB + 余量；当前剩余 {:.2}GB）。封盘并请换下一块盘后重跑。",
+            drive.id, name, need_gb, free_gb
+        );
+        return PlanItem {
+            name,
+            est_bytes: size,
+            action: PlanAction::SealAndStop(reason),
+        };
+    }
+    PlanItem {
+        name,
+        est_bytes: size,
+        action: if dup {
+            PlanAction::RenameAndArchive { dest_name }
+        } else {
+            PlanAction::Archive { dest_name }
+        },
+    }
+}
+
+/// dry-run:只渲染计划、不执行。`handled` = 将归档的项目数(Archive/RenameAndArchive)。
+fn render_dry_run(plan: &ArchivePlan, reporter: &dyn Reporter) -> ArchiveSummary {
+    let mut handled = 0usize;
+    for it in &plan.items {
+        let gb = it.est_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        match &it.action {
+            PlanAction::Archive { dest_name } => {
+                handled += 1;
+                reporter.info(&format!(
+                    "[演练] 将归档 {} (~{:.2}GB) → {}\\项目\\{}",
+                    it.name, gb, plan.drive.id, dest_name
+                ));
+            }
+            PlanAction::RenameAndArchive { dest_name } => {
+                handled += 1;
+                reporter.info(&format!(
+                    "[演练] 将归档 {} (~{:.2}GB) → {}\\项目\\{}(本盘已有同名 → 改用唯一名)",
+                    it.name, gb, plan.drive.id, dest_name
+                ));
+            }
+            PlanAction::Skip(reason) => {
+                reporter.info(&format!("[演练] 跳过 {}：{}", it.name, reason));
+            }
+            PlanAction::SealAndStop(reason) => {
+                reporter.warn(&format!(
+                    "[演练] {} → 此处将封盘停本轮：{}",
+                    it.name, reason
+                ));
+                break; // 封盘点之后的项目本轮不会处理,预览也到此为止
+            }
+        }
+    }
+    reporter.ok("[演练] 结束(未真正复制/移动任何文件)。");
+    ArchiveSummary {
+        handled,
+        ..Default::default()
+    }
+}
+
+/// 执行计划:**冻"意图"(目标名/选盘)、不冻"安全判断"**。每项执行前重验受外部状态影响的安全前置——
+/// 盘仍在且未封盘(本函数开头按盘上 marker 实时重读)、源仍稳定、容量仍够、目标名仍不冲突——
+/// 任一已变 → 该项"计划已过期"跳过,绝不照旧 plan 误归档/误封盘。(Spec D §4.1)
+pub fn run_plan(
+    cfg: &Config,
+    plan: &ArchivePlan,
+    cancel: &AtomicBool,
+    reporter: &dyn Reporter,
+) -> Result<ArchiveSummary> {
+    let opts = &plan.opts;
+    // fail-closed(纵深:GUI 可能直接调 run_plan)
+    guard_verify_enabled(cfg, opts)?;
+
+    // 准备系统目录
+    fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
+    fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
+    fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
+
+    // 启动自检：上次的事务标记是不是残留？
+    check_pending_txn(cfg, reporter)?;
+
+    // 重验盘:预览→执行之间盘可能被拔/被封。按盘上实时状态(id 文件 + 封盘 marker)重读,
+    // 不信 plan 里冻结的 sealed/在线态。任一变 → 整份计划过期(不写任何盘)。
+    let drive = &plan.drive;
+    if !paths::drive_id_path(&drive.root).is_file() {
+        reporter.error(&format!(
+            "计划已过期：备份盘 {} ({}:) 已不在线或未初始化 → 本轮不执行,请重新规划(bftool archive)。",
+            drive.id, drive.letter
+        ));
         return Ok(ArchiveSummary::default());
     }
-    reporter.info(&format!(
-        "发现 {} 个待归档项目（按编号升序处理）。",
-        projects.len()
-    ));
+    if paths::drive_sealed_path(&drive.root).is_file() {
+        reporter.error(&format!(
+            "计划已过期：盘 {} ({}:) 在预览后被封盘 → 本轮不执行,请换未封盘的盘重新规划。",
+            drive.id, drive.letter
+        ));
+        return Ok(ArchiveSummary {
+            sealed_stopped: true,
+            ..Default::default()
+        });
+    }
 
-    let mut handled = 0usize;
-    let mut failed = 0usize;
-    for proj in &projects {
-        if opts.limit > 0 && handled >= opts.limit {
+    // 路径安全检查
+    let warnings = safety::check_paths(
+        &cfg.ready_root,
+        &cfg.archived_root,
+        &cfg.system_root,
+        Some(&drive.root),
+    )?;
+    for w in warnings {
+        reporter.warn(&w);
+    }
+
+    // tester detection:本轮只 detect 一次、只 warn 一次
+    let mut tester_opt = detect_tester(cfg, opts, reporter)?;
+
+    let mut summary = ArchiveSummary::default();
+    for item in &plan.items {
+        if opts.limit > 0 && summary.handled >= opts.limit {
             reporter.action(&format!(
                 "已达本次处理上限（{} 个项目），停止；剩余项目下次运行继续。",
                 opts.limit
             ));
             break;
         }
-        match handle_one(cfg, reporter, &drive, proj, &opts, tester_opt.as_ref()) {
-            Ok(HandleOutcome::Done) => handled += 1,
+        // 取消只在**项目边界**生效(不在文件复制中途);已开始的项目跑完或安全跳过。(Spec D §4.5)
+        if cancel.load(Ordering::Relaxed) {
+            summary.cancelled = true;
+            reporter.action(&format!(
+                "已取消：{} 个已完成,其余未处理(已开始的项目已安全收尾)。",
+                summary.handled
+            ));
+            break;
+        }
+        // Skip/SealAndStop 的预览项也走 handle_one(forced=None)重新裁决:这样安全前置实时重验、
+        // 台账(需人工处理.txt)按真实结果记;Archive/RenameAndArchive 则带上冻结目标名。
+        let proj_path = cfg.ready_root.join(&item.name);
+        let forced = match &item.action {
+            PlanAction::Archive { dest_name } | PlanAction::RenameAndArchive { dest_name } => {
+                Some(dest_name.as_str())
+            }
+            PlanAction::Skip(_) | PlanAction::SealAndStop(_) => None,
+        };
+        match handle_one(
+            cfg,
+            reporter,
+            drive,
+            &proj_path,
+            opts,
+            tester_opt.as_ref(),
+            forced,
+        ) {
+            Ok(HandleOutcome::Done) => summary.handled += 1,
             Ok(HandleOutcome::Skipped) => {}
+            Ok(HandleOutcome::StalePlan) => {} // 已在 handle_one 内打"计划已过期",不计 failed
             Ok(HandleOutcome::DriveSealed) => {
+                summary.sealed_stopped = true;
                 reporter.action(
                     "本盘已封盘，本轮结束。换上下一块空盘后用 `bftool init <盘符>` 初始化再继续。",
                 );
@@ -214,38 +472,95 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<Archi
                 tester_opt = None;
             }
             Err(e) => {
-                let name = proj
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
                 reporter.error(&format!(
                     "项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。",
-                    name, e
+                    item.name, e
                 ));
                 // 用 note_manual(非致命):台账写失败不再把整轮归档拖垮。(ledger L-018)
-                note_manual(cfg, reporter, &name, &format!("未捕获异常：{}", e));
-                failed += 1;
+                note_manual(cfg, reporter, &item.name, &format!("未捕获异常：{}", e));
+                summary.failed += 1;
             }
         }
     }
-    if failed > 0 {
+    if summary.failed > 0 {
         reporter.error(&format!(
             "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」)。",
-            handled, failed
+            summary.handled, summary.failed
         ));
-    } else {
+    } else if !summary.cancelled {
         reporter.ok("本轮结束。");
     }
-    Ok(ArchiveSummary { handled, failed })
+    Ok(summary)
+}
+
+/// fail-closed 守卫:无校验组合(no_hash + archive test 关闭)直接拒。(ledger L-008)
+fn guard_verify_enabled(cfg: &Config, opts: &Options) -> Result<()> {
+    if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
+        anyhow::bail!(
+            "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
+             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
+             这是 core 级 fail-closed 拦截,调用方应该在传 Options 之前就做合并检查\
+             (CLI dispatch 已经做了一次更友好的)。\n\
+             如何修：\n\
+               - 去掉 no_hash 让 SHA256 兜底；或\n\
+               - 不要把 test_archives 设成 false 也不要把 no_test_archives 设成 true"
+        );
+    }
+    Ok(())
+}
+
+/// 顶层 tester detection:本轮只 detect 一次。no_hash 且一个测试器都没装 → fail-closed bail。
+fn detect_tester(
+    cfg: &Config,
+    opts: &Options,
+    reporter: &dyn Reporter,
+) -> Result<Option<(Tester, PathBuf)>> {
+    if !cfg.test_archives || opts.no_test_archives {
+        return Ok(None);
+    }
+    let p = TesterPaths {
+        winrar: cfg.winrar_path.clone(),
+        bandizip: cfg.bandizip_path.clone(),
+        seven_zip: cfg.seven_zip_path.clone(),
+    };
+    match archive_test::detect(&p) {
+        Some(t) => Ok(Some(t)),
+        None => {
+            if opts.no_hash {
+                anyhow::bail!(
+                    "拒绝运行：开启了 --unsafe-no-hash 但**机器上一个压缩包测试器都没装**。\n\
+                     此时 SHA256 没在跑,archive test 也跑不起来 —— 只剩\n\
+                     文件数+大小+修改时间,等价于「没在做完整性校验」。\n\
+                     如何修：\n\
+                       - 装一个测试器：推荐 7-Zip(免费开源 https://7-zip.org);或\n\
+                       - 去掉 --unsafe-no-hash,让 SHA256 兜底"
+                );
+            }
+            reporter.warn(
+                "未检测到 WinRAR / Bandizip / 7-Zip —— 压缩包内部结构无法测试。\
+                 重要资料建议装一个(推荐 7-Zip 免费开源：https://7-zip.org)。\
+                 SHA256 整文件校验仍在正常进行。",
+            );
+            Ok(None)
+        }
+    }
 }
 
 enum HandleOutcome {
     Done,
     Skipped,
+    /// 冻结的目标名在执行时已被占用(预览→执行间状态变了)——不写盘,不计 failed。(Spec D §4.1)
+    StalePlan,
     DriveSealed,
     TesterFatallyDisabled,
 }
 
+/// 执行单个项目的真实归档(复制/校验/源复核/事务提交)。`forced_dest_name`:
+/// - `Some(name)` = run_plan 传入的**冻结目标名**(复验未被占用后使用;被占 → StalePlan);
+/// - `None` = 直调(自行裁决目标名,重名时现算时间戳)——兼容旧测试与非计划路径。
+///
+/// 无论哪条路径,**安全前置(稳定/统计/容量/源复核)都在此实时重验**——冻的是命名,不是安全判断。
+#[allow(clippy::too_many_arguments)]
 fn handle_one(
     cfg: &Config,
     reporter: &dyn Reporter,
@@ -253,6 +568,7 @@ fn handle_one(
     proj_path: &Path,
     opts: &Options,
     tester_opt: Option<&(Tester, PathBuf)>,
+    forced_dest_name: Option<&str>,
 ) -> Result<HandleOutcome> {
     let name = proj_path
         .file_name()
@@ -294,8 +610,7 @@ fn handle_one(
         return Ok(HandleOutcome::Skipped);
     }
 
-    // 重名保护
-    let mut dest_name = name.clone();
+    // 重名保护 / 冻结名复验
     let catalog = paths::drive_catalog_path(&drive.root);
     let dup_in_drive = match catalog_has_project(&catalog, &name) {
         Ok(b) => b,
@@ -320,14 +635,39 @@ fn handle_one(
             return Ok(HandleOutcome::Skipped);
         }
     };
-    if dup_in_drive {
-        let stamp = Local::now().format("%Y%m%d%H%M%S");
-        dest_name = format!("{}_{}", name, stamp);
-        reporter.action(&format!(
-            "本盘已存在同名历史备份『{}』→ 为避免污染旧备份，本次改用唯一名『{}』。",
-            name, dest_name
-        ));
-    }
+    let dest_name = match forced_dest_name {
+        // run_plan 路径:用冻结名,但**复验**它未被占用(预览→执行间可能有人占了它)。
+        // 时间戳唯一名(重名场景)不会撞;普通名若现在已存在 → 计划已过期(StalePlan),不照旧误写。
+        Some(frozen) => {
+            let taken = if frozen == name {
+                dup_in_drive
+            } else {
+                catalog_has_project(&catalog, frozen).unwrap_or(false)
+            };
+            if taken {
+                reporter.warn(&format!(
+                    "计划已过期：目标名『{}』在本盘索引中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
+                    frozen
+                ));
+                return Ok(HandleOutcome::StalePlan);
+            }
+            frozen.to_string()
+        }
+        // 直调路径:自行裁决,重名时现算唯一时间戳名(旧行为)。
+        None => {
+            if dup_in_drive {
+                let stamp = Local::now().format("%Y%m%d%H%M%S");
+                let dn = format!("{}_{}", name, stamp);
+                reporter.action(&format!(
+                    "本盘已存在同名历史备份『{}』→ 为避免污染旧备份，本次改用唯一名『{}』。",
+                    name, dn
+                ));
+                dn
+            } else {
+                name.clone()
+            }
+        }
+    };
     let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
     let dest_have = if dest.is_dir() {
         folder_stats(&dest).bytes
@@ -977,6 +1317,9 @@ mod tests {
         fs::create_dir_all(&cfg.system_root).unwrap();
         let drive_root = base.join("drive");
         fs::create_dir_all(&drive_root).unwrap();
+        // 让它看起来是一块已初始化的备份盘:run_plan 重验会查盘上 id 文件是否在线。
+        fs::create_dir_all(paths::drive_info_dir(&drive_root)).unwrap();
+        fs::write(paths::drive_id_path(&drive_root), "备份1").unwrap();
         let drive = DriveInfo {
             letter: "T".into(),
             root: drive_root,
@@ -1019,7 +1362,8 @@ mod tests {
         let (_d, cfg, drive) = temp_world();
         let proj = cfg.ready_root.join("001empty");
         fs::create_dir_all(&proj).unwrap();
-        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
+        let outcome =
+            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
         assert!(matches!(outcome, HandleOutcome::Skipped), "空源应 Skipped");
         assert!(proj.is_dir(), "空源不应被移走(应仍在 待备份)");
     }
@@ -1033,7 +1377,7 @@ mod tests {
         fs::write(proj.join("a.txt"), b"hello").unwrap();
         fs::write(proj.join("b.bin"), b"world!!").unwrap();
         let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
-        let outcome = handle_one(&cfg, &rep, &drive, &proj, &test_opts(), None).unwrap();
+        let outcome = handle_one(&cfg, &rep, &drive, &proj, &test_opts(), None, None).unwrap();
         let log = rep.0.lock().unwrap().join("\n");
         assert!(
             matches!(outcome, HandleOutcome::Done),
@@ -1083,7 +1427,8 @@ mod tests {
             fs::create_dir_all(p).unwrap();
         }
         fs::write(&cat, [0xff, 0xfe, 0x00]).unwrap(); // 非 UTF-8 → 读索引必失败
-        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
+        let outcome =
+            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
         assert!(
             matches!(outcome, HandleOutcome::Skipped),
             "索引损坏应 fail-closed Skipped"
@@ -1127,5 +1472,156 @@ mod tests {
         assert!(verify_disabled(true, false, false));
         // no_hash=true 且 no_test_archives=true → 无校验,禁止
         assert!(verify_disabled(true, true, true));
+    }
+
+    // ── Spec D §4.1: decide() 只读裁决 Archive / Skip(无可备份) / SealAndStop(余量不足) ──
+    #[test]
+    fn decide_archive_skip_and_seal_and_stop() {
+        let (_d, cfg, drive) = temp_world();
+        // 正常项目 → Archive{dest_name}
+        let p1 = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        let it1 = decide(&cfg, &drive, &p1);
+        assert!(
+            matches!(&it1.action, PlanAction::Archive { dest_name } if dest_name == "001proj"),
+            "正常项目应 Archive,得到 {:?}",
+            it1.action
+        );
+        assert_eq!(it1.est_bytes, 5);
+        // 空源 → Skip("无可备份…")
+        let p2 = cfg.ready_root.join("002empty");
+        fs::create_dir_all(&p2).unwrap();
+        let it2 = decide(&cfg, &drive, &p2);
+        assert!(
+            matches!(&it2.action, PlanAction::Skip(r) if r.contains("可备份的真实文件")),
+            "空源应 Skip(无可备份的真实文件),得到 {:?}",
+            it2.action
+        );
+        // 余量不足 → SealAndStop(reserve_gb=0,free=1 字节,项目 4KB)
+        let mut tiny = drive.clone();
+        tiny.free_bytes = 1;
+        let p3 = cfg.ready_root.join("003big");
+        fs::create_dir_all(&p3).unwrap();
+        fs::write(p3.join("x.bin"), vec![0u8; 4096]).unwrap();
+        let it3 = decide(&cfg, &tiny, &p3);
+        assert!(
+            matches!(it3.action, PlanAction::SealAndStop(_)),
+            "余量不足应 SealAndStop,得到 {:?}",
+            it3.action
+        );
+    }
+
+    // ── Spec D §4.1: run_plan 执行冻结目标名 → 归档 + 移源 ──
+    #[test]
+    fn run_plan_executes_frozen_name_and_moves_source() {
+        let (_d, cfg, drive) = temp_world();
+        let p1 = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "001proj".into(),
+                est_bytes: 5,
+                action: PlanAction::Archive {
+                    dest_name: "001proj".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let s = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap();
+        assert_eq!(s.handled, 1);
+        assert_eq!(s.failed, 0);
+        assert!(!p1.exists(), "源应已移到 已备份");
+        assert!(
+            paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .is_dir(),
+            "目标盘应有项目副本"
+        );
+    }
+
+    // ── Spec D §4.1: 预览后盘被封 → run_plan 重验判定"计划已过期",不写盘不移源 ──
+    #[test]
+    fn run_plan_stale_when_drive_sealed_after_plan() {
+        let (_d, cfg, drive) = temp_world();
+        let p1 = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "001proj".into(),
+                est_bytes: 5,
+                action: PlanAction::Archive {
+                    dest_name: "001proj".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        // 预览之后、执行之前:盘被封
+        drive::seal(&drive).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        let s = run_plan(&cfg, &plan, &cancel, &rep).unwrap();
+        assert_eq!(s.handled, 0, "封盘后不执行");
+        assert!(s.sealed_stopped, "应标记封盘停本轮");
+        assert!(p1.is_dir(), "源不应被移动");
+        assert!(
+            !paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .exists(),
+            "不应写盘"
+        );
+        let log = rep.0.lock().unwrap().join("\n");
+        assert!(
+            log.contains("计划已过期"),
+            "应提示计划已过期;日志:\n{}",
+            log
+        );
+    }
+
+    // ── Spec D §4.1: 冻结目标名在执行前被占用 → StalePlan,不写盘不移源 ──
+    #[test]
+    fn run_plan_stale_when_frozen_name_taken() {
+        let (_d, cfg, drive) = temp_world();
+        let p1 = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        // 预览给的是普通名 001proj;但执行前本盘索引里已出现 001proj(被他人占用)
+        let cat = paths::drive_catalog_path(&drive.root);
+        if let Some(p) = cat.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(
+            &cat,
+            "ProjectNo,ProjectName,FileCount,TotalBytes,ArchivedUTC,VerifyStatus,Status,Notes\n\
+             001,001proj,1,5,2026-05-29T00:00:00+00:00,SHA256-OK,Complete,\n",
+        )
+        .unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "001proj".into(),
+                est_bytes: 5,
+                action: PlanAction::Archive {
+                    dest_name: "001proj".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        let s = run_plan(&cfg, &plan, &cancel, &rep).unwrap();
+        assert_eq!(s.handled, 0, "冻名被占不执行");
+        assert!(p1.is_dir(), "源不应被移动");
+        let log = rep.0.lock().unwrap().join("\n");
+        assert!(
+            log.contains("计划已过期"),
+            "应提示计划已过期;日志:\n{}",
+            log
+        );
     }
 }

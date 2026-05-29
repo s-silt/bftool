@@ -26,3 +26,4 @@ pub mod safety;
 pub mod status;
 pub mod txn;
 pub mod verify;
+pub mod verify_state;

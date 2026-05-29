@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use bftool_core::config::Config;
+use bftool_core::config::{Config, ConfigSource};
 use bftool_core::engine;
 use bftool_core::reporter::Reporter;
 
@@ -120,7 +120,9 @@ pub enum Command {
 }
 
 pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
-    let cfg = Config::load(args.config.as_deref()).context("加载配置失败")?;
+    // 用 LoadedConfig 读:既拿到生效配置,也记住「从哪读的」供 config-show 显示(Spec D §4.3)。
+    let loaded = Config::load_with_source(args.config.as_deref()).context("加载配置失败")?;
+    let cfg = loaded.config;
 
     match args.cmd {
         None => engine::status::run(&cfg, reporter),
@@ -168,6 +170,8 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             if let Some(r) = reserve_gb {
                 cfg.reserve_gb = r;
             }
+            // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
+            let no_cancel = std::sync::atomic::AtomicBool::new(false);
             let summary = engine::archive::run(
                 &cfg,
                 reporter,
@@ -179,6 +183,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                     drive_letter_override: drive,
                     no_test_archives,
                 },
+                &no_cancel,
             )?;
             if summary.failed > 0 {
                 bail!(
@@ -194,7 +199,9 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             engine::drive::init(&cfg, reporter, &drive, id.as_deref(), force)
         }
         Some(Command::Verify { drive }) => {
-            let report = engine::verify::run(&cfg, reporter, drive.as_deref())?;
+            // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
+            let no_cancel = std::sync::atomic::AtomicBool::new(false);
+            let report = engine::verify::run(&cfg, reporter, drive.as_deref(), &no_cancel)?;
             if report.has_corruption() {
                 bail!(
                     "复查发现 {} 处损坏/缺失/大小不符 —— 本盘完整性有问题。\n\
@@ -208,7 +215,17 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
         Some(Command::Find { keyword }) => engine::find::run(&cfg, &keyword),
         Some(Command::Drives) => engine::drive::list_mounted(&cfg, reporter),
         Some(Command::ConfigShow) => {
-            // 这条命令是查询性质，直接打到 stdout 即可（GUI 端会用 config getter，不走 CLI）。
+            // 查询性质，直接打到 stdout（GUI 端走 LoadedConfig getter，不解析这里的文本）。
+            // 头一行用 TOML 注释标出「配置来源」——让用户/脚本明确当前生效配置从哪读的,
+            // 且输出整体仍是合法 TOML 可直接管道/重定向。(Spec D §4.3)
+            let origin = match &loaded.source {
+                ConfigSource::Explicit(p) => format!("命令行 --config 指定：{}", p.display()),
+                ConfigSource::Candidate(p) => format!("自动发现：{}", p.display()),
+                ConfigSource::Default => {
+                    "内置默认（未找到任何 bftool.toml / config.toml）".to_string()
+                }
+            };
+            println!("# 配置来源：{}", origin);
             println!(
                 "{}",
                 toml::to_string_pretty(&cfg).context("序列化配置失败")?
