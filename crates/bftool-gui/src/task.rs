@@ -67,10 +67,25 @@ impl<T: Send + 'static> BackgroundTask<T> {
 
     /// 取走最终结果(join 线程)。仅在 is_finished 后调用;重复调用返回 None。
     pub fn take_outcome(&mut self) -> Option<TaskOutcome<T>> {
+        let join_result = self.handle.take().map(|h| h.join());
+        let outcome = self.result.lock().ok().and_then(|mut s| s.take());
+        // 若线程 join 返回 Err 且 result 为 None，说明任务 panic 了
+        if outcome.is_none() {
+            if let Some(Err(_)) = join_result {
+                return Some(TaskOutcome::Failed("后台任务崩溃（内部错误）".to_string()));
+            }
+        }
+        outcome
+    }
+}
+
+impl<T> Drop for BackgroundTask<T> {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        self.result.lock().ok().and_then(|mut s| s.take())
     }
 }
 

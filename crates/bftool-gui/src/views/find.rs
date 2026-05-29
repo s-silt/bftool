@@ -30,6 +30,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("关键词：");
         let resp = ui.text_edit_singleline(&mut app.find_ui.keyword);
+        if resp.changed() {
+            app.find_ui.result = None; // 关键词改变立即清空旧结果
+            app.find_ui.error = None;
+        }
         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             do_search = true;
         }

@@ -82,6 +82,11 @@ pub struct App {
     pub verify_ui: crate::views::verify::VerifyUiState,
     /// 设置页跨帧状态(表单字段 + 保存位置)。
     pub settings_ui: crate::views::settings::SettingsUiState,
+    /// 仪表盘状态缓存(避免每帧调 status::gather;TTL 1500ms)。
+    pub status_cache: Option<(
+        bftool_core::engine::status::StatusReport,
+        std::time::Instant,
+    )>,
 }
 
 impl App {
@@ -118,6 +123,7 @@ impl App {
             init_ui: crate::views::init::InitUiState::default(),
             verify_ui: crate::views::verify::VerifyUiState::default(),
             settings_ui: crate::views::settings::SettingsUiState::default(),
+            status_cache: None,
         }
     }
 

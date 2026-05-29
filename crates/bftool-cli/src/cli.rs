@@ -204,7 +204,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             let report = engine::verify::run(&cfg, reporter, drive.as_deref(), &no_cancel)?;
             if report.has_corruption() {
                 bail!(
-                    "复查发现 {} 处损坏/缺失/大小不符 —— 本盘完整性有问题。\n\
+                    "复查发现 {} 处完整性问题（损坏/缺失/大小不符/读取失败等） —— 本盘完整性有问题。\n\
                      请用其它副本恢复受损项目,或重做本盘。\n\
                      (本命令以非零退出码结束,便于定期复查脚本/计划任务识别坏盘。)",
                     report.bad

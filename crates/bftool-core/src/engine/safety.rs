@@ -78,6 +78,8 @@ fn eq_ci(a: &Path, b: &Path) -> bool {
 }
 
 fn is_inside(child: &Path, parent: &Path) -> bool {
+    // 注意:canonicalize 在路径不存在时回退原始路径,junction/symlink 重定向场景下保护有限。
+    // Windows 备份场景下此风险低(正常用户不会故意构建 junction 攻击自己),已知局限。
     let c = format!("{}\\", child.to_string_lossy().to_lowercase());
     let p = format!("{}\\", parent.to_string_lossy().to_lowercase());
     c.starts_with(&p) && c != p
@@ -85,6 +87,8 @@ fn is_inside(child: &Path, parent: &Path) -> bool {
 
 fn qualifier(p: &Path) -> String {
     // 取盘符部分 "D:" / ""；字符安全:多字节首字符 / UNC 不 panic(旧 `&s[1..2]` 会)。(ledger L-023)
+    // 注意:盘符比较是已知局限——canonicalize 在路径不存在时回退原始路径,
+    // junction/symlink 可绕过此检查。Windows 备份场景下风险低,已知局限。
     let s = p.to_string_lossy();
     let mut it = s.chars();
     match (it.next(), it.next()) {

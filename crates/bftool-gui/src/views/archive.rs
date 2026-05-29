@@ -170,6 +170,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 /// 后台跑 archive::plan(只读)生成预览——`plan` 会遍历待备份所有项目(folder_stats),
 /// 大目录时耗时,故放后台线程,不冻 UI。plan 消息经 GuiReporter 进日志;结果经 plan_task 回传。
 fn refresh_plan(app: &mut App) {
+    debug_assert!(
+        app.plan_task.is_none(),
+        "rx clobber: plan_task still running"
+    );
     app.logs.clear();
     app.last_summary = None;
     app.archive_plan = None;
@@ -193,6 +197,7 @@ fn refresh_plan(app: &mut App) {
 
 /// 把当前 plan 交给后台线程跑 run_plan(GuiReporter 推日志/进度,cancel 项目边界)。
 fn start_archive(app: &mut App) {
+    debug_assert!(app.task.is_none(), "rx clobber: task still running");
     let Some(plan) = app.archive_plan.take() else {
         return;
     };

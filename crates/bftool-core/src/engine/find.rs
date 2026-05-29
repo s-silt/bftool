@@ -29,7 +29,7 @@ pub struct FindOutcome {
     pub matches: Vec<FindMatch>,
     /// 实际成功检索到的索引来源数(本机 + 可读的额外来源)。
     pub sources_searched: usize,
-    /// 读取失败的额外来源标签(文件不存在/解析失败);本机索引不存在不算失败(=尚未归档)。
+    /// 读取失败的来源标签(额外来源不存在、或任何来源读取/解析失败)；本机索引**不存在**不算失败(=尚未归档)，但本机索引存在却读取失败会计入此列表。
     pub sources_failed: Vec<String>,
 }
 
@@ -84,9 +84,11 @@ fn read_catalog(
     let i_folder = idx("文件夹名");
     let i_no = idx("编号");
     if i_folder.is_none() && i_no.is_none() {
+        let header_list: Vec<&str> = headers.iter().collect();
         anyhow::bail!(
-            "无法识别的索引格式(缺「文件夹名」「编号」列)：{}",
-            path.display()
+            "无法识别的索引格式(缺「文件夹名」「编号」列)：{}，实际表头：[{}]",
+            path.display(),
+            header_list.join(", ")
         );
     }
     let i_drive = idx("备份盘名");

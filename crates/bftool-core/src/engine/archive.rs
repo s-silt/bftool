@@ -5,7 +5,7 @@
 //! 2. 单项目 try/catch 隔离，意外只跳过该项目不中断整轮
 //! 3. 校验失败时把目标侧坏文件移到 异常文件/，下次自动重传
 //! 4. 移动源前再次比对源（防"备份的是旧版本"）
-//! 5. 写事务标记 → 移动源 → 写清单/索引 → 删标记（宁可漏写索引也不要"假装归档好了"）
+//! 5. 写事务标记 → 写清单/索引 → 移动源 → 删标记（索引先于移源落盘;write_csv/catalog 失败源仍可重做）
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
@@ -267,7 +267,7 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
         }
     };
     // 超单盘容量(空盘也放不下)
-    let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
+    let reserve = cfg.reserve_gb.saturating_mul(1024 * 1024 * 1024);
     if size > drive.total_bytes.saturating_sub(reserve) {
         return skip(
             size,
@@ -285,6 +285,8 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
     };
     // 余量(断点续传时仅按"还需写入"判断)→ 不足则封盘停本轮
     let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
+    // dest_have 可能含孤儿 .bftool-part 文件(copy_folder 开头会先删它,最终不影响完成大小)。
+    // 此处轻微高估已有量导致 need 偏小,极端情况下可能多余地触发封盘;属已知可接受的精度损失。
     let dest_have = if dest.is_dir() {
         folder_stats(&dest).bytes
     } else {
@@ -527,10 +529,10 @@ fn detect_tester(
         Some(t) => Ok(Some(t)),
         None => {
             if opts.no_hash {
+                // AR-08: 与 guard_verify_enabled 保持一致的措辞风格——都是"拒绝运行：…等价于没在做完整性校验"。
                 anyhow::bail!(
-                    "拒绝运行：开启了 --unsafe-no-hash 但**机器上一个压缩包测试器都没装**。\n\
-                     此时 SHA256 没在跑,archive test 也跑不起来 —— 只剩\n\
-                     文件数+大小+修改时间,等价于「没在做完整性校验」。\n\
+                    "拒绝运行：开启了 --unsafe-no-hash 但没有可用的压缩包测试器(WinRAR/Bandizip/7-Zip 均未检测到)。\n\
+                     此时 SHA256 与 archive test 均不运行,等价于「没在做完整性校验」。\n\
                      如何修：\n\
                        - 装一个测试器：推荐 7-Zip(免费开源 https://7-zip.org);或\n\
                        - 去掉 --unsafe-no-hash,让 SHA256 兜底"
@@ -639,14 +641,18 @@ fn handle_one(
         // run_plan 路径:用冻结名,但**复验**它未被占用(预览→执行间可能有人占了它)。
         // 时间戳唯一名(重名场景)不会撞;普通名若现在已存在 → 计划已过期(StalePlan),不照旧误写。
         Some(frozen) => {
+            let drive_projects = paths::drive_projects_dir(&drive.root);
+            let dest_phys = drive_projects.join(frozen);
+            // 索引检查:frozen==name 时用 dup_in_drive;重命名场景重新查 catalog。
+            // 额外 OR 物理路径检查:索引与磁盘不一致时(写索引前宕机等),磁盘上已有目录也算被占用。
             let taken = if frozen == name {
-                dup_in_drive
+                dup_in_drive || dest_phys.exists()
             } else {
-                catalog_has_project(&catalog, frozen).unwrap_or(false)
+                catalog_has_project(&catalog, frozen).unwrap_or(false) || dest_phys.exists()
             };
             if taken {
                 reporter.warn(&format!(
-                    "计划已过期：目标名『{}』在本盘索引中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
+                    "计划已过期：目标名『{}』在本盘索引或磁盘中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
                     frozen
                 ));
                 return Ok(HandleOutcome::StalePlan);
@@ -677,7 +683,7 @@ fn handle_one(
     let need = size.saturating_sub(dest_have);
 
     // 容量
-    let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
+    let reserve = cfg.reserve_gb.saturating_mul(1024 * 1024 * 1024);
     if size > drive.total_bytes.saturating_sub(reserve) {
         reporter.error(&format!(
             "项目 {:.2}GB 超过单盘容量，空盘也放不下 → 需人工拆分",
@@ -705,6 +711,8 @@ fn handle_one(
         return Ok(HandleOutcome::DriveSealed);
     }
 
+    // dry_run 路径由 run() 在 plan() 后直接 render_dry_run(),不会进入 run_plan/handle_one。
+    // 此处 dry_run 分支仅供直接调用 handle_one(如旧测试)触发时兜底,正常流程不会到达。
     if opts.dry_run {
         reporter.info(&format!(
             "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
@@ -896,6 +904,9 @@ fn handle_one(
     }
 
     // 事务式提交
+    // AR-01 提交顺序:写标记 → 写清单/索引 → rename 移源 → 清标记。
+    // 这样如果 write_csv/catalog 失败,源还在 待备份,下次可以重做。
+    // rename 失败时不清标记(抛错 → 标记留着,下次 check_pending_txn 感知)。
     let local_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let utc = Utc::now().to_rfc3339();
     let src_bytes = src.total_bytes();
@@ -904,6 +915,8 @@ fn handle_one(
     let manifest_path =
         paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
     let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
+    // AR-04: arch_dest 的最终值(含时间戳冲突处理)在 pending.write 之前确定,
+    // 保证 PendingTxn.move_to 记录的是真正的目标路径。
     let mut arch_dest = cfg.archived_root.join(&name);
     if arch_dest.exists() {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
@@ -923,28 +936,7 @@ fn handle_one(
     };
     pending.write(&txn_path)?;
 
-    // 移动源（先动它；失败抛错 → 不写索引；源留在 待备份 下次重做）
-    fs::rename(proj_path, &arch_dest).map_err(|e| {
-        // 跨卷 rename 在 Windows 返回 ERROR_NOT_SAME_DEVICE(17):给可操作的 fail-closed 提示。(ledger L-010)
-        if e.raw_os_error() == Some(17) {
-            anyhow::anyhow!(
-                "移动源失败:待备份({})与已备份({})不在同一磁盘卷,无法原子移动。\n\
-                 如何修:把 ready_root 与 archived_root 配到同一块盘(通常都在你的 SSD 上)。\n\
-                 项目仍留在 待备份,改好配置后会自动重做(目标盘上的副本+校验清单已写好)。",
-                proj_path.display(),
-                arch_dest.display()
-            )
-        } else {
-            anyhow::anyhow!(
-                "移动源失败:{} → {}: {}",
-                proj_path.display(),
-                arch_dest.display(),
-                e
-            )
-        }
-    })?;
-
-    // 写清单 + 本盘索引 + 全局索引
+    // 写清单 + 本盘索引 + 全局索引(在 rename 之前写;失败则源仍在 待备份 可重做)
     src.write_csv(&manifest_path)?;
     append_drive_catalog(
         &catalog,
@@ -977,6 +969,27 @@ fn handle_one(
             manifest_path: rel_manifest,
         },
     )?;
+
+    // 移动源（索引已落盘后再移；失败抛错 → 不清标记；源留在 待备份 下次重做）
+    fs::rename(proj_path, &arch_dest).map_err(|e| {
+        // 跨卷 rename 在 Windows 返回 ERROR_NOT_SAME_DEVICE(17):给可操作的 fail-closed 提示。(ledger L-010)
+        if e.raw_os_error() == Some(17) {
+            anyhow::anyhow!(
+                "移动源失败:待备份({})与已备份({})不在同一磁盘卷,无法原子移动。\n\
+                 如何修:把 ready_root 与 archived_root 配到同一块盘(通常都在你的 SSD 上)。\n\
+                 项目仍留在 待备份,改好配置后会自动重做(目标盘上的副本+校验清单已写好)。",
+                proj_path.display(),
+                arch_dest.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "移动源失败:{} → {}: {}",
+                proj_path.display(),
+                arch_dest.display(),
+                e
+            )
+        }
+    })?;
 
     txn::PendingTxn::clear(&txn_path)?;
     reporter.ok(&format!(

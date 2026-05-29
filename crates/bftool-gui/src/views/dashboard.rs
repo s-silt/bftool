@@ -14,16 +14,32 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(theme::GAP);
     progress_card(app, ui);
 
-    let report = match status::gather(&app.cfg) {
-        Ok(r) => r,
-        Err(e) => {
-            theme::callout(
-                ui,
-                theme::DANGER,
-                theme::DANGER_SOFT,
-                &format!("读取状态失败：{:#}", e),
-            );
-            return;
+    const CACHE_TTL_MS: u128 = 1500;
+    let report = {
+        let now = std::time::Instant::now();
+        let stale = app
+            .status_cache
+            .as_ref()
+            .map(|(_, t)| t.elapsed().as_millis() > CACHE_TTL_MS)
+            .unwrap_or(true);
+        if stale {
+            match status::gather(&app.cfg) {
+                Ok(r) => {
+                    app.status_cache = Some((r.clone(), now));
+                    r
+                }
+                Err(e) => {
+                    theme::callout(
+                        ui,
+                        theme::DANGER,
+                        theme::DANGER_SOFT,
+                        &format!("读取状态失败：{:#}", e),
+                    );
+                    return;
+                }
+            }
+        } else {
+            app.status_cache.as_ref().unwrap().0.clone()
         }
     };
 
