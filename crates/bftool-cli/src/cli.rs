@@ -168,6 +168,8 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             if let Some(r) = reserve_gb {
                 cfg.reserve_gb = r;
             }
+            // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
+            let no_cancel = std::sync::atomic::AtomicBool::new(false);
             let summary = engine::archive::run(
                 &cfg,
                 reporter,
@@ -179,6 +181,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                     drive_letter_override: drive,
                     no_test_archives,
                 },
+                &no_cancel,
             )?;
             if summary.failed > 0 {
                 bail!(
