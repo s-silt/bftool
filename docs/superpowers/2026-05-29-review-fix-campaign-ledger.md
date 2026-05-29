@@ -9,7 +9,7 @@
 
 ## 进度(实时,Phase 3)
 
-测试数:0 → **70 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
+测试数:0 → **78 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
 
 > **⚠ 重大发现 L-044(P1,集成测试新抓到)**:`manifest::build` 与 `verify_tree` 对 base 做 `canonicalize()`(Windows 加 `\\?\` 前缀),而 `cruft::walk` 的 `WalkDir` 产出路径不带前缀 → `strip_prefix` 失配 → rel 退化成**绝对路径** → **diff/verify 在 Windows 上必然失败,核心归档功能根本跑不通**。因 CI 不跑 `cargo test`(CI-4)+ 核心零集成测试,一直未暴露。已修(base 改用传入 root)+ handle_one happy-path 集成测试锁定。commit `0582389`。
 
@@ -35,15 +35,24 @@
 | L-005 | P2 | `0582389` | folder_stats fail-closed + happy-path ×1 |
 | **L-044** | **P1** | `0582389` | **canonicalize rel 失配(核心校验必败)** + happy-path 锁定 |
 | L-014 | P2 | `d66c9b1` | copy_folder 原子复制 + cruft .part ×2 |
+| L-022 | P2 | `728dc76` | PendingTxn TOML 往返,删 grab_field ×2 |
+| L-027 | P2 | `4691c7d` | next_number/parse_drive_number ×2 |
+| L-020 | P2 | `2eb7005` | VerifyStatus enum ×1 |
+| L-010 | P2 | `e3b9a86` | 跨卷 fail-closed + safety 文案 ×1 |
+| L-032–040 | P3 | `ee5869e` | 文档漂移批量(README/toml/mod/cli/reporter/manifest) |
 
 **严重度修正(主控复核;拟交 Phase 4 确认):**
 - L-003 / L-005 / L-008 / L-009:P1 → **P2**。复核后均非"当前可触发的数据丢失/校验绕过",而是 fail-closed 缺口/维护性风险(L-003 空源假成功但不删数据;L-005 跨卷失败可经 check_pending_txn 恢复、不丢数据;L-008 core+cli 双 guard 当前都在、仅未来漂移风险;L-009 仅 no_hash 且 exit code=1 罕见)。仍会修。
 - L-002:P1 → **P2**。清单一致 + rel 唯一时缺文件必被 count/extra 捕获;真正静默漏检需 cruft 不对称 → 属脆弱性 + reason 误导。已修。
 
 **新增发现:**
-- L-043 | P3 | verify.rs:178 | `proj_dir.canonicalize()`(\\?\ 前缀)与 `cruft::walk` 的非 canonical 路径前缀做 strip_prefix 可能不匹配 → 真实盘上 extra 检测或把全部文件误报为"多余"。来源:主控写 L-007 测试时发现。待核/修。
+- L-043 → **已由 L-044 修复**(同根因 canonicalize/strip_prefix;verify_tree 与 manifest::build 的 base 都已改)。
+- L-044(P1)→ 见上「重大发现」,已修 `0582389`。
 
-剩余:P2(L-003/005/008/009/010–027 未修者)、P3 文档批量、Phase 4 对抗复审、Phase 5(CI 硬化 + cargo-audit + DoD)。
+**剩余:**
+- P2 未修:L-011(本盘/全局 catalog 非原子)、L-012(提交失败分类)、L-015(隔离 create_dir_all 吞错)、**L-019(Entry.hash→类型,大改)**、**L-021(DriveInfo sealed→newtype,大改)**
+- P3 未修:L-016(scan_mounted 丢盘静默→降 P3)、L-031(status/find println 绕过 Reporter)、L-039(spec A 行号 banner)、L-041(find 测试)、L-042(leading_number 测试)、L-028/029/030(冗余读/folder_stable 吞错/seal 统计)
+- Phase 4 对抗复审 → Phase 5(CI 硬化 + cargo-audit + DoD)→ 桌面版设计
 
 ---
 
