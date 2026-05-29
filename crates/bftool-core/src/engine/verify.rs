@@ -154,6 +154,13 @@ fn verify_tree(mdir: &Path, projects_dir: &Path, reporter: &dyn Reporter) -> Res
                     continue;
                 }
             };
+            // 清单项既无 Size 也无 Hash → 无任何可校验属性 → fail-closed,不能只查存在性就放过。
+            // (Phase 4 对抗复审 F-01/F-6:防"清单损坏/半截 → verify 仍报全绿 exit 0"。)
+            if size.is_none() && hash.is_empty() {
+                reporter.error(&format!("  清单项缺 Size 且缺 Hash,无法校验: {}", rel));
+                report.bad += 1;
+                continue;
+            }
             if let Some(sz) = size {
                 if meta.len() != sz {
                     reporter.error(&format!("  大小不一致: {}", rel));
@@ -339,6 +346,21 @@ mod tests {
         let (mdir, pdir) = setup(d.path(), &[("z.txt", 0, "")], &[("z.txt", b"")]);
         let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
         assert_eq!(r.bad, 0, "真实 0 字节文件应通过");
+    }
+
+    // ── Phase 4 F-01/F-6: 清单缺 Size 且缺 Hash → 无可校验属性 → fail-closed ──
+    #[test]
+    fn verify_tree_unverifiable_row_is_bad() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // Size 不可解析(abc)+ Hash 空 → 该行无任何可校验属性
+        fs::write(mdir.join("proj.sha256.csv"), "Rel,Size,Hash\nz.txt,abc,\n").unwrap();
+        fs::write(proj.join("z.txt"), b"whatever").unwrap();
+        let r = verify_tree(&mdir, &d.path().join("p"), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1, "Size 不可解析 + 无 Hash 应判 bad(fail-closed)");
     }
 
     #[test]

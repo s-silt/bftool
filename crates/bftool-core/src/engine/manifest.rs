@@ -111,7 +111,7 @@ pub struct ManifestOpts {
     pub no_hash: bool,
 }
 
-/// 生成文件夹清单。`no_hash=true` 时 Hash 字段为空串。
+/// 生成文件夹清单。`no_hash=true` 时 `Entry.hash` 为 `None`(CSV 落盘仍写空串保持兼容)。
 pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result<Manifest> {
     let files = real_files(root, reporter)?;
     let total_bytes: u64 = files

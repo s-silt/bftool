@@ -297,7 +297,29 @@ fn handle_one(
     // 重名保护
     let mut dest_name = name.clone();
     let catalog = paths::drive_catalog_path(&drive.root);
-    let dup_in_drive = dup_in_drive_or_assume(&catalog, &name, reporter);
+    let dup_in_drive = match catalog_has_project(&catalog, &name) {
+        Ok(b) => b,
+        Err(e) => {
+            // 本盘索引存在但读不出(损坏/非 UTF-8):fail-closed —— 不确定是否重名时,既不能覆盖
+            // 旧备份,也不该每轮用新时间戳名重复全量写盘(会塞满)。停下让用户修索引。(Phase 4 F-4;修订 L-017)
+            reporter.error(&format!(
+                "读本盘索引失败({}):无法判断是否重名 → 跳过本项目,避免覆盖旧备份或重复写盘。请检查 {}",
+                e,
+                catalog.display()
+            ));
+            note_manual(
+                cfg,
+                reporter,
+                &name,
+                &format!(
+                    "本盘索引读取失败:{} —— 请人工检查/修复 {}",
+                    e,
+                    catalog.display()
+                ),
+            );
+            return Ok(HandleOutcome::Skipped);
+        }
+    };
     if dup_in_drive {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
         dest_name = format!("{}_{}", name, stamp);
@@ -710,21 +732,6 @@ fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
     Ok(())
 }
 
-/// 读本盘索引判断是否已有同名项目;**读失败时保守返回 true**(视为可能重名),
-/// 避免把同名旧备份覆盖污染。此前 `.unwrap_or(false)` 把读失败当"无重名"= fail-open。(ledger L-017)
-fn dup_in_drive_or_assume(catalog: &Path, name: &str, reporter: &dyn Reporter) -> bool {
-    match catalog_has_project(catalog, name) {
-        Ok(b) => b,
-        Err(e) => {
-            reporter.warn(&format!(
-                "读本盘索引失败({})——保守按'可能重名'用唯一名,避免覆盖同名旧备份。",
-                e
-            ));
-            true
-        }
-    }
-}
-
 fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
     if !catalog.is_file() {
         return Ok(false);
@@ -887,7 +894,14 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target).ok();
         } else if entry.file_type().is_file() {
-            // 已存在且大小一致 → 视为已传，跳过（断点续传）
+            // 原子复制的临时名;先清理可能残留的孤儿 .part(上次中断留下),避免在备份盘累积。(Phase 4 F-3)
+            let part = {
+                let mut s = target.clone().into_os_string();
+                s.push(".bftool-part");
+                PathBuf::from(s)
+            };
+            let _ = fs::remove_file(&part); // best-effort:失败也会被下面 fs::copy 覆盖
+                                            // 已存在且大小一致 → 视为已传，跳过（断点续传）
             if let (Ok(meta_src), Ok(meta_dst)) = (path.metadata(), target.metadata()) {
                 if meta_src.len() == meta_dst.len() {
                     continue;
@@ -898,11 +912,6 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
             }
             // 原子复制:写 <target>.bftool-part → fsync → rename。崩溃只会留下 .part
             // (被当 cruft 忽略、下轮重写),不会留下"大小对得上的半成品"被续传误跳过。(ledger L-014)
-            let part = {
-                let mut s = target.clone().into_os_string();
-                s.push(".bftool-part");
-                PathBuf::from(s)
-            };
             fs::copy(path, &part)
                 .with_context(|| format!("复制失败：{} → {}", path.display(), part.display()))?;
             let f = std::fs::OpenOptions::new()
@@ -1062,20 +1071,29 @@ mod tests {
         assert!(!dst.join("a.txt.bftool-part").exists(), "不应遗留 .part");
     }
 
-    // ── L-017: 读本盘索引失败时保守视为重名(避免覆盖旧备份) ──
+    // ── L-017 修订(Phase 4 F-4):本盘索引损坏 → fail-closed Skipped,不覆盖也不重复写盘 ──
     #[test]
-    fn dup_assume_true_on_unreadable_catalog() {
-        let d = tempfile::tempdir().unwrap();
-        let cat = d.path().join("cat.csv");
+    fn handle_one_corrupt_drive_catalog_fails_closed() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        let cat = paths::drive_catalog_path(&drive.root);
+        if let Some(p) = cat.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(&cat, [0xff, 0xfe, 0x00]).unwrap(); // 非 UTF-8 → 读索引必失败
+        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
         assert!(
-            !dup_in_drive_or_assume(&cat, "x", &NoopReporter),
-            "无索引文件 → 不算重名"
+            matches!(outcome, HandleOutcome::Skipped),
+            "索引损坏应 fail-closed Skipped"
         );
-        // 非 UTF-8 内容 → csv 读 headers 失败 → 保守视为重名
-        fs::write(&cat, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        assert!(proj.is_dir(), "不应移源");
         assert!(
-            dup_in_drive_or_assume(&cat, "x", &NoopReporter),
-            "索引读失败 → 保守视为重名(避免覆盖)"
+            !paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .exists(),
+            "不应写盘"
         );
     }
 
