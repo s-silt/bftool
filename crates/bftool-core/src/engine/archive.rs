@@ -54,7 +54,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     // 找当前可用备份盘
     let drive = match opts.drive_letter_override.as_deref() {
         Some(letter) => drive::info_by_letter(letter)?,
-        None => match drive::pick_active()? {
+        None => match drive::pick_active(cfg.min_drive_gb, reporter)? {
             Some(d) => d,
             None => {
                 reporter.error("未发现已初始化且未封盘的备份盘。");

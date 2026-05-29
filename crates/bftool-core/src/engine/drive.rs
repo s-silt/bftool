@@ -80,10 +80,36 @@ pub fn scan_mounted() -> Result<Vec<DriveInfo>> {
     Ok(out)
 }
 
-/// 返回唯一一块未封盘的备份盘；多块返回错误；零块返回 None。
-pub fn pick_active() -> Result<Option<DriveInfo>> {
-    let all = scan_mounted()?;
-    let usable: Vec<_> = all.into_iter().filter(|d| !d.sealed).collect();
+/// 从一组盘里挑出"可写入"的(未封盘且容量 ≥ min_drive_gb),并把"过小被忽略"的单独返回。
+/// 纯函数便于测试;容量过滤是「防误抓 U 盘」安全闸 —— 此前 min_drive_gb 形同虚设。(ledger L-006)
+fn usable_drives(all: Vec<DriveInfo>, min_drive_gb: u64) -> (Vec<DriveInfo>, Vec<DriveInfo>) {
+    let min_bytes = min_drive_gb.saturating_mul(1024 * 1024 * 1024);
+    let mut usable = Vec::new();
+    let mut too_small = Vec::new();
+    for d in all.into_iter().filter(|d| !d.sealed) {
+        if d.total_bytes >= min_bytes {
+            usable.push(d);
+        } else {
+            too_small.push(d);
+        }
+    }
+    (usable, too_small)
+}
+
+/// 返回唯一一块未封盘且容量达标的备份盘；多块返回错误；零块返回 None。
+/// 容量过滤(min_drive_gb)是防误抓 U 盘/SD 卡的安全闸。(ledger L-006)
+pub fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
+    let (usable, too_small) = usable_drives(scan_mounted()?, min_drive_gb);
+    for d in &too_small {
+        reporter.warn(&format!(
+            "忽略疑似过小的盘 {} ({}:) {:.0}GB(低于最小 {}GB)—— 防误抓 U 盘/SD 卡。\
+             若确需用它,把配置 min_drive_gb 调低后重试。",
+            d.id,
+            d.letter,
+            d.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+            min_drive_gb
+        ));
+    }
     if usable.len() > 1 {
         let names = usable
             .iter()
@@ -358,4 +384,55 @@ pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
         free_bytes: free,
         total_bytes: total,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn di(letter: &str, total_gb: u64, sealed: bool) -> DriveInfo {
+        let bytes = total_gb * 1024 * 1024 * 1024;
+        DriveInfo {
+            letter: letter.into(),
+            root: PathBuf::from(format!("{}:\\", letter)),
+            id: format!("备份{}", letter),
+            sealed,
+            free_bytes: bytes,
+            total_bytes: bytes,
+        }
+    }
+
+    // ── L-006: min_drive_gb 真正生效,排除过小盘(防误抓 U 盘) ──
+    #[test]
+    fn usable_drives_excludes_below_min_size() {
+        let all = vec![di("F", 8, false), di("E", 500, false)];
+        let (usable, too_small) = usable_drives(all, 200);
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].letter, "E");
+        assert_eq!(too_small.len(), 1);
+        assert_eq!(too_small[0].letter, "F");
+    }
+
+    #[test]
+    fn usable_drives_excludes_sealed_without_marking_too_small() {
+        let all = vec![di("E", 500, true)];
+        let (usable, too_small) = usable_drives(all, 200);
+        assert!(usable.is_empty());
+        assert!(too_small.is_empty(), "已封盘不应被算作'过小'");
+    }
+
+    #[test]
+    fn usable_drives_keeps_large_unsealed() {
+        let all = vec![di("E", 500, false)];
+        let (usable, too_small) = usable_drives(all, 200);
+        assert_eq!(usable.len(), 1);
+        assert!(too_small.is_empty());
+    }
+
+    #[test]
+    fn usable_drives_at_exact_threshold_is_usable() {
+        let all = vec![di("E", 200, false)];
+        let (usable, _) = usable_drives(all, 200);
+        assert_eq!(usable.len(), 1, "恰好等于阈值应可用");
+    }
 }
