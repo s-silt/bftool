@@ -252,7 +252,7 @@ fn handle_one(
     // 重名保护
     let mut dest_name = name.clone();
     let catalog = paths::drive_catalog_path(&drive.root);
-    let dup_in_drive = catalog_has_project(&catalog, &name).unwrap_or(false);
+    let dup_in_drive = dup_in_drive_or_assume(&catalog, &name, reporter);
     if dup_in_drive {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
         dest_name = format!("{}_{}", name, stamp);
@@ -655,6 +655,21 @@ fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
     Ok(())
 }
 
+/// 读本盘索引判断是否已有同名项目;**读失败时保守返回 true**(视为可能重名),
+/// 避免把同名旧备份覆盖污染。此前 `.unwrap_or(false)` 把读失败当"无重名"= fail-open。(ledger L-017)
+fn dup_in_drive_or_assume(catalog: &Path, name: &str, reporter: &dyn Reporter) -> bool {
+    match catalog_has_project(catalog, name) {
+        Ok(b) => b,
+        Err(e) => {
+            reporter.warn(&format!(
+                "读本盘索引失败({})——保守按'可能重名'用唯一名,避免覆盖同名旧备份。",
+                e
+            ));
+            true
+        }
+    }
+}
+
 fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
     if !catalog.is_file() {
         return Ok(false);
@@ -901,6 +916,23 @@ mod tests {
         let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
         assert!(matches!(outcome, HandleOutcome::Skipped), "空源应 Skipped");
         assert!(proj.is_dir(), "空源不应被移走(应仍在 待备份)");
+    }
+
+    // ── L-017: 读本盘索引失败时保守视为重名(避免覆盖旧备份) ──
+    #[test]
+    fn dup_assume_true_on_unreadable_catalog() {
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("cat.csv");
+        assert!(
+            !dup_in_drive_or_assume(&cat, "x", &NoopReporter),
+            "无索引文件 → 不算重名"
+        );
+        // 非 UTF-8 内容 → csv 读 headers 失败 → 保守视为重名
+        fs::write(&cat, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        assert!(
+            dup_in_drive_or_assume(&cat, "x", &NoopReporter),
+            "索引读失败 → 保守视为重名(避免覆盖)"
+        );
     }
 
     // ── L-008: 无校验判定单一来源,core/cli 共用 verify_disabled ──
