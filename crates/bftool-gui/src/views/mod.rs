@@ -6,5 +6,6 @@ pub mod dashboard;
 pub mod drives;
 pub mod find;
 pub mod init;
+pub mod settings;
 pub mod util;
 pub mod verify;

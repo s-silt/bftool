@@ -76,6 +76,8 @@ pub struct App {
     pub init_ui: crate::views::init::InitUiState,
     /// 复查页跨帧状态(盘列表 + 选择)。
     pub verify_ui: crate::views::verify::VerifyUiState,
+    /// 设置页跨帧状态(表单字段 + 保存位置)。
+    pub settings_ui: crate::views::settings::SettingsUiState,
 }
 
 impl App {
@@ -107,6 +109,7 @@ impl App {
             find_ui: crate::views::find::FindUiState::default(),
             init_ui: crate::views::init::InitUiState::default(),
             verify_ui: crate::views::verify::VerifyUiState::default(),
+            settings_ui: crate::views::settings::SettingsUiState::default(),
         }
     }
 
@@ -172,10 +175,7 @@ impl eframe::App for App {
             View::Find => crate::views::find::ui(self, ui),
             View::Init => crate::views::init::ui(self, ui),
             View::Verify => crate::views::verify::ui(self, ui),
-            other => {
-                ui.heading(other.label());
-                ui.label("（此视图将在 Phase 3 接入）");
-            }
+            View::Settings => crate::views::settings::ui(self, ui),
         });
     }
 }
