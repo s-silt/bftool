@@ -3,18 +3,16 @@
 
 use eframe::egui;
 
-use bftool_core::engine::find::{self, FindMatch};
+use bftool_core::engine::find::{self, FindMatch, FindOutcome};
 
 use crate::app::App;
 
-/// 查找页跨帧状态。
+/// 查找页跨帧状态。直接持有 core 返回的 `FindOutcome`,避免把命中/来源数/失败来源
+/// 拆成多个字段后还要在各分支手动同步。
 #[derive(Debug, Default)]
 pub struct FindUiState {
     pub keyword: String,
-    pub results: Option<Vec<FindMatch>>,
-    /// 上次查询检索了几个来源 / 哪些额外来源读不了(供提示)。
-    pub sources_searched: usize,
-    pub sources_failed: Vec<String>,
+    pub result: Option<FindOutcome>,
     pub error: Option<String>,
 }
 
@@ -47,50 +45,51 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if let Some(err) = &app.find_ui.error {
         ui.colored_label(egui::Color32::from_rgb(0xCC, 0x33, 0x33), err);
     }
-    if !app.find_ui.sources_failed.is_empty() {
-        ui.colored_label(
-            egui::Color32::from_rgb(0xB0, 0x6A, 0x00),
-            format!(
-                "{} 个额外索引来源读取失败已跳过：{}",
-                app.find_ui.sources_failed.len(),
-                app.find_ui.sources_failed.join("、")
-            ),
-        );
-    }
-    match &app.find_ui.results {
-        Some(rows) if !rows.is_empty() => {
-            ui.label(format!(
-                "匹配 {} 项(检索了 {} 个来源)：",
-                rows.len(),
-                app.find_ui.sources_searched
-            ));
-            egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("find_grid")
-                        .num_columns(5)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("文件夹");
-                            ui.strong("来源");
-                            ui.strong("备份盘");
-                            ui.strong("盘内路径");
-                            ui.strong("校验");
-                            ui.end_row();
-                            for m in rows {
-                                let [folder, source, drive_id, path, verify] = match_row(m);
-                                ui.monospace(folder);
-                                ui.label(source);
-                                ui.label(drive_id);
-                                ui.monospace(path);
-                                ui.label(verify);
+    match &app.find_ui.result {
+        Some(outcome) => {
+            if !outcome.sources_failed.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xB0, 0x6A, 0x00),
+                    format!(
+                        "{} 个索引来源读取失败已跳过：{}",
+                        outcome.sources_failed.len(),
+                        outcome.sources_failed.join("、")
+                    ),
+                );
+            }
+            if outcome.matches.is_empty() {
+                ui.label("无匹配。");
+            } else {
+                ui.label(format!(
+                    "匹配 {} 项(检索了 {} 个来源)：",
+                    outcome.matches.len(),
+                    outcome.sources_searched
+                ));
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("find_grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong("文件夹");
+                                ui.strong("来源");
+                                ui.strong("备份盘");
+                                ui.strong("盘内路径");
+                                ui.strong("校验");
                                 ui.end_row();
-                            }
-                        });
-                });
-        }
-        Some(_) => {
-            ui.label("无匹配。");
+                                for m in &outcome.matches {
+                                    let [folder, source, drive_id, path, verify] = match_row(m);
+                                    ui.monospace(folder);
+                                    ui.label(source);
+                                    ui.label(drive_id);
+                                    ui.monospace(path);
+                                    ui.label(verify);
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
         }
         None => {
             ui.weak("输入关键词后回车 / 点「查找」。");
@@ -101,22 +100,15 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 fn run_search(app: &mut App) {
     let kw = app.find_ui.keyword.trim().to_string();
     app.find_ui.error = None;
-    app.find_ui.sources_failed.clear();
     if kw.is_empty() {
-        app.find_ui.results = None;
-        app.find_ui.sources_searched = 0;
+        app.find_ui.result = None;
         app.find_ui.error = Some("请输入关键词。".to_string());
         return;
     }
     match find::search(&app.cfg, &kw) {
-        Ok(outcome) => {
-            app.find_ui.results = Some(outcome.matches);
-            app.find_ui.sources_searched = outcome.sources_searched;
-            app.find_ui.sources_failed = outcome.sources_failed;
-        }
+        Ok(outcome) => app.find_ui.result = Some(outcome),
         Err(e) => {
-            app.find_ui.results = None;
-            app.find_ui.sources_searched = 0;
+            app.find_ui.result = None;
             app.find_ui.error = Some(format!("查找失败：{:#}", e));
         }
     }
@@ -141,10 +133,8 @@ mod tests {
     fn find_ui_default_empty() {
         let s = FindUiState::default();
         assert!(s.keyword.is_empty());
-        assert!(s.results.is_none());
+        assert!(s.result.is_none());
         assert!(s.error.is_none());
-        assert_eq!(s.sources_searched, 0);
-        assert!(s.sources_failed.is_empty());
     }
 
     #[test]
