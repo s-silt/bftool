@@ -1311,6 +1311,7 @@ mod tests {
             winrar_path: std::path::PathBuf::new(),
             bandizip_path: std::path::PathBuf::new(),
             seven_zip_path: std::path::PathBuf::new(),
+            extra_catalogs: Vec::new(),
         };
         fs::create_dir_all(&cfg.ready_root).unwrap();
         fs::create_dir_all(&cfg.archived_root).unwrap();

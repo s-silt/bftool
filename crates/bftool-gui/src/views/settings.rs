@@ -35,6 +35,8 @@ pub struct SettingsUiState {
     pub winrar: String,
     pub bandizip: String,
     pub seven_zip: String,
+    /// 多机汇总查询:其它电脑拷来的「备份索引名单.csv」路径列表。
+    pub extra_catalogs: Vec<String>,
     pub save_choice: SaveChoice,
     /// (成功?, 文案)
     pub result: Option<(bool, String)>,
@@ -54,6 +56,11 @@ impl SettingsUiState {
         self.winrar = cfg.winrar_path.display().to_string();
         self.bandizip = cfg.bandizip_path.display().to_string();
         self.seven_zip = cfg.seven_zip_path.display().to_string();
+        self.extra_catalogs = cfg
+            .extra_catalogs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         self.loaded = true;
     }
 }
@@ -96,6 +103,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             });
     });
 
+    ui.add_space(4.0);
+    extra_catalogs_section(ui, &mut app.settings_ui.extra_catalogs);
+
     ui.separator();
     ui.label("保存位置：");
     let is_default = matches!(app.config_source, ConfigSource::Default);
@@ -135,6 +145,46 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         };
         ui.colored_label(color, msg);
     }
+}
+
+/// 多机汇总查询:管理其它电脑拷来的「备份索引名单.csv」列表。
+/// 「添加索引文件…」用 `pick_files()` 支持一次多选(Ctrl/Shift 圈选);每行可单独移除。
+fn extra_catalogs_section(ui: &mut egui::Ui, items: &mut Vec<String>) {
+    ui.collapsing("多机汇总查询：额外索引来源(查找时一并检索)", |ui| {
+        ui.weak("把其它电脑的「备份索引名单.csv」拷到本机后加进来，查找页就能跨机查。只读，不影响本机归档。");
+        ui.weak("建议各机用不同「盘命名前缀」，结果里才好区分来自哪台机。");
+        ui.add_space(4.0);
+        if ui.button("➕ 添加索引文件…").clicked() {
+            let picked = rfd::FileDialog::new()
+                .set_title("选择其它电脑的 备份索引名单.csv（可多选）")
+                .add_filter("CSV 索引", &["csv"])
+                .pick_files();
+            if let Some(paths) = picked {
+                for p in paths {
+                    let s = p.display().to_string();
+                    if !items.iter().any(|e| e == &s) {
+                        items.push(s);
+                    }
+                }
+            }
+        }
+        if items.is_empty() {
+            ui.weak("(未添加额外来源；只查本机索引)");
+        } else {
+            let mut remove: Option<usize> = None;
+            for (i, path) in items.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.button("移除").clicked() {
+                        remove = Some(i);
+                    }
+                    path_display(ui, path);
+                });
+            }
+            if let Some(i) = remove {
+                items.remove(i);
+            }
+        }
+    });
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -256,6 +306,13 @@ fn parse_form(s: &SettingsUiState) -> Result<Config, String> {
         winrar_path: PathBuf::from(s.winrar.trim()),
         bandizip_path: PathBuf::from(s.bandizip.trim()),
         seven_zip_path: PathBuf::from(s.seven_zip.trim()),
+        extra_catalogs: s
+            .extra_catalogs
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect(),
     })
 }
 
@@ -308,6 +365,16 @@ mod tests {
         assert_eq!(c.min_drive_gb, 200);
         assert_eq!(c.ready_root, PathBuf::from("D:/r"));
         assert_eq!(c.name_prefix, "备份");
+    }
+
+    #[test]
+    fn parse_form_collects_extra_catalogs_dropping_blanks() {
+        let mut s = filled();
+        s.extra_catalogs = vec!["D:/u/A.csv".into(), "  ".into(), "D:/u/B.csv".into()];
+        let c = parse_form(&s).unwrap();
+        assert_eq!(c.extra_catalogs.len(), 2, "空白项应被丢弃");
+        assert_eq!(c.extra_catalogs[0], PathBuf::from("D:/u/A.csv"));
+        assert_eq!(c.extra_catalogs[1], PathBuf::from("D:/u/B.csv"));
     }
 
     #[test]

@@ -40,3 +40,11 @@ test_archives = true
 winrar_path   = "C:\\Program Files\\WinRAR\\WinRAR.exe"
 bandizip_path = "C:\\Program Files\\Bandizip\\bz.exe"
 seven_zip_path = "C:\\Program Files\\7-Zip\\7z.exe"
+
+# -------- 多机汇总查询(可选) --------
+# 其它电脑拷来的「备份索引名单.csv」路径列表;find 查询时与本机索引一并检索。
+# 只读,不影响本机归档/盘号/事务。建议各机用不同 name_prefix,结果里好区分来源。
+# 不需要就保持空数组 []。GUI 设置页可点选添加(支持一次多选)。
+# 例:
+# extra_catalogs = ["D:\\汇总\\A.csv", "D:\\汇总\\B.csv"]
+extra_catalogs = []
