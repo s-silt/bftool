@@ -33,7 +33,10 @@ name_prefix = "备份"
 # -------- 压缩包内部测试(Spec B / Batch 3.5) --------
 # 默认开。装了 7-Zip / WinRAR / Bandizip 任一就自动用,新手不用动这一段。
 
-# 默认 true。--no-test-archives 关掉(关时与 --unsafe-no-hash 互斥)。
+# 默认 true。--no-test-archives 关掉。
+# 注意:不是"两个开关本身互斥"。被拒绝的是「同时关闭 SHA256(--unsafe-no-hash)
+# 且关闭 archive test」这一组合 —— 那样只剩 文件数+大小+修改时间,等于没做完整性校验。
+# 单独关 archive test(SHA256 仍开)是允许的;单独用 SHA256(archive test 关)也允许。
 test_archives = true
 
 # WinRAR(优先) / Bandizip / 7-Zip 路径。装哪个就保留哪个对应行有效路径。

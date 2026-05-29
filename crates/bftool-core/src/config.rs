@@ -138,6 +138,16 @@ impl Config {
                 p
             );
         }
+        // extra_catalogs:GUI parse_form 已过滤空白项,但 CLI 直接编辑 toml 可能塞进空串/纯空白。
+        // 空路径会被 find 当成"不存在的来源"静默记为失败,徒增噪音;直接在加载期拒掉。(F4)
+        for (i, c) in self.extra_catalogs.iter().enumerate() {
+            if c.as_os_str().to_string_lossy().trim().is_empty() {
+                anyhow::bail!(
+                    "配置 extra_catalogs 第 {} 项为空(或纯空白);请删除该项,或填一个有效的「备份索引名单.csv」路径。",
+                    i + 1
+                );
+            }
+        }
         Ok(())
     }
 
@@ -277,6 +287,31 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    // ── F4: extra_catalogs 不接受空串/纯空白项(CLI 直接编辑 toml 可能塞空串)──
+    #[test]
+    fn validate_rejects_empty_extra_catalog_entry() {
+        let c = Config {
+            extra_catalogs: vec![PathBuf::from("")],
+            ..Config::default()
+        };
+        assert!(c.validate().is_err(), "空串路径应被拒绝");
+
+        let c = Config {
+            extra_catalogs: vec![PathBuf::from("   ")],
+            ..Config::default()
+        };
+        assert!(c.validate().is_err(), "纯空白路径应被拒绝");
+    }
+
+    #[test]
+    fn validate_accepts_nonempty_extra_catalogs() {
+        let c = Config {
+            extra_catalogs: vec![PathBuf::from("D:/汇总/A.csv")],
+            ..Config::default()
+        };
+        assert!(c.validate().is_ok());
     }
 
     // ── 向后兼容：旧配置文件没有 extra_catalogs 字段，仍应能加载（默认空）──

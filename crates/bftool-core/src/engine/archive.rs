@@ -25,6 +25,7 @@ use crate::reporter::Reporter;
 pub struct Options {
     pub dry_run: bool,
     pub no_hash: bool,
+    /// 本轮最多处理多少个项目。`0 = 不限`（处理本轮计划里的全部项目）。
     pub limit: usize,
     pub drive_letter_override: Option<String>,
     pub no_test_archives: bool,
@@ -87,6 +88,22 @@ impl std::error::Error for NoWritableDrive {}
 /// 是否处于"没有任何内容完整性校验"的状态:跳过 SHA256(no_hash) 且 archive test 实际关闭。
 /// 等价于只剩 size+count+mtime,是禁止的组合。判定集中在此,core::run 守卫与 CLI 守卫共用
 /// 同一真值,避免两处条件漂移把"无校验后门"悄悄打开。(ledger L-008)
+///
+/// SEC-008: 三个 bool 参数语义重叠，签名暂不改（改了牵动 core+cli 两处调用点，
+/// 风险中、收益低）。三者各自含义与组合真值如下，调用方务必按命名传值：
+/// - `no_hash`        —— 用户是否传了 `--unsafe-no-hash`（**关掉** SHA256 整文件校验）。
+/// - `test_archives`  —— 配置项 `cfg.test_archives`（是否**启用**压缩包内部测试）。
+/// - `no_test_archives` —— 本轮 `opts.no_test_archives`（是否**临时关掉**压缩包测试，覆盖配置）。
+///
+/// 「archive test 实际开启」≡ `test_archives && !no_test_archives`（配置开 且 本轮没关）。
+/// 「无校验」≡ `no_hash && !(test_archives && !no_test_archives)`，化简即下式。真值表：
+///
+/// | no_hash | test_archives | no_test_archives | 结果(=无校验) |
+/// |---------|---------------|------------------|----------------|
+/// | false   | *             | *                | false（SHA256 兜底） |
+/// | true    | true          | false            | false（压缩包测试兜底） |
+/// | true    | false         | *                | **true**（配置没开测试） |
+/// | true    | true          | true             | **true**（本轮关了测试） |
 pub fn verify_disabled(no_hash: bool, test_archives: bool, no_test_archives: bool) -> bool {
     no_hash && (!test_archives || no_test_archives)
 }
@@ -171,6 +188,9 @@ pub fn plan(cfg: &Config, opts: &Options, reporter: &dyn Reporter) -> Result<Arc
     // 列出待归档项目(读不到/为空 → 空计划,友好提示)。
     let mut items = Vec::new();
     if !cfg.ready_root.is_dir() {
+        // AR-16: ready_root 非目录时**有意**返回空 items 而非 Err —— 让 run/run_plan 走
+        // 友好的「本轮无项目可做」收尾路径(打印提示、退出码 0)，而不是抛硬错误把
+        // CLI/GUI 弹成异常。配置写错盘符等情况下，用户看到的是可读提示而非堆栈。
         reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
         return Ok(ArchivePlan {
             drive,
@@ -278,6 +298,10 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
         );
     }
     // 冻结目标名(重名 → 唯一时间戳名)
+    // AR-11: 时间戳精度为秒(%Y%m%d%H%M%S)。同一秒内对两个同名项目算计划，会得到相同的时间戳目标名。
+    // 这种「同秒 + 同名」极罕见(秒级竞态 + 重名两条件叠加)，且即便发生也不会写坏数据：
+    // run_plan 执行前 handle_one 会用 forced_dest_name 复验该名是否已被占用(索引或磁盘)，
+    // 命中即判 StalePlan 跳过、不照旧误写。这里接受秒级精度，不引入更细粒度(纳秒会让目标名难读)。
     let dest_name = if dup {
         format!("{}_{}", name, Local::now().format("%Y%m%d%H%M%S"))
     } else {
@@ -398,6 +422,38 @@ pub fn run_plan(
         });
     }
 
+    // SEC-007: 单盘不变式复验。`pick_active` 的「多块可写盘 → 停」检查只在 plan() 跑过一次；
+    // 预览→执行之间若插入第二块未封盘备份盘，原来的检查就被绕过、可能写错盘。
+    // 仅在**自动选盘**(drive_letter_override 为 None)时复验——显式 --drive 指定盘符时是用户
+    // 主动选定，不在此拦。重新 scan：出现 >1 块可写盘即中止本轮，让用户确认只留一块。
+    if opts.drive_letter_override.is_none() {
+        match drive::usable_drives_now(cfg.min_drive_gb) {
+            Ok(usable) if usable.len() > 1 => {
+                let names = usable
+                    .iter()
+                    .map(|d| format!("{}({}:)", d.id, d.letter))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                reporter.error(&format!(
+                    "计划已过期：预览后检测到多块未封盘的备份盘：{} —— 为防止写错盘已停止。\
+                     请只保留一块在线(其余盘可封盘或拔下)后重新运行 `bftool archive`。",
+                    names
+                ));
+                return Ok(ArchiveSummary::default());
+            }
+            // 0 块/1 块都不阻断:1 块是正常情形;0 块(此盘恰好被拔)由后面 drive_id 重验已覆盖。
+            Ok(_) => {}
+            // scan 失败不静默吞:复验本身出错时 fail-closed 中止,不冒「漏检多盘」的险。
+            Err(e) => {
+                reporter.error(&format!(
+                    "无法复验在线备份盘数量({}) → 为防止写错盘,本轮不执行,请检查盘连接后重试。",
+                    e
+                ));
+                return Ok(ArchiveSummary::default());
+            }
+        }
+    }
+
     // 路径安全检查
     let warnings = safety::check_paths(
         &cfg.ready_root,
@@ -484,10 +540,17 @@ pub fn run_plan(
             }
         }
     }
+    // AR-13: 取消与失败可同时发生(取消前已有项目失败)。汇总里同时体现取消原因,
+    // 否则只打失败消息会让「为什么没处理完」对用户不可见。
+    let cancel_note = if summary.cancelled {
+        "（本轮被取消，剩余项目未处理）"
+    } else {
+        ""
+    };
     if summary.failed > 0 {
         reporter.error(&format!(
-            "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」)。",
-            summary.handled, summary.failed
+            "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」){}。",
+            summary.handled, summary.failed, cancel_note
         ));
     } else if !summary.cancelled {
         reporter.ok("本轮结束。");
@@ -498,14 +561,13 @@ pub fn run_plan(
 /// fail-closed 守卫:无校验组合(no_hash + archive test 关闭)直接拒。(ledger L-008)
 fn guard_verify_enabled(cfg: &Config, opts: &Options) -> Result<()> {
     if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
+        // EH-006: 纯用户向文案（不含 core/调用方等内部开发说明），CLI 与 GUI 都直接展示。
         anyhow::bail!(
-            "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
-             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
-             这是 core 级 fail-closed 拦截,调用方应该在传 Options 之前就做合并检查\
-             (CLI dispatch 已经做了一次更友好的)。\n\
-             如何修：\n\
-               - 去掉 no_hash 让 SHA256 兜底；或\n\
-               - 不要把 test_archives 设成 false 也不要把 no_test_archives 设成 true"
+            "已停止：当前设置会让 SHA256 校验和压缩包测试同时关闭 —— 等于「没有做任何完整性校验」，\
+             不能这样备份。\n\
+             如何修（任选其一）：\n\
+               - 不要使用 --unsafe-no-hash（让 SHA256 整文件校验兜底）；或\n\
+               - 开启压缩包测试（不要把 test_archives 设为 false，也不要使用 --no-test-archives）"
         );
     }
     Ok(())
@@ -1042,6 +1104,10 @@ struct GlobalCatalogRow {
 }
 
 fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
+    // AR-10: 「文件是否已存在」(决定要不要写 CSV header) 与下面 OpenOptions::create 之间存在
+    // TOCTOU 窗口。此 race 可接受：归档是单进程串行执行(一次只处理一个项目，没有并发写同一索引)，
+    // 不会有第二个写者在这两步之间创建该文件。若将来引入并发归档，需改用「打开后 seek 到 0 探测
+    // 是否已有 header 行」之类的更稳健判断。
     let file_existed = path.is_file();
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).ok();
@@ -1064,6 +1130,8 @@ fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
 }
 
 fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
+    // AR-10: 同 append_drive_catalog —— file_existed 探测与 OpenOptions::create 之间的
+    // TOCTOU 在单进程串行归档下可接受(无并发写者)。详见 append_drive_catalog 注释。
     let file_existed = path.is_file();
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).ok();
@@ -1127,6 +1195,10 @@ fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
         .append(true)
         .open(&path)?;
     f.write_all(line.as_bytes())?;
+    // EH-009: 追加后 fsync，与 catalog 写入(append_drive_catalog/append_global_catalog)的落盘
+    // 语义一致。「需人工处理.txt」本身不是关键事务(它是给人看的提醒台账，丢一行不影响数据安全)，
+    // 但这里 sync 成本极低且能保证断电后提醒不丢；用 durable::sync_file 对追加场景同样适用。
+    durable::sync_file(&f)?;
     Ok(())
 }
 
@@ -1148,13 +1220,22 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
         }
     };
     let pname = pending.project_dest_name.clone();
-    let psrc = if pending.project_src_name.is_empty() {
-        pname.clone()
-    } else {
-        pending.project_src_name.clone()
-    };
     let parch = pending.move_to.clone();
-    let in_ready = !psrc.is_empty() && cfg.ready_root.join(&psrc).exists();
+    // AR-09: 判断「源是否仍在待备份」时，绝不能回退到 project_dest_name —— 重名场景下它带秒级
+    // 时间戳后缀(如 001proj_20260529...)，而待备份里的源名永远是**原始名**(001proj)，
+    // 拿带时间戳的名去 ready_root 拼路径会永远查不到、把「源还在」误判成「源已移走」。
+    // 可靠来源优先级：
+    //   1. project_src_name —— 现版本一定会写的原始项目名；
+    //   2. src_path —— 写标记时记录的源**完整路径**，直接 exists() 最可靠(兼容旧标记)；
+    //   3. 两者都没有(极旧标记) → 无法判定源名，不猜，in_ready=false 交给「无法自动判定」分支
+    //      保留标记请人工核对，而不是用时间戳名误判。
+    let in_ready = if !pending.project_src_name.is_empty() {
+        cfg.ready_root.join(&pending.project_src_name).exists()
+    } else if !pending.src_path.is_empty() {
+        Path::new(&pending.src_path).exists()
+    } else {
+        false
+    };
     let moved = !parch.is_empty() && Path::new(&parch).exists();
     let global = paths::system_global_catalog(&cfg.system_root);
     let indexed = global_has_folder(&global, &pname).unwrap_or(false);
@@ -1229,7 +1310,14 @@ fn folder_stats(p: &Path) -> FolderStats {
 /// 简单的递归复制；与 robocopy 比缺少 /Z 断点续传中段恢复，但小文件/中等大小够用。
 /// 已存在且大小相同的文件直接跳过（保留断点续传的核心语义）。
 ///
-/// TODO(Batch 4)：改为 .bftool-part 临时文件 + 写完 sync + 重读目标算 hash + 原子 rename。
+/// 原子写已实现：每个文件先写 `<target>.bftool-part` → fsync → rename 到正式名(见下方循环)。
+/// 崩溃只会留下 .part(被当 cruft 忽略、下轮重写)，不会留下「大小对得上的半成品」被续传误跳过。
+///
+/// EH-010 续传策略 + 兜底：续传时以「目标已存在且**大小相同**」判定该文件已传、直接跳过。
+/// 大小相同但内容损坏(如坏扇区、之前被截断后又恰好补到同样字节数)的文件会被这一步跳过，
+/// 但**不会漏检**：copy_folder 返回后，handle_one 会对整个目标目录重算 manifest 并与源做
+/// SHA256 diff(manifest::diff，非 no_hash 时逐文件比哈希)，内容不一致的文件在那一步被发现、
+/// 移入隔离目录，下次运行补传重校。即「大小跳过」是性能优化，「SHA256 diff」是正确性兜底。
 fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
     fs::create_dir_all(dst).ok();
     let mut errors: Vec<String> = Vec::new();
@@ -1307,6 +1395,12 @@ fn leading_digits(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::reporter::NoopReporter;
+
+    // AR-12 测试分工说明:本模块的 handle_one / run_plan 集成测试都跑在 test_archives=false 下,
+    // 是**有意**的——它们聚焦核心归档流程(复制/SHA256 校验/源复核/事务提交/移源/断点续传),
+    // 不想被外部压缩包测试器(WinRAR/Bandizip/7-Zip 是否安装)的环境依赖污染、影响可重复性。
+    // 「archive test 通路」(detect / test_folder / 覆盖率 / 坏包隔离)有 archive_test.rs 自己的
+    // 单元测试覆盖(见 engine::archive_test 的 tests 模块);两边职责不重叠。
 
     /// 搭一个临时"世界":ready/archived/sys + 一块假备份盘,供 handle_one 集成测试复用。
     fn temp_world() -> (tempfile::TempDir, Config, DriveInfo) {

@@ -120,6 +120,19 @@ mod tests {
     }
 
     #[test]
+    fn task_panic_maps_to_failed() {
+        // 契约(G-03):闭包 panic → 线程 result 槽为 None 且 join 返回 Err →
+        // take_outcome 兜底为 TaskOutcome::Failed,UI 不会卡在"运行中"。
+        // 临时静默 panic hook,避免测试输出里出现吓人的 backtrace。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let t = BackgroundTask::<String>::spawn(|_cancel| panic!("boom"));
+        let outcome = drain::<String>(t);
+        std::panic::set_hook(prev);
+        assert!(matches!(outcome, TaskOutcome::Failed(_)));
+    }
+
+    #[test]
     fn cancel_flag_visible_to_closure() {
         let t = BackgroundTask::spawn(|cancel| {
             while !cancel.load(Ordering::Relaxed) {

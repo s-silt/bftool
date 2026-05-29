@@ -15,6 +15,9 @@ default-members = ["crates/bftool-cli"]
 [workspace.package]
 version = "0.1.2"
 edition = "2021"
+# MSRV 1.74：已审计代码所用 std API 均在 1.74 及以前稳定
+# (如 let-else 1.65、inline format args 1.58、Option::is_some_and 1.70)。
+# 提升 MSRV 前请确认未引入 1.74 之后才稳定的 API。(SEC-010)
 rust-version = "1.74"
 license = "MIT"
 repository = "https://github.com/s-silt/bftool"

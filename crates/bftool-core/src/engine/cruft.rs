@@ -4,7 +4,11 @@
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
-/// 文件名精确匹配（不分大小写）
+/// 文件名精确匹配（不分大小写）。
+///
+/// **不变量:这些条目必须全为 ASCII。** 匹配走 [`str::eq_ignore_ascii_case`](is_cruft_file),
+/// 它只对 ASCII 字母做大小写折叠;若加入含非 ASCII 字符的名字,大小写不敏感会失效
+/// (非 ASCII 字符按字节原样比较),导致漏判。OS 注入的杂文件名本身就都是 ASCII,无需突破此约束。
 pub const CRUFT_FILES: &[&str] = &[
     "Thumbs.db",   // Windows 缩略图缓存
     "desktop.ini", // Windows 文件夹元数据
@@ -13,7 +17,10 @@ pub const CRUFT_FILES: &[&str] = &[
     "ehthumbs_vista.db",
 ];
 
-/// 目录名精确匹配（不分大小写）—— 整个目录跳过,不递归进去
+/// 目录名精确匹配（不分大小写）—— 整个目录跳过,不递归进去。
+///
+/// **不变量:这些条目必须全为 ASCII**(同 [`CRUFT_FILES`]:匹配用 `eq_ignore_ascii_case`,
+/// 只折叠 ASCII 大小写)。系统注入的目录名($RECYCLE.BIN / System Volume Information 等)本就是 ASCII。
 pub const CRUFT_DIRS: &[&str] = &[
     "$RECYCLE.BIN",
     "System Volume Information",
@@ -105,6 +112,18 @@ pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ASCII 不变量(SEC-009)----
+    #[test]
+    fn cruft_constants_are_all_ascii() {
+        // eq_ignore_ascii_case 只折叠 ASCII 大小写;非 ASCII 条目会让大小写不敏感失效。
+        for c in CRUFT_FILES {
+            assert!(c.is_ascii(), "CRUFT_FILES 含非 ASCII 条目：{c:?}");
+        }
+        for c in CRUFT_DIRS {
+            assert!(c.is_ascii(), "CRUFT_DIRS 含非 ASCII 条目：{c:?}");
+        }
+    }
 
     // ---- is_cruft_file ----
     #[test]

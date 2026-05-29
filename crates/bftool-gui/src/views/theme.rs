@@ -196,6 +196,8 @@ pub fn ring(ui: &mut egui::Ui, frac: f32, color: Color32, center: &str, label: &
     p.circle_stroke(c, radius, egui::Stroke::new(stroke_w, TRACK));
     if frac > 0.0 {
         let start = -std::f32::consts::FRAC_PI_2; // 12 点方向起
+                                                  // max(1):frac 极小时 round() 可能得 0,会让折线只有 1 个点(0..=0)而画不出弧;
+                                                  // 兜底至少 1 段,保证 frac>0 时总能看到一小截进度。
         let n = ((frac * 96.0).round() as usize).max(1);
         let mut pts = Vec::with_capacity(n + 1);
         for i in 0..=n {

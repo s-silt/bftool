@@ -151,6 +151,14 @@ fn usable_drives(all: Vec<DriveInfo>, min_drive_gb: u64) -> (Vec<DriveInfo>, Vec
     (usable, too_small)
 }
 
+/// 当前在线、未封盘、容量达标的备份盘列表（不打日志、不挑唯一）。
+/// `run_plan` 在执行前用它复验「单盘不变式」——`pick_active` 的多盘检查只在 `plan()` 跑过一次，
+/// 预览→执行之间若插入第二块可写盘，需在这里重新拦下，否则单盘安全闸被绕过。(SEC-007)
+pub fn usable_drives_now(min_drive_gb: u64) -> Result<Vec<DriveInfo>> {
+    let (usable, _too_small) = usable_drives(scan_mounted()?, min_drive_gb);
+    Ok(usable)
+}
+
 /// 返回唯一一块未封盘且容量达标的备份盘；多块返回错误；零块返回 None。
 /// 容量过滤(min_drive_gb)是防误抓 U 盘/SD 卡的安全闸。(ledger L-006)
 pub fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
@@ -252,6 +260,18 @@ pub fn init(
     // 序号文件追踪：保证下次取下一块的时候编号单调递增
     if let Some(n) = parse_drive_number(&cfg.name_prefix, &id) {
         bump_drive_seq(cfg, n)?;
+    }
+
+    // re-init = 当作新盘用:若残留封盘标记,清除它。否则盘虽被重新初始化、提示"可以 archive",
+    // 但封盘标记仍在 → pick_active/try_into_writable 仍判其为已封盘而拒写,提示与实际矛盾。(EH-005)
+    let sealed_marker = paths::drive_sealed_path(&root);
+    if sealed_marker.is_file() {
+        fs::remove_file(&sealed_marker)
+            .with_context(|| format!("清除封盘标记失败：{}", sealed_marker.display()))?;
+        reporter.info(&format!(
+            "已清除 {}: 的封盘标记(重新初始化 = 当作可写新盘)。",
+            letter
+        ));
     }
 
     reporter.ok(&format!("已初始化备份盘 {} ({}:)", id, letter));

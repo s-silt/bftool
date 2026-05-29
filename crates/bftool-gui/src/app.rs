@@ -50,6 +50,17 @@ impl View {
     }
 }
 
+/// 应用根状态。字段刻意平铺(非拆子 struct),按用途分两类:
+/// - **全局状态**(跨视图共享):`view` / `cfg` / `config_source` / `logs` /
+///   `progress` / `rx` / `task` / `plan_task` / `task_started` / `last_summary` /
+///   `archive_plan` / `status_cache`。
+/// - **各视图状态**(仅本视图借用):`archive_ui` / `drives_cache` / `find_ui` /
+///   `init_ui` / `verify_ui` / `settings_ui`。
+///
+/// 视图函数签名统一为 `ui(app: &mut App, ...)`,各自只读/写自己那块,目前无
+/// borrow-checker 冲突(同一时刻只有一个视图在渲染)。已知权衡:平铺字段多,但拆
+/// 子 struct 会牵动所有 view 函数签名,高风险低收益——故暂不拆。**若未来出现
+/// borrow-checker 冲突**(如某视图需同时可变借用两块状态),再按视图分组拆子 struct。
 pub struct App {
     pub view: View,
     pub cfg: Config,
@@ -145,6 +156,15 @@ impl App {
                         TaskOutcome::Failed(e) => format!("失败：{}", e),
                     });
                 }
+                // 最终 drain:线程已结束但日志可能在最后一次 try_recv 之后才入队;
+                // 丢弃 rx 前再收一遍,避免后台线程最后几条日志丢失。
+                if let Some(rx) = &self.rx {
+                    while let Ok(ev) = rx.try_recv() {
+                        match ev {
+                            UiEvent::Log { level, msg } => self.logs.push((level, msg)),
+                        }
+                    }
+                }
                 self.task = None;
                 self.task_started = None;
                 self.rx = None;
@@ -165,8 +185,19 @@ impl App {
                     }
                 }
                 self.plan_task = None;
-                // plan 期间用的也是 rx(GuiReporter 日志);算完释放
+                // plan 不设 task_started(只读、不计"已用时间");此处一并清空仅作未来防陷阱
+                // ——若以后 plan 也开始用 task_started,这里已替它收尾,不会残留脏值。
+                self.task_started = None;
+                // plan 期间用的也是 rx(GuiReporter 日志);算完前做最终 drain 再释放,
+                // 避免 plan 线程最后几条日志丢失。
                 if self.task.is_none() {
+                    if let Some(rx) = &self.rx {
+                        while let Ok(ev) = rx.try_recv() {
+                            match ev {
+                                UiEvent::Log { level, msg } => self.logs.push((level, msg)),
+                            }
+                        }
+                    }
                     self.rx = None;
                 }
             }
@@ -198,6 +229,10 @@ impl App {
                         // 真·可取消的执行任务(备份 run / 复查)
                         ui.add(egui::Spinner::new().size(14.0).color(theme::PRIMARY));
                         ui.add_space(6.0);
+                        // progress 锁竞争说明:后台线程每个 SHA256 chunk 都 inc(锁同一 Mutex),
+                        // UI 每帧(~60fps)也读这把锁。但两侧临界区都极短——后台只 +=delta,
+                        // UI 只 clone 几个字段后立即释放,无 I/O、无长循环——故竞争可接受;
+                        // 而每帧读进度是渲染进度条所必需的,无法避开。
                         let snap = self
                             .progress
                             .lock()

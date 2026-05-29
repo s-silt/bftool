@@ -326,6 +326,8 @@ fn check_one_file(
         }
     };
     // 既无 Size 也无 Hash → 无任何可校验属性 → fail-closed。(Phase 4 F-01/F-6)
+    // 注意条件是「两者皆缺」:no_hash 归档模式(有 Size、Hash="")**不**触发 Unverifiable,
+    // 因为还能靠 Size 精确比对(下面 if let Some(sz) 分支),不算不可校验。(V-04)
     if size.is_none() && hash.is_empty() {
         reporter.error(&format!("  清单项缺 Size 且缺 Hash,无法校验: {}", rel));
         report.push_issue(project_name, rel, VerifyIssueKind::Unverifiable);
@@ -335,12 +337,16 @@ fn check_one_file(
         if meta.len() != sz {
             reporter.error(&format!("  大小不一致: {}", rel));
             report.push_issue(project_name, rel, VerifyIssueKind::SizeMismatch);
+            // 大小已经不符,内容必然不一致,再算 SHA256 只是浪费 IO/CPU。
+            // 一条问题一种 kind:这里报 SizeMismatch 即够,early-return 跳过哈希。(V-07)
             return;
         }
     }
     if !hash.is_empty() {
         match sha256_hex(&f) {
-            Ok(h) if h == hash => {}
+            // 大小写不敏感:本工具写大写十六进制(见 sha256_hex),但旧版本/其他工具
+            // 可能写小写哈希。eq_ignore_ascii_case 兼容历史小写清单,避免误报 Corrupt。(V-08)
+            Ok(h) if h.eq_ignore_ascii_case(hash) => {}
             Ok(_) => {
                 reporter.error(&format!("  损坏/不一致: {}", rel));
                 report.push_issue(project_name, rel, VerifyIssueKind::Corrupt);
@@ -365,6 +371,8 @@ fn report_extras(
         return;
     }
     // 同 L-044:不 canonicalize,否则 `\\?\` 前缀与 walk 路径失配 → extra 全部误报。
+    // cruft::walk 已过滤 .bftool-part 等临时残留:归档中断留下的 .part **不**报为 extra
+    // 是有意的 —— 那是续传/下次归档要清理的中间产物,不是用户该关心的「清单外多余文件」。(V-05)
     for entry in cruft::walk(proj_dir) {
         let entry = match entry {
             Ok(e) => e,
@@ -404,6 +412,11 @@ fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>>
     let mut out = Vec::new();
     for rec in rdr.records().flatten() {
         let rel = rec.get(i_rel).unwrap_or("").to_string();
+        // 跳过空 Rel 行:proj_dir.join("") == proj_dir 本身,会把项目目录当文件校验
+        // 而误报 Missing(目录不是 is_file())。空 Rel 是脏数据,直接丢弃。(V-09)
+        if rel.is_empty() {
+            continue;
+        }
         if cruft::rel_has_cruft_component(&rel) {
             continue;
         }
@@ -419,6 +432,9 @@ fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>>
 /// 从用户选的路径定位:所在备份盘根 + 项目名 + (若选的是文件)项目内相对路径(None=整个项目文件夹)。
 /// 备份盘根 = 含 `本盘信息\本盘编号.txt` 的祖先目录;目标须在该盘 `项目\` 下。
 fn locate_backup_target(target: &Path) -> Result<(PathBuf, String, Option<String>)> {
+    // ancestors() 从近到远(self → parent → … → 盘根)。取**第一个**含 本盘信息\本盘编号.txt
+    // 的祖先即「目标所在盘的盘根」:盘根标识只在盘根一层存在,从近到远第一个命中就是它,
+    // 不会被更外层(理论上不该有)的同名标识抢走。语义正确。(V-06)
     let root = target
         .ancestors()
         .find(|a| paths::drive_id_path(a).is_file())
@@ -606,6 +622,38 @@ mod tests {
         assert_eq!(r.bad, 1, "Size 不可解析 + 无 Hash 应判 bad(fail-closed)");
     }
 
+    // ── V-08: 历史小写哈希应大小写不敏感比对,不误报 Corrupt ──
+    #[test]
+    fn verify_tree_lowercase_hash_matches() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        let lower = sha_of(content).to_lowercase();
+        let (mdir, pdir) = setup(d.path(), &[("a.txt", 5, &lower)], &[("a.txt", content)]);
+        let r = verify_tree(&mdir, &pdir, &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "小写哈希(旧版本/他工具)应兼容,不报损坏");
+        assert_eq!(r.checked, 1);
+    }
+
+    // ── V-09: 空 Rel 行被跳过,不会把项目目录当文件误报 Missing ──
+    #[test]
+    fn verify_tree_skips_empty_rel_row() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // 第二行 Rel 为空:旧逻辑会 join("")==proj_dir,目录非 is_file() → 误报 Missing。
+        fs::write(
+            mdir.join("proj.sha256.csv"),
+            "Rel,Size,Hash\na.txt,5,\n,,\n",
+        )
+        .unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "空 Rel 行应被跳过,不产生误导性 Missing");
+        assert_eq!(r.checked, 1, "只校验有效的 a.txt 一行");
+    }
+
     #[test]
     fn verify_tree_counts_extra_files() {
         let d = tempfile::tempdir().unwrap();
@@ -729,6 +777,26 @@ mod tests {
         let r = verify_one(&Config::default(), &NoopReporter, &target, &abool()).unwrap();
         assert_eq!(r.bad, 0);
         assert_eq!(r.extra, 1);
+    }
+
+    // ── 单目标复查:取消整项目复查 → Cancelled,不计 corruption。(V-10)
+    // verify_one 复用 verify_tree 同样的 cancel.load 机制,这里覆盖整项目分支的取消路径。
+    #[test]
+    fn verify_one_project_folder_cancel_returns_cancelled() {
+        let d = tempfile::tempdir().unwrap();
+        // 故意铺一个等长篡改的坏文件:若取消没生效,会被算成 bad,断言能抓住。
+        setup_drive(
+            d.path(),
+            &[("a.txt", 5, &sha_of(b"hello"))],
+            &[("a.txt", b"world")],
+        );
+        let target = d.path().join(paths::DRIVE_PROJECTS_DIR).join("proj");
+        let cancel = AtomicBool::new(true);
+        let r = verify_one(&Config::default(), &NoopReporter, &target, &cancel).unwrap();
+        assert!(r.cancelled);
+        assert_eq!(r.checked, 0, "首项即取消,未检查任何文件");
+        assert!(!r.has_corruption());
+        assert_eq!(r.outcome(), VerifyOutcome::Cancelled);
     }
 
     #[test]

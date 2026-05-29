@@ -28,6 +28,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if ui.button("🔄 刷新候选").clicked() {
         rescan(app);
     }
+    // R-04:仅当缓存为空(首次进入,或 init 成功后置 None)才自动扫一次。
+    // rescan 是阻塞的同步 I/O(枚举挂载盘),绝不能每帧/每次进视图都扫——否则 UI 卡顿。
+    // 后续刷新只走上面的「刷新候选」按钮(用户主动触发)。
     if app.init_ui.cache.is_none() {
         rescan(app);
     }

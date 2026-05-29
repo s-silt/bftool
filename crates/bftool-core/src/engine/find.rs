@@ -10,6 +10,9 @@ use std::path::Path;
 use crate::config::Config;
 use crate::engine::paths;
 
+/// 本机总索引来源在结果里的来源标签。源码与测试统一引用,避免中文字面量重复。(F5)
+pub const LOCAL_SOURCE: &str = "本机";
+
 /// 一条查询命中(结构化,GUI 列表 / CLI 表格各自渲染)。
 #[derive(Debug, Clone)]
 pub struct FindMatch {
@@ -40,6 +43,11 @@ pub struct FindOutcome {
 type RowKey = (String, String, String, String, String, String);
 
 /// 默认索引文件名去扩展名后的 stem(用户不改名时,多份都叫这个)。
+///
+/// 运行时从 `GLOBAL_CATALOG_FILE`(目前 "备份索引名单.csv")解析 stem 而非编译期常量,
+/// 是为了跟随 paths 模块那个唯一来源、避免两处字面量漂移。代价仅是每次查询额外几次廉价
+/// 路径解析(find 不在热路径)。`unwrap_or("备份索引名单")` 是 fallback:仅当 `GLOBAL_CATALOG_FILE`
+/// 被改成无 stem 的形态(如纯扩展名 ".csv")时才会触发,正常文件名不会走到。(F6)
 fn default_catalog_stem() -> &'static str {
     Path::new(paths::GLOBAL_CATALOG_FILE)
         .file_stem()
@@ -160,7 +168,7 @@ pub fn search(cfg: &Config, keyword: &str) -> Result<FindOutcome> {
     let mut seen: HashSet<RowKey> = HashSet::new();
 
     let main = paths::system_global_catalog(&cfg.system_root);
-    read_source(&main, "本机", true, keyword, &mut out, &mut seen);
+    read_source(&main, LOCAL_SOURCE, true, keyword, &mut out, &mut seen);
 
     for p in &cfg.extra_catalogs {
         let label = catalog_label(p);
@@ -244,7 +252,7 @@ mod tests {
         assert_eq!(r.matches[0].folder, "001proj");
         assert_eq!(r.matches[0].drive_id, "备份1");
         assert_eq!(r.matches[0].verify, "SHA256-OK");
-        assert_eq!(r.matches[0].source, "本机");
+        assert_eq!(r.matches[0].source, LOCAL_SOURCE);
         assert_eq!(r.sources_searched, 1);
         assert!(r.sources_failed.is_empty());
         assert_eq!(
@@ -303,7 +311,7 @@ mod tests {
         assert!(r
             .matches
             .iter()
-            .any(|m| m.source == "本机" && m.drive_id == "A备份2"));
+            .any(|m| m.source == LOCAL_SOURCE && m.drive_id == "A备份2"));
     }
 
     #[test]
@@ -394,5 +402,27 @@ mod tests {
         assert_eq!(catalog_label(Path::new("D:/汇总/B/备份索引名单.csv")), "B");
         // 改过名的直接用文件名 stem
         assert_eq!(catalog_label(Path::new("D:/汇总/客厅台式.csv")), "客厅台式");
+    }
+
+    #[test]
+    fn catalog_label_edge_cases() {
+        // F3:盘符根 / 纯文件名(无父目录)等 edge case。
+
+        // 纯文件名(改过名,无父目录)→ 直接用 stem,不应 panic。
+        assert_eq!(
+            catalog_label(Path::new("备份索引名单名单.csv")),
+            "备份索引名单名单"
+        );
+
+        // 纯文件名 == 默认文件名:parent 为 ""(无可用文件夹名)→ 回退到 stem 本身,
+        // 不会因为"想用父目录区分"而拿到空串。
+        assert_eq!(
+            catalog_label(Path::new("备份索引名单.csv")),
+            default_catalog_stem()
+        );
+
+        // 默认文件名直接落在盘符根:父目录是 "D:\\",file_name 为空 → 同样回退到 stem。
+        let at_root = catalog_label(Path::new("D:\\备份索引名单.csv"));
+        assert_eq!(at_root, default_catalog_stem());
     }
 }
