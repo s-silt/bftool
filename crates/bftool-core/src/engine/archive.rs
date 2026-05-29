@@ -198,7 +198,8 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<Archi
                     "项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。",
                     name, e
                 ));
-                append_manual(cfg, &name, &format!("未捕获异常：{}", e))?;
+                // 用 note_manual(非致命):台账写失败不再把整轮归档拖垮。(ledger L-018)
+                note_manual(cfg, reporter, &name, &format!("未捕获异常：{}", e));
                 failed += 1;
             }
         }
@@ -687,6 +688,14 @@ fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// best-effort 记一行"需人工处理"台账:写失败只 warn,不向上抛 —— 台账写入故障
+/// 不该把"跳过该项目继续下一个"升级成整轮中止(此前 run 的 catch-all 用 `?` 会)。(ledger L-018)
+fn note_manual(cfg: &Config, reporter: &dyn Reporter, name: &str, why: &str) {
+    if let Err(e) = append_manual(cfg, name, why) {
+        reporter.warn(&format!("写「需人工处理」台账失败({}):{}", name, e));
+    }
+}
+
 fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
     let path = paths::system_need_manual(&cfg.system_root);
     if let Some(p) = path.parent() {
@@ -933,6 +942,17 @@ mod tests {
             dup_in_drive_or_assume(&cat, "x", &NoopReporter),
             "索引读失败 → 保守视为重名(避免覆盖)"
         );
+    }
+
+    // ── L-018: 台账写失败不致命(note_manual 返回 () 不向上抛) ──
+    #[test]
+    fn note_manual_infallible_when_system_root_unwritable() {
+        let (_d, mut cfg, _drive) = temp_world();
+        let bogus = cfg.system_root.join("not_a_dir");
+        fs::write(&bogus, b"x").unwrap();
+        cfg.system_root = bogus; // system_root 指向文件 → 台账写入必失败
+                                 // 关键:返回 () 且不 panic —— 写失败只 warn,不会中止整轮归档
+        note_manual(&cfg, &NoopReporter, "proj", "校验失败：xxx");
     }
 
     // ── L-008: 无校验判定单一来源,core/cli 共用 verify_disabled ──
