@@ -209,53 +209,29 @@ pub fn init(
         bail!("驱动器 {}: 不存在或未挂载", letter);
     }
 
-    // 防呆：不允许系统盘 / 资料库三目录所在盘 / 已是其它备份盘 / 根目录非空
+    // 防呆：系统盘 / 资料库盘 / 已是备份盘 / 非空盘 —— 判定收口到 classify_for_init(与 init_candidates 共用)
     if !force {
-        let sys = system_drive_letter();
-        if sys.eq_ignore_ascii_case(&letter) {
+        let c = classify_for_init(cfg, &letter, &root)?;
+        if c.is_system {
             bail!("拒绝初始化系统盘 {}:（如确需，请加 --force）", letter);
         }
-        let lib_letters = [&cfg.ready_root, &cfg.archived_root, &cfg.system_root]
-            .iter()
-            .filter_map(|p| qualifier_letter(p))
-            .collect::<Vec<_>>();
-        if lib_letters.iter().any(|l| l.eq_ignore_ascii_case(&letter)) {
+        if c.is_library {
             bail!(
                 "拒绝初始化资料库所在盘 {}:（待备份/已备份/备份系统 在此盘；如确需，请加 --force）",
                 letter
             );
         }
-        // 已是备份盘 → 不阻止（init 等同重新写元数据），但提示
-        if paths::drive_id_path(&root).is_file() {
+        if c.already_backup {
+            // 已是备份盘 → 不阻止（等同重写元数据），但提示
             reporter.warn(&format!(
                 "{}: 已经是一块初始化过的备份盘；将覆盖元数据，但不会动 \\项目\\ 下的数据。",
                 letter
             ));
-        } else {
-            // 不是备份盘 → 必须根目录为空（忽略 Windows 系统目录）
-            let ignore: &[&str] = &[
-                "System Volume Information",
-                "$RECYCLE.BIN",
-                "RECYCLER",
-                "found.000",
-                "lost+found",
-                ".Trashes",
-            ];
-            let entries = fs::read_dir(&root)
-                .with_context(|| format!("读取 {}: 根目录失败", letter))?
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name();
-                    let n = name.to_string_lossy();
-                    !ignore.iter().any(|x| x.eq_ignore_ascii_case(&n))
-                })
-                .count();
-            if entries > 0 {
-                bail!(
-                    "拒绝初始化非空盘 {}:（根目录有数据，怕认错盘；如确需，请加 --force）",
-                    letter
-                );
-            }
+        } else if c.non_empty {
+            bail!(
+                "拒绝初始化非空盘 {}:（根目录有数据，怕认错盘；如确需，请加 --force）",
+                letter
+            );
         }
     }
 
@@ -286,6 +262,109 @@ pub fn init(
         );
     }
     Ok(())
+}
+
+/// init 防呆分类(系统盘/资料库盘/已是备份盘/非空)。init() 与 init_candidates 共用。(Spec D §4.2 Finding #4)
+struct InitClass {
+    is_system: bool,
+    is_library: bool,
+    already_backup: bool,
+    non_empty: bool,
+}
+
+fn classify_for_init(cfg: &Config, letter: &str, root: &Path) -> Result<InitClass> {
+    let is_system = system_drive_letter().eq_ignore_ascii_case(letter);
+    let is_library = [&cfg.ready_root, &cfg.archived_root, &cfg.system_root]
+        .iter()
+        .filter_map(|p| qualifier_letter(p))
+        .any(|l| l.eq_ignore_ascii_case(letter));
+    let already_backup = paths::drive_id_path(root).is_file();
+    let non_empty = if already_backup {
+        false
+    } else {
+        !root_is_empty(root)?
+    };
+    Ok(InitClass {
+        is_system,
+        is_library,
+        already_backup,
+        non_empty,
+    })
+}
+
+/// 根目录是否为空(忽略 Windows 系统目录)。
+fn root_is_empty(root: &Path) -> Result<bool> {
+    let ignore: &[&str] = &[
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        "RECYCLER",
+        "found.000",
+        "lost+found",
+        ".Trashes",
+    ];
+    let n = fs::read_dir(root)
+        .with_context(|| format!("读取 {} 根目录失败", root.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            !ignore.iter().any(|x| x.eq_ignore_ascii_case(&s))
+        })
+        .count();
+    Ok(n == 0)
+}
+
+/// 由分类得出能否初始化 + 阻断原因。
+fn init_decision(c: &InitClass) -> (bool, Option<String>) {
+    if c.is_system {
+        return (false, Some("系统盘".into()));
+    }
+    if c.is_library {
+        return (false, Some("资料库所在盘(待备份/已备份/备份系统)".into()));
+    }
+    if !c.already_backup && c.non_empty {
+        return (false, Some("根目录非空(怕认错盘)".into()));
+    }
+    (true, None) // 含"已是备份盘"(re-init 覆盖元数据,允许)
+}
+
+/// GUI 初始化页用:列出所有挂载盘 + 结构化防呆判定。(Spec D §4.2)
+#[derive(Debug, Clone)]
+pub struct InitCandidate {
+    pub letter: String,
+    pub total_gb: u64,
+    pub is_system: bool,
+    pub is_library: bool,
+    pub already_backup: bool,
+    pub non_empty: bool,
+    pub can_init: bool,
+    pub block_reason: Option<String>,
+}
+
+pub fn init_candidates(cfg: &Config) -> Result<Vec<InitCandidate>> {
+    let mut out = Vec::new();
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    for d in disks.list() {
+        let Some(letter) = drive_letter_of(d.mount_point()) else {
+            continue;
+        };
+        let root = PathBuf::from(format!("{}:\\", letter));
+        let Ok(cls) = classify_for_init(cfg, &letter, &root) else {
+            continue; // 读不了根目录的盘跳过(不进候选)
+        };
+        let (can_init, block_reason) = init_decision(&cls);
+        out.push(InitCandidate {
+            letter,
+            total_gb: d.total_space() / (1024 * 1024 * 1024),
+            is_system: cls.is_system,
+            is_library: cls.is_library,
+            already_backup: cls.already_backup,
+            non_empty: cls.non_empty,
+            can_init,
+            block_reason,
+        });
+    }
+    Ok(out)
 }
 
 fn readme(id: &str) -> String {
@@ -460,6 +539,41 @@ mod tests {
             free_bytes: bytes,
             total_bytes: bytes,
         }
+    }
+
+    // ── Spec D §4.2 Finding #4: init_decision 真值表 ──
+    #[test]
+    fn init_decision_truth_table() {
+        let mk = |sys, lib, bak, ne| InitClass {
+            is_system: sys,
+            is_library: lib,
+            already_backup: bak,
+            non_empty: ne,
+        };
+        assert!(
+            init_decision(&mk(false, false, false, false)).0,
+            "空盘可初始化"
+        );
+        assert!(
+            init_decision(&mk(false, false, true, false)).0,
+            "已是备份盘可 re-init"
+        );
+        assert!(
+            init_decision(&mk(false, false, true, true)).0,
+            "已是备份盘优先于非空"
+        );
+        assert!(
+            !init_decision(&mk(true, false, false, false)).0,
+            "系统盘拒绝"
+        );
+        assert!(
+            !init_decision(&mk(false, true, false, false)).0,
+            "资料库盘拒绝"
+        );
+        assert!(
+            !init_decision(&mk(false, false, false, true)).0,
+            "非空盘拒绝"
+        );
     }
 
     // ── Spec D §4.2 / L-021: try_into_writable 类型化盘 ──
