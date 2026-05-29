@@ -77,14 +77,16 @@ code-reviewer + silent-failure-hunter 各自独立尝试推翻这批修复 → *
 ## Phase 5 收尾
 
 - **CI 硬化**:`0792d66`,已 push,PR #1 触发实跑(fmt/build/test/clippy on windows + audit on ubuntu)。
-- **cargo-audit**:本机 ARM64 编译该工具失败(其依赖问题),但 audit 是平台无关(只读 Cargo.lock),已由 CI 的 ubuntu audit job 覆盖。
+- **cargo-audit**:本机 ARM64 编译该工具失败,但 CI 的 ubuntu audit job **已实跑通过(无已知漏洞)**。
 - **推送**:分支 `campaign/review-fix-p2` 已 push;PR #1 → main。
+- **CI 实跑结果(PR #1 run 26614743784 = success)**:✓ fmt+build+test+clippy(windows-latest,**79 测试在 x86_64-pc-windows-msvc 真机全过**)· ✓ cargo audit(无漏洞)· ✓ release build+package。硬化门禁已被真实 runner 验证。
+- **CI 维护项(P3 backlog)**:actions/upload-artifact@v4 的 Node20 弃用警告、windows-latest 迁移通知——非阻断,后续 bump。
 
 ## DoD 评估(§10)
 
 1. 确认成立的 P0/P1/P2 全部已修 + 回归测试 + Phase 4 verified sound;L-021/L-011/L-012 **显式取舍**(L-021→桌面版 API、L-011/012→backlog),L-001 非 NTFS 残留如实记。✅(取舍项已用户确认)
 2. 无 `Needs-evidence` 残留。✅
-3. §6 门禁:本地全绿(fmt/build/test/clippy,79 测试);CI 实跑待 PR #1 结果。🟡
+3. §6 门禁:**本地 + CI 双绿** —— PR #1 run 成功(windows 真机 79 测试 + fmt/clippy + ubuntu cargo audit 无漏洞 + release build 全过)。✅
 4. ledger 归档 + README/spec drift 已修。✅
 5. P3 backlog 列出(F-N1、L-016/031/039/041/042/028/029/030),交用户。✅
 
