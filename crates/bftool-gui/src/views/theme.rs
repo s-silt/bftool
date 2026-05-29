@@ -257,7 +257,8 @@ pub fn kpi_card(
                 ui.colored_label(TEXT_BODY, egui::RichText::new(title).size(12.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // 右上角强调色小圆点(线性科技风的弱标记)。
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 4.0, accent);
                 });
             });
@@ -282,7 +283,8 @@ pub fn kpi_card(
 pub fn hbar(ui: &mut egui::Ui, frac: f32, color: Color32) {
     let frac = frac.clamp(0.0, 1.0);
     let h = 10.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
     let p = ui.painter();
     let r = CornerRadius::same(5);
     p.rect_filled(rect, r, TRACK);
