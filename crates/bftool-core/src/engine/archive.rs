@@ -836,7 +836,7 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target).ok();
         } else if entry.file_type().is_file() {
-            // 已存在且大小一致 → 视为已传，跳过（与 robocopy 的默认行为一致）
+            // 已存在且大小一致 → 视为已传，跳过（断点续传）
             if let (Ok(meta_src), Ok(meta_dst)) = (path.metadata(), target.metadata()) {
                 if meta_src.len() == meta_dst.len() {
                     continue;
@@ -845,8 +845,25 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
             if let Some(p) = target.parent() {
                 fs::create_dir_all(p).ok();
             }
-            fs::copy(path, &target)
-                .with_context(|| format!("复制失败：{} → {}", path.display(), target.display()))?;
+            // 原子复制:写 <target>.bftool-part → fsync → rename。崩溃只会留下 .part
+            // (被当 cruft 忽略、下轮重写),不会留下"大小对得上的半成品"被续传误跳过。(ledger L-014)
+            let part = {
+                let mut s = target.clone().into_os_string();
+                s.push(".bftool-part");
+                PathBuf::from(s)
+            };
+            fs::copy(path, &part)
+                .with_context(|| format!("复制失败：{} → {}", path.display(), part.display()))?;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .with_context(|| format!("打开临时文件刷盘失败：{}", part.display()))?;
+            f.sync_all()
+                .with_context(|| format!("临时文件刷盘失败：{}", part.display()))?;
+            drop(f);
+            fs::rename(&part, &target).with_context(|| {
+                format!("提交复制失败：{} → {}", part.display(), target.display())
+            })?;
         }
     }
     if !errors.is_empty() {
@@ -977,6 +994,21 @@ mod tests {
                 .is_file(),
             "应写出校验清单"
         );
+    }
+
+    // ── L-014: copy_folder 原子复制,内容正确且不遗留 .bftool-part ──
+    #[test]
+    fn copy_folder_atomic_no_part_left() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("t");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"hello").unwrap();
+        fs::write(src.join("sub").join("b.bin"), b"xyz").unwrap();
+        copy_folder(&src, &dst, &NoopReporter).unwrap();
+        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(dst.join("sub").join("b.bin")).unwrap(), b"xyz");
+        assert!(!dst.join("a.txt.bftool-part").exists(), "不应遗留 .part");
     }
 
     // ── L-017: 读本盘索引失败时保守视为重名(避免覆盖旧备份) ──

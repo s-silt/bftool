@@ -30,6 +30,10 @@ pub fn is_cruft_file(name: &str) -> bool {
     if name.starts_with("._") {
         return true;
     }
+    // bftool 原子复制的临时文件:不算项目内容,manifest/复制/校验/容量统计都忽略。(ledger L-014)
+    if name.ends_with(".bftool-part") {
+        return true;
+    }
     CRUFT_FILES.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
 
@@ -130,6 +134,13 @@ mod tests {
         assert!(!is_cruft_file("main.zip"));
         assert!(!is_cruft_file("cover.jpg"));
         assert!(!is_cruft_file("readme.md"));
+    }
+
+    #[test]
+    fn is_cruft_file_bftool_part_temp() {
+        assert!(is_cruft_file("a.txt.bftool-part"));
+        assert!(is_cruft_file("movie.7z.bftool-part"));
+        assert!(!is_cruft_file("a.txt"));
     }
 
     // ---- is_cruft_dir ----
