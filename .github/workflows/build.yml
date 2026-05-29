@@ -69,6 +69,7 @@ jobs:
           $dist = "dist"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/bftool.exe" "$dist/bftool.exe"
+          Copy-Item "target/${{ matrix.target }}/release/bftool-gui.exe" "$dist/bftool-gui.exe"
           Copy-Item "bftool.toml.example" "$dist/bftool.toml.example"
           Copy-Item "README.md" "$dist/README.md"
           Copy-Item "LICENSE" "$dist/LICENSE"
@@ -78,6 +79,7 @@ jobs:
           name: bftool-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/bftool.exe
+            target/${{ matrix.target }}/release/bftool-gui.exe
             bftool-${{ matrix.target }}.zip
           if-no-files-found: error
 
@@ -98,4 +100,5 @@ jobs:
           files: |
             artifacts/**/bftool-*.zip
             artifacts/**/bftool.exe
+            artifacts/**/bftool-gui.exe
           generate_release_notes: true

@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "归档备份工具(bftool)桌面版 —— SSD→机械盘 SHA256 三重校验归档,新手友好 GUI"
+build = "build.rs"
 
 [[bin]]
 name = "bftool-gui"
@@ -15,3 +17,7 @@ path = "src/main.rs"
 bftool-core = { path = "../bftool-core" }
 eframe.workspace = true
 anyhow.workspace = true
+
+# 仅 Windows 构建:给 exe 嵌入图标 + 版本/产品信息(调 MSVC rc.exe)。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

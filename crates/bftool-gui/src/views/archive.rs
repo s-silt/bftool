@@ -9,7 +9,7 @@ use bftool_core::engine::archive::{self, Options, PlanAction};
 use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
-use crate::reporter::{GuiReporter, ProgressState, UiEvent};
+use crate::reporter::{GuiReporter, ProgressState};
 use crate::task::BackgroundTask;
 use crate::views::util;
 
@@ -87,7 +87,11 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             start_archive(app);
         }
 
-        if busy {
+        if app.plan_task.is_some() {
+            // 计划在后台算(只读、不可中途取消)。
+            ui.spinner();
+            ui.label("正在生成计划…");
+        } else if app.task.is_some() {
             let requested = app
                 .task
                 .as_ref()
@@ -163,10 +167,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     util::log_panel(&app.logs, ui);
 }
 
-/// 同步跑 archive::plan(只读)生成预览。plan 的 reporter 消息收进日志。
+/// 后台跑 archive::plan(只读)生成预览——`plan` 会遍历待备份所有项目(folder_stats),
+/// 大目录时耗时,故放后台线程,不冻 UI。plan 消息经 GuiReporter 进日志;结果经 plan_task 回传。
 fn refresh_plan(app: &mut App) {
     app.logs.clear();
     app.last_summary = None;
+    app.archive_plan = None;
     if app.archive_ui.unsafe_no_hash && !app.archive_ui.confirm_unsafe {
         app.logs.push((
             LogLevel::Error,
@@ -177,21 +183,12 @@ fn refresh_plan(app: &mut App) {
     let opts = app.archive_ui.to_options();
     let (tx, rx) = mpsc::channel();
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
-    let result = archive::plan(&app.cfg, &opts, &reporter);
-    drop(reporter); // 关闭 tx,让 try_iter 收尾
-    let drained: Vec<UiEvent> = rx.try_iter().collect();
-    for ev in drained {
-        match ev {
-            UiEvent::Log { level, msg } => app.logs.push((level, msg)),
-        }
-    }
-    match result {
-        Ok(p) => app.archive_plan = Some(p),
-        Err(e) => {
-            app.archive_plan = None;
-            app.logs.push((LogLevel::Error, format!("{:#}", e)));
-        }
-    }
+    app.rx = Some(rx);
+    let cfg = app.cfg.clone();
+    app.plan_task = Some(BackgroundTask::spawn(move |_cancel| {
+        // plan 只读、不可中途取消(folder_stats 无 cancel 钩子);返回结构化计划。
+        archive::plan(&cfg, &opts, &reporter)
+    }));
 }
 
 /// 把当前 plan 交给后台线程跑 run_plan(GuiReporter 推日志/进度,cancel 项目边界)。

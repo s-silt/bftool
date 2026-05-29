@@ -1,28 +1,30 @@
-//! 后台任务:在独立线程跑长任务(archive/verify),UI 轮询结果——**绝不在 UI 线程跑**。
+//! 后台任务:在独立线程跑长任务(archive/verify/plan),UI 轮询结果——**绝不在 UI 线程跑**。
 //! 取消用 `Arc<AtomicBool>`,闭包内把 `&AtomicBool` 传给 core,在**项目边界**生效。(Spec D §3/§4.5)
+//!
+//! 泛型 `T`:run/verify 回传 `String` 摘要,plan 回传结构化 `ArchivePlan`——同一原语两用。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// 任务最终结果(给 UI 呈现 Done/Failed 两类;取消由 core 收进摘要文案)。
+/// 任务最终结果(Done 携带 `T`;Failed 携带展开后的错误链文案)。
 #[derive(Debug)]
-pub enum TaskOutcome {
-    Done(String),
+pub enum TaskOutcome<T> {
+    Done(T),
     Failed(String),
 }
 
-pub struct BackgroundTask {
+pub struct BackgroundTask<T> {
     cancel: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    result: Arc<Mutex<Option<TaskOutcome>>>,
+    result: Arc<Mutex<Option<TaskOutcome<T>>>>,
 }
 
-impl BackgroundTask {
+impl<T: Send + 'static> BackgroundTask<T> {
     /// 起一个后台线程跑 `f`(`f` 收到 cancel 标志,可在项目边界检查)。
     pub fn spawn<F>(f: F) -> Self
     where
-        F: FnOnce(&AtomicBool) -> anyhow::Result<String> + Send + 'static,
+        F: FnOnce(&AtomicBool) -> anyhow::Result<T> + Send + 'static,
     {
         let cancel = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
@@ -30,7 +32,7 @@ impl BackgroundTask {
         let result_t = Arc::clone(&result);
         let handle = std::thread::spawn(move || {
             let outcome = match f(&cancel_t) {
-                Ok(s) => TaskOutcome::Done(s),
+                Ok(v) => TaskOutcome::Done(v),
                 // {:#} 展开 anyhow 的错误链(含 context),保留"怎么修"链路。
                 Err(e) => TaskOutcome::Failed(format!("{:#}", e)),
             };
@@ -64,7 +66,7 @@ impl BackgroundTask {
     }
 
     /// 取走最终结果(join 线程)。仅在 is_finished 后调用;重复调用返回 None。
-    pub fn take_outcome(&mut self) -> Option<TaskOutcome> {
+    pub fn take_outcome(&mut self) -> Option<TaskOutcome<T>> {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -76,28 +78,35 @@ impl BackgroundTask {
 mod tests {
     use super::*;
 
-    #[test]
-    fn task_runs_to_done() {
-        let mut t = BackgroundTask::spawn(|_cancel| Ok("完成 3 项".to_string()));
+    fn drain<T: Send + 'static>(mut t: BackgroundTask<T>) -> TaskOutcome<T> {
         while !t.is_finished() {
             std::thread::yield_now();
         }
-        assert!(matches!(t.take_outcome(), Some(TaskOutcome::Done(s)) if s == "完成 3 项"));
+        t.take_outcome().unwrap()
+    }
+
+    #[test]
+    fn task_runs_to_done() {
+        let t = BackgroundTask::spawn(|_cancel| Ok("完成 3 项".to_string()));
+        assert!(matches!(drain(t), TaskOutcome::Done(s) if s == "完成 3 项"));
     }
 
     #[test]
     fn task_reports_failure() {
-        let mut t = BackgroundTask::spawn(|_cancel| anyhow::bail!("炸了"));
-        while !t.is_finished() {
-            std::thread::yield_now();
-        }
-        assert!(matches!(t.take_outcome(), Some(TaskOutcome::Failed(e)) if e.contains("炸了")));
+        let t = BackgroundTask::spawn(|_cancel| anyhow::bail!("炸了"));
+        assert!(matches!(drain::<String>(t), TaskOutcome::Failed(e) if e.contains("炸了")));
+    }
+
+    #[test]
+    fn task_carries_non_string_result() {
+        // 泛型:Done 可携带任意 Send 类型(这里 Vec<u32> 模拟结构化结果如 ArchivePlan)。
+        let t = BackgroundTask::spawn(|_cancel| Ok(vec![1u32, 2, 3]));
+        assert!(matches!(drain(t), TaskOutcome::Done(v) if v == vec![1, 2, 3]));
     }
 
     #[test]
     fn cancel_flag_visible_to_closure() {
-        let mut t = BackgroundTask::spawn(|cancel| {
-            // 自旋到被取消(测试里立即 request_cancel)
+        let t = BackgroundTask::spawn(|cancel| {
             while !cancel.load(Ordering::Relaxed) {
                 std::thread::yield_now();
             }
@@ -106,9 +115,6 @@ mod tests {
         assert!(!t.cancel_requested());
         t.request_cancel();
         assert!(t.cancel_requested());
-        while !t.is_finished() {
-            std::thread::yield_now();
-        }
-        assert!(matches!(t.take_outcome(), Some(TaskOutcome::Done(_))));
+        assert!(matches!(drain(t), TaskOutcome::Done(_)));
     }
 }
