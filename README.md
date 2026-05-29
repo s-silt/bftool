@@ -1,7 +1,7 @@
 # 归档备份工具 (bftool)
 
 > SSD → 机械盘，**按文件夹**安全归档，SHA256 三重校验，绝不误删，可中断续传。
-> 单文件 `bftool.exe`，**下载即用**，无任何外部依赖。
+> 命令行 `bftool.exe` + **新手友好桌面版 `bftool-gui.exe`**(浅色扁平 GUI，7 视图)，**下载即用**，无任何外部依赖。
 
 [![build](https://github.com/s-silt/bftool/actions/workflows/build.yml/badge.svg)](https://github.com/s-silt/bftool/actions/workflows/build.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -33,7 +33,9 @@
 
 ### 1. 下载
 
-到 [Releases](https://github.com/s-silt/bftool/releases) 下载 `bftool-x86_64-pc-windows-msvc.zip`，解压得到 `bftool.exe`、`bftool.toml.example`、`README.md`、`LICENSE`。把它们放到任意目录（比如 `C:\Tools\bftool\`）即可。
+到 [Releases](https://github.com/s-silt/bftool/releases) 下载 `bftool-x86_64-pc-windows-msvc.zip`，解压得到 `bftool.exe`(命令行)、`bftool-gui.exe`(桌面版)、`bftool.toml.example`、`README.md`、`LICENSE`。把它们放到任意目录（比如 `C:\Tools\bftool\`）即可。
+
+> 想要图形界面、不想敲命令?直接双击 **`bftool-gui.exe`**(见下方[桌面版](#桌面版-gui))。下面的「快速上手」是命令行流程,GUI 是它的点选化对等。
 
 > **不需要安装 Visual C++ Redistributable**：本工具静态链接 CRT，单 `.exe` 文件无外部 .dll 依赖。
 
@@ -111,6 +113,22 @@ bftool find 关键词
 
 需要彻底关压缩包测试？显式传 `--no-test-archives`，或在 `bftool.toml` 里写 `test_archives = false`。
 
+## 桌面版 (GUI)
+
+不想敲命令?用 **`bftool-gui.exe`** —— 浅色扁平的图形界面,把上面全部功能做成点选(7 个视图,左侧栏切换):
+
+| 视图 | 作用 |
+|---|---|
+| **仪表盘** | 当前盘 / 待备份数 / 容量已用 / 最近复查一屏总览;每盘容量横条 + 复查健康环;三大按钮直达备份/复查/初始化 |
+| **备份** | 演练预览计划 → 正式备份;实时进度 + 日志 + 取消(项目边界生效);高级设置(限量/指定盘/危险开关)折叠 |
+| **复查** | 选盘整盘复查,或「📁 选文件夹 / 📄 选文件」只复查**单个目标**的哈希 |
+| **初始化** | 列出候选盘 + 防呆(系统盘/资料库/非空盘),点选初始化;`--force` 藏在二次确认后 |
+| **查找 / 盘列表 / 设置** | 关键词查项目位置;列已识别盘;**点选目录**改三大根目录与参数 → 校验 → 保存(默认 `%APPDATA%`) |
+
+底部常驻状态栏显示运行状态 + 已用时间 + 取消按钮。到 [Releases](https://github.com/s-silt/bftool/releases) 下载 `bftool-gui.exe` 双击即用(同样静态、无外部依赖)。
+
+> GUI 与 CLI **共用同一套 core 引擎和配置**(`bftool.toml` / `%APPDATA%\bftool\config.toml`),行为完全一致 —— GUI 绝不通过 shell 调 `bftool.exe`,而是直接调用引擎。界面中文依赖系统已装中文字体(Windows 默认有微软雅黑)。
+
 ## 子命令速查
 
 | 命令 | 作用 |
@@ -180,10 +198,12 @@ bftool find 关键词
 ```cmd
 git clone https://github.com/s-silt/bftool.git
 cd bftool
-cargo build --release
+cargo build --release                 :: 命令行 bftool.exe
+cargo build --release -p bftool-gui   :: 桌面版 bftool-gui.exe
 ```
 
-产物在 `target\release\bftool.exe`（静态链接 CRT，可直接拷走运行）。
+产物在 `target\release\bftool.exe` 与 `target\release\bftool-gui.exe`（静态链接 CRT，可直接拷走运行）。
+默认 `cargo build` 只构建 CLI(纯命令行用户不必编译 eframe);GUI 用 `-p bftool-gui` 显式构建。
 
 ## 项目结构（Cargo workspace）
 
@@ -209,16 +229,24 @@ bftool/
 │   │           ├─ find.rs          全局索引查询
 │   │           ├─ status.rs        状态总览
 │   │           └─ paths.rs         盘内路径常量
-│   └─ bftool-cli/             命令行入口（bftool.exe）
+│   ├─ bftool-cli/             命令行入口（bftool.exe）
+│   │   └─ src/
+│   │       ├─ main.rs              调用 bftool_core::*
+│   │       ├─ cli.rs               clap 子命令定义
+│   │       └─ terminal_reporter.rs 终端渲染 Reporter
+│   └─ bftool-gui/             桌面版入口（bftool-gui.exe，eframe/egui）
 │       └─ src/
-│           ├─ main.rs              调用 bftool_core::*
-│           ├─ cli.rs               clap 子命令定义
-│           └─ terminal_reporter.rs 终端渲染 Reporter
-└─ .github/workflows/build.yml CI（windows-latest，cargo check + clippy + release zip）
+│           ├─ main.rs              eframe 入口（窗口/字体）
+│           ├─ app.rs               App 壳 + 左侧栏 + 全局状态栏
+│           ├─ reporter.rs          GuiReporter（core 输出 → channel/进度）
+│           ├─ task.rs              后台任务 + 项目边界取消
+│           └─ views/               7 视图 + theme（浅色扁平主题/组件）
+└─ .github/workflows/build.yml CI（windows-latest，fmt+build+test+clippy + audit + release zip）
 ```
 
-`bftool-core` 是业务引擎，未来桌面版（Tauri / egui）会**直接调用**它，
-不会通过 shell 调 `bftool.exe`。
+`bftool-core` 是业务引擎(与界面无关)。命令行 `bftool-cli` 与桌面版 `bftool-gui`(eframe/egui)
+都**直接调用**它,不通过 shell 互相调 exe;`Reporter` trait 让 core 的输出在 CLI(终端)与
+GUI(channel/进度条)各自渲染,而 core 永不 `println!`。
 
 ## License
 
