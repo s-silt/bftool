@@ -545,12 +545,24 @@ fn handle_one(
     pending.write(&txn_path)?;
 
     // 移动源（先动它；失败抛错 → 不写索引；源留在 待备份 下次重做）
-    fs::rename(proj_path, &arch_dest).with_context(|| {
-        format!(
-            "移动源失败：{} → {}",
-            proj_path.display(),
-            arch_dest.display()
-        )
+    fs::rename(proj_path, &arch_dest).map_err(|e| {
+        // 跨卷 rename 在 Windows 返回 ERROR_NOT_SAME_DEVICE(17):给可操作的 fail-closed 提示。(ledger L-010)
+        if e.raw_os_error() == Some(17) {
+            anyhow::anyhow!(
+                "移动源失败:待备份({})与已备份({})不在同一磁盘卷,无法原子移动。\n\
+                 如何修:把 ready_root 与 archived_root 配到同一块盘(通常都在你的 SSD 上)。\n\
+                 项目仍留在 待备份,改好配置后会自动重做(目标盘上的副本+校验清单已写好)。",
+                proj_path.display(),
+                arch_dest.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "移动源失败:{} → {}: {}",
+                proj_path.display(),
+                arch_dest.display(),
+                e
+            )
+        }
     })?;
 
     // 写清单 + 本盘索引 + 全局索引

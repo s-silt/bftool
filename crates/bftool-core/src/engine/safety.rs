@@ -60,8 +60,9 @@ pub fn check_paths(
 
     if !qualifier(&r).eq_ignore_ascii_case(&qualifier(&a)) {
         warnings.push(format!(
-            "提醒：待备份({}) 与 已备份({}) 不在同一分区，归档成功后的「移动」会变成复制+删除（较慢、不够原子）。建议放同一块固态盘。",
-            r.display(), a.display()
+            "提醒：待备份({}) 与 已备份({}) 不在同一分区 —— 跨卷无法原子移动源,归档到「移动源」这步会失败(项目留在 待备份、可重做)。建议把两者放在同一块盘。",
+            r.display(),
+            a.display()
         ));
     }
     Ok(warnings)
@@ -192,6 +193,23 @@ mod tests {
             Some(Path::new("E:\\")),
         );
         assert!(r.is_err(), "根目录在备份盘 E: 上 应拒绝");
+    }
+
+    // ── L-010: 跨分区给出准确提醒(归档移源会失败,而非"复制+删除") ──
+    #[test]
+    fn check_paths_warns_on_different_partition() {
+        let w = check_paths(
+            Path::new("C:\\ready"),
+            Path::new("D:\\archived"),
+            Path::new("D:\\sys"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            w.iter().any(|s| s.contains("不在同一分区")),
+            "跨分区应有提醒,实际:{:?}",
+            w
+        );
     }
 
     #[test]
