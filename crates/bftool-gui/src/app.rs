@@ -66,6 +66,8 @@ pub struct App {
     pub last_summary: Option<String>,
     /// 备份页的计划预览(archive::plan 的结果);T6 填充。
     pub archive_plan: Option<ArchivePlan>,
+    /// 备份页高级设置的持久 UI 状态(跨帧保留)。
+    pub archive_ui: crate::views::archive::ArchiveUiState,
 }
 
 impl App {
@@ -92,6 +94,7 @@ impl App {
             task: None,
             last_summary: None,
             archive_plan: None,
+            archive_ui: crate::views::archive::ArchiveUiState::default(),
         }
     }
 
