@@ -366,6 +366,17 @@ fn handle_one(
         reporter,
     )?;
 
+    // 0 真实文件:不归档、不移源 —— 否则"什么都没备份"会被记成 SHA256-OK 成功并把源移走。(ledger L-003)
+    if src.count() == 0 {
+        reporter.warn(&format!("跳过(无可备份的真实文件):{}", name));
+        append_manual(
+            cfg,
+            &name,
+            "项目内没有可备份的真实文件(空目录或全是 cruft)——不归档、不移源,请人工确认。",
+        )?;
+        return Ok(HandleOutcome::Skipped);
+    }
+
     // 复制
     fs::create_dir_all(&dest).context("创建目标目录失败")?;
     reporter.info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
@@ -836,6 +847,61 @@ fn leading_digits(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reporter::NoopReporter;
+
+    /// 搭一个临时"世界":ready/archived/sys + 一块假备份盘,供 handle_one 集成测试复用。
+    fn temp_world() -> (tempfile::TempDir, Config, DriveInfo) {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let cfg = Config {
+            ready_root: base.join("ready"),
+            archived_root: base.join("archived"),
+            system_root: base.join("sys"),
+            reserve_gb: 0,
+            stable_minutes: 0, // 不卡稳定性
+            min_drive_gb: 0,
+            name_prefix: "备份".into(),
+            test_archives: false,
+            winrar_path: std::path::PathBuf::new(),
+            bandizip_path: std::path::PathBuf::new(),
+            seven_zip_path: std::path::PathBuf::new(),
+        };
+        fs::create_dir_all(&cfg.ready_root).unwrap();
+        fs::create_dir_all(&cfg.archived_root).unwrap();
+        fs::create_dir_all(&cfg.system_root).unwrap();
+        let drive_root = base.join("drive");
+        fs::create_dir_all(&drive_root).unwrap();
+        let drive = DriveInfo {
+            letter: "T".into(),
+            root: drive_root,
+            id: "备份1".into(),
+            sealed: false,
+            free_bytes: 1 << 40,
+            total_bytes: 1 << 40,
+        };
+        (d, cfg, drive)
+    }
+
+    fn test_opts() -> Options {
+        Options {
+            dry_run: false,
+            no_hash: false,
+            limit: 0,
+            drive_letter_override: None,
+            no_test_archives: false,
+        }
+    }
+
+    // ── L-003: 空源(0 真实文件)不被记成功、不移源 ──
+    #[test]
+    fn handle_one_empty_source_does_not_move() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001empty");
+        fs::create_dir_all(&proj).unwrap();
+        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
+        assert!(matches!(outcome, HandleOutcome::Skipped), "空源应 Skipped");
+        assert!(proj.is_dir(), "空源不应被移走(应仍在 待备份)");
+    }
 
     // ── L-008: 无校验判定单一来源,core/cli 共用 verify_disabled ──
     #[test]
