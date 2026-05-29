@@ -45,6 +45,11 @@ pub struct Config {
     /// 7-Zip 路径(免费开源,推荐新手装这个)。
     #[serde(default = "default_seven_zip")]
     pub seven_zip_path: PathBuf,
+
+    /// 多机汇总查询：其它电脑拷来的「备份索引名单.csv」路径列表。
+    /// `find` 查询时与本机总索引一并检索；只读、不影响归档/盘号/事务。
+    #[serde(default)]
+    pub extra_catalogs: Vec<PathBuf>,
 }
 
 fn default_reserve_gb() -> u64 {
@@ -91,6 +96,7 @@ impl Default for Config {
             winrar_path: default_winrar(),
             bandizip_path: default_bandizip(),
             seven_zip_path: default_seven_zip(),
+            extra_catalogs: Vec::new(),
         }
     }
 }
@@ -271,5 +277,39 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    // ── 向后兼容：旧配置文件没有 extra_catalogs 字段，仍应能加载（默认空）──
+    #[test]
+    fn loads_legacy_config_without_extra_catalogs() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bftool.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"D:/r\"\n\
+             archived_root = \"D:/a\"\n\
+             system_root = \"D:/s\"\n",
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert!(c.extra_catalogs.is_empty());
+        assert_eq!(c.name_prefix, "备份");
+    }
+
+    #[test]
+    fn extra_catalogs_roundtrips() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bftool.toml");
+        let lc = LoadedConfig {
+            config: Config {
+                extra_catalogs: vec![PathBuf::from("D:/u/A.csv"), PathBuf::from("D:/u/B.csv")],
+                ..Config::default()
+            },
+            source: ConfigSource::Default,
+        };
+        lc.save(&SaveTarget::Custom(p.clone())).unwrap();
+        let back = Config::from_path(&p).unwrap();
+        assert_eq!(back.extra_catalogs.len(), 2);
+        assert_eq!(back.extra_catalogs[0], PathBuf::from("D:/u/A.csv"));
     }
 }
