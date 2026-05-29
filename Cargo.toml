@@ -13,7 +13,7 @@ default-members = ["crates/bftool-cli"]
 # 共享的发布元数据 + 依赖版本。子 crate 用 `.workspace = true` 引用，
 # 保证升级集中在一处，子 crate 之间不会版本漂移。
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
