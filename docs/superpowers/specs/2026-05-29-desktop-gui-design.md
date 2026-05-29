@@ -45,24 +45,29 @@ archive/verify 是长阻塞操作,**绝不能在 UI 线程跑**。
 
 GUI 直接调 core,需把"只为 CLI 打印"的查询改成**返回结构化数据**;**CLI 渲染层保留**(把结构渲染成文本),**core 提供结构化查询 API,GUI 绝不解析 reporter 文本**。
 
-### 4.1 结构化查询(L-031)
-- `find::search(cfg, keyword) -> Result<Vec<FindMatch>>`(`FindMatch { folder, drive_id, in_drive_path, ... }`)。CLI 渲染成现有表格;GUI 渲染成结果列表。(取代 `find::run` 的 `println!`;配 L-042 测试)
-- `status::gather(cfg) -> Result<StatusReport>`(`StatusReport { current_drive: Option<..>, pending_count, last_verify, drives, .. }`)。CLI/GUI 各自渲染。(取代 status 的 `println!`)
-- `drives::gather() -> Result<Vec<BackupDrive>>`(或 GUI 直接用 `scan_mounted()`)。GUI 列盘用结构,不读 reporter 文本。
+### 4.1 结构化查询 + 计划(L-031 + 新增)
+列表/明细/计划一律由 core 返回结构化数据,CLI 渲染成文本、GUI 直接消费,双方都不解析 reporter 文本。
+- `find::search(cfg, keyword) -> Result<Vec<FindMatch>>`(`FindMatch { folder, drive_id, in_drive_path }`)。(取代 `find::run` 的 `println!`;配 L-042 测试)
+- `status::gather(cfg) -> Result<StatusReport>`(`StatusReport { current_drive: Option<BackupDrive>, pending_count, last_verify: Option<LastVerify>, drives: Vec<BackupDrive> }`)。`last_verify` 数据来源见 §4.4。(取代 status 的 `println!`)
+- `drives::gather() -> Result<Vec<BackupDrive>>`(GUI 列盘;或直接 `scan_mounted()`)。
+- **`archive::plan(cfg, opts) -> Result<ArchivePlan>`(新增,Finding #1)**:不动数据算出本轮计划 —— `ArchivePlan { drive: BackupDrive, items: Vec<PlanItem> }`,`PlanItem { name, est_bytes, dest_name, action: Archive | Skip(reason) }`(reason:未稳定 / 超容量 / 重名改名 / 0 文件 …)。**dry-run = 渲染 plan;GUI 备份页列项目用 plan;正式 archive 与 plan 共享同一 per-project 决策逻辑**,不重复实现。CLI dry-run 改为渲染 ArchivePlan。
+- **`VerifyReport` 扩明细(Finding #2)**:在 `checked/bad/extra` 计数外加 `issues: Vec<VerifyIssue>`(`VerifyIssue { rel, kind: Missing | SizeMismatch | Corrupt | Unverifiable | EnumError }`)与 `extras: Vec<String>`。CLI 渲染成现有逐行文本;GUI 复查页直接列明细。
 
 ### 4.2 类型化盘(L-021,分读写场景)
 - `BackupDrive`:**已初始化的备份盘**通用类型(带 `sealed` 状态、容量、id、root)。`scan_mounted()` / `drives::gather()` 返回它——verify、drives、状态页都用它(需要读取所有已初始化盘,无论封盘与否)。
-- `BackupDrive::try_into_writable() -> Result<WritableDrive, DriveError>`:仅**未封盘且容量达标**时成功;**archive 写路径只接受 `WritableDrive`**,编译期挡掉"往封盘/过小盘写"。
-- **init** 面对的是**原始盘符/挂载点**(尚未初始化,不是 `BackupDrive`)——保持现有 `drive::init(letter, ..)` 签名。
+- `BackupDrive::try_into_writable(min_drive_gb: u64) -> Result<WritableDrive, DriveError>`(Finding #5):仅**未封盘且容量 ≥ min_drive_gb**时成功 —— 阈值**显式传入**(来自 `cfg.min_drive_gb`),不藏在无参方法里;**archive 写路径只接受 `WritableDrive`**,编译期挡掉"往封盘/过小盘写"。
+- **init 候选(Finding #4)**:`drive::init_candidates(cfg) -> Result<Vec<InitCandidate>>`,`InitCandidate { letter, total_gb, is_system, is_library, non_empty, can_init: bool, block_reason: Option<String> }` —— 把现有 `init` 的防呆判定(系统盘/资料库盘/非空盘)抽成结构化,GUI 初始化页直接列、不重复实现防呆;`drive::init(letter, ..)` 执行签名不变。
 - 不强迫所有调用吃 writable/sealed 二分:总类型 `BackupDrive` + 按需 `try_into_writable()`。
 
 ### 4.3 配置读写(LoadedConfig)
 - `Config::load` → 返回 **`LoadedConfig { config: Config, source: ConfigSource }`**,`ConfigSource = Explicit(PathBuf) | Candidate(PathBuf) | Default`(记录"从哪读的")。
-- **`LoadedConfig::save(target) -> Result<()>`**:写回当前 source;source 为 `Default`(没找到任何配置文件)时,GUI 让用户选目标(当前目录 `bftool.toml` / `%APPDATA%\bftool\config.toml` / 自定义)。**保证 GUI 写的就是 CLI 下次会读的位置**,不会读写错位。
-- 写前过 `Config::validate()`(已做,L-025)。
-- CLI 的 `Config::load` 改为基于 `LoadedConfig`(取其 `.config`),行为不变。
+- **`LoadedConfig::save(target: SaveTarget) -> Result<()>`**:写哪由 `SaveTarget` 显式指定。**默认推荐 `%APPDATA%\bftool\config.toml`(与 cwd 无关,CLI 命令行运行与 GUI 双击启动都会查到)**——不拿"当前目录"作默认(Finding #6:GUI 双击的 cwd 与 CLI 在终端运行的 cwd 往往不同,写到 cwd 不保证 CLI 下次读到)。GUI 设置页:source 非 Default → 默认存回原处;Default → 默认 `%APPDATA%`,"当前目录"选项以**绝对路径**显示并注明"仅当 CLI 也在此目录运行才生效"。
+- 写前过 `Config::validate()`(L-025)。CLI 的 `Config::load` 改基于 `LoadedConfig`(取 `.config`),行为不变。
 
-### 4.4 取消钩子
+### 4.4 last_verify 持久化(Finding #3)
+当前 `verify::run` 不持久化复查时间,无 `last_verify` 来源。新增:**verify 成功完成后,往该盘 `本盘信息\上次复查.txt` 写时间戳**(每盘自洽,符合"盘内自带元数据"原则);`status::gather` 读各盘该文件聚合成 `last_verify: Option<LastVerify { drive_id, when }>`(无文件 = 未知/None)。配测试(写+读往返、缺文件→None)。CLI status 也展示。
+
+### 4.5 取消钩子
 - `archive::run(.., cancel: &AtomicBool)`、`verify::run(.., cancel: &AtomicBool)`(CLI 传一个永不取消的常量,行为不变;GUI 传可置位的)。
 
 所有 core 改动各配回归测试(core 已有测试基建 + temp_world 集成脚手架)。
@@ -72,12 +77,12 @@ GUI 直接调 core,需把"只为 CLI 打印"的查询改成**返回结构化数�
 | 视图 | 对应 CLI | 要点 |
 |---|---|---|
 | **仪表盘(默认)** | 默认 status | 当前盘 / 待备份数 / 上次复查;三大按钮「备份 / 复查 / 初始化新盘」。首次无配置或无盘 → 顶部横幅引导去设置/init。 |
-| **备份** | `archive` | 列待备份项目 →「演练(dry-run 预览)」+「正式备份」;实时进度条 + 日志 + 成功/失败/取消汇总。**高级设置(默认折叠)**:`--limit`、指定盘、`stable_minutes`、`reserve_gb`、`--no-test-archives`、`--unsafe-no-hash`(+ 确认)。**危险组合**(no_hash + 关测试)沿用 core `verify_disabled` fail-closed + GUI 二次确认弹窗。「取消」按钮(项目边界生效)。 |
+| **备份** | `archive` | 列待备份项目(`archive::plan`)→「演练(= 渲染 plan)」+「正式备份」;实时进度条 + 日志 + 成功/失败/取消汇总。**高级设置(默认折叠)**:`--limit`、指定盘、`stable_minutes`、`reserve_gb`、`--no-test-archives`、`--unsafe-no-hash`(+ 确认)。**危险组合**(no_hash + 关测试)沿用 core `verify_disabled` fail-closed + GUI 二次确认弹窗。「取消」按钮(项目边界生效)。 |
 | **复查** | `verify` | 选盘(`BackupDrive` 列表)→ 进度 + 损坏/缺失/多余报告(`VerifyReport`);可取消。 |
-| **初始化** | `init` | 选盘符(原始盘)→ 防呆提示(系统盘/资料库盘/非空盘,沿用 core)→ init;`--force` 藏在二次确认后。 |
+| **初始化** | `init` | `drive::init_candidates` 列原始盘(盘符/容量/防呆阻断原因)→ 选可初始化的 → init;`--force` 藏在二次确认后。 |
 | **查找** | `find` | 关键词 → 结果表(`Vec<FindMatch>`:在哪块盘 / 盘内路径)。 |
 | **盘列表** | `drives` | 列已识别 `BackupDrive`(可用/已封盘/容量)。 |
-| **设置** | `config-show` | **配置预览**(当前生效 `LoadedConfig`:config + 来源路径)+ **编辑**三根目录与选项 → `validate` → `save`。 |
+| **设置** | `config-show` | **配置预览**(当前生效 `LoadedConfig`:config + 来源路径)+ **编辑**三根目录与选项 → `validate` → `save`(默认 `%APPDATA%`,见 §4.3)。 |
 
 新手友好:默认值保守;危险操作二次确认;错误信息带"怎么修"(沿用 core 文案);dry-run 预览先行。
 
