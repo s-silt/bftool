@@ -136,7 +136,13 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
             }
         };
         let size = meta.len();
-        let mtime = system_time_to_rfc3339(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        // mtime 读不到时存空串(不要用 UNIX_EPOCH 兜底):空串在 no_hash 复核里被当作
+        // "无法证明未变" → 保守判定为已变,而 UNIX_EPOCH 兜底会让两次都相等从而漏判。(ledger L-004)
+        let mtime = meta
+            .modified()
+            .ok()
+            .map(system_time_to_rfc3339)
+            .unwrap_or_default();
         let rel = path_relative(&base, f);
 
         let hash = if opts.no_hash {
@@ -300,6 +306,12 @@ pub fn source_changed(
                 break;
             }
             if no_hash {
+                // 空 mtime = 该文件 mtime 不可读 → 无法证明复制期间未变 → 保守判为已变(fail-closed)
+                if i.mtime.is_empty() || j.mtime.is_empty() {
+                    changed = true;
+                    reasons.push(format!("修改时间不可读,无法确认未变 {}", i.rel));
+                    break;
+                }
                 if j.mtime != i.mtime {
                     changed = true;
                     reasons.push(format!("修改时间变化 {}", i.rel));
@@ -313,4 +325,57 @@ pub fn source_changed(
         }
     }
     (changed, reasons)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(rel: &str, size: u64, hash: &str, mtime: &str) -> Entry {
+        Entry {
+            rel: rel.into(),
+            size,
+            hash: hash.into(),
+            mtime: mtime.into(),
+        }
+    }
+
+    // ── L-004: no_hash 复核不能被"不可读 mtime"绕过 ──
+    #[test]
+    fn source_changed_no_hash_treats_unreadable_mtime_as_changed() {
+        // 两次 build 都读不到 mtime(空串):旧实现用 UNIX_EPOCH 兜底会让两者相等 → 漏判;
+        // 现在应保守判为"已变",防止"复制期间内容变了但 mtime 读不到"时把旧/坏版本移走。
+        let a = Manifest {
+            entries: vec![e("x", 10, "", "")],
+        };
+        let b = Manifest {
+            entries: vec![e("x", 10, "", "")],
+        };
+        assert!(
+            source_changed(&a, &b, true).0,
+            "空 mtime 无法证明未变,应保守判为已变"
+        );
+    }
+
+    #[test]
+    fn source_changed_no_hash_same_mtime_unchanged() {
+        let a = Manifest {
+            entries: vec![e("x", 10, "", "2026-01-01T00:00:00+00:00")],
+        };
+        let b = Manifest {
+            entries: vec![e("x", 10, "", "2026-01-01T00:00:00+00:00")],
+        };
+        assert!(!source_changed(&a, &b, true).0);
+    }
+
+    #[test]
+    fn source_changed_no_hash_diff_mtime_changed() {
+        let a = Manifest {
+            entries: vec![e("x", 10, "", "2026-01-01T00:00:00+00:00")],
+        };
+        let b = Manifest {
+            entries: vec![e("x", 10, "", "2026-02-02T00:00:00+00:00")],
+        };
+        assert!(source_changed(&a, &b, true).0);
+    }
 }
