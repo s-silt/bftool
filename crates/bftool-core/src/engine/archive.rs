@@ -325,7 +325,8 @@ fn handle_one(
 
     // Spec B 源压缩包测试 —— 在 dry_run check 之后,在生成 manifest 之前
     if let Some((kind, path)) = tester_opt {
-        let r = archive_test::test_folder(proj_path, (*kind, path.as_path()), reporter);
+        let r =
+            archive_test::test_folder(proj_path, (*kind, path.as_path()), opts.no_hash, reporter);
         if !r.ok {
             for detail in r.details() {
                 reporter.error(&detail);
@@ -433,7 +434,7 @@ fn handle_one(
 
     // Spec B 目标压缩包测试 —— 在 SHA256 校验通过后、源复核之前
     if let Some((kind, path)) = tester_opt {
-        let r = archive_test::test_folder(&dest, (*kind, path.as_path()), reporter);
+        let r = archive_test::test_folder(&dest, (*kind, path.as_path()), opts.no_hash, reporter);
         if !r.ok {
             for detail in r.details() {
                 reporter.error(&detail);
