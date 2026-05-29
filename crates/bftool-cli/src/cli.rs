@@ -8,10 +8,17 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 
 use bftool_core::config::{Config, ConfigSource};
 use bftool_core::engine;
 use bftool_core::reporter::Reporter;
+
+/// CLI 的"永不取消"标志:GUI 传可置位的 AtomicBool,CLI 不支持图形化取消,
+/// 用这个工厂函数构造永远为 false 的标志,避免两处相同硬编码漂移。(EH-001)
+fn no_cancel() -> AtomicBool {
+    AtomicBool::new(false)
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -172,7 +179,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                 cfg.reserve_gb = r;
             }
             // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
-            let no_cancel = std::sync::atomic::AtomicBool::new(false);
+            let no_cancel = no_cancel();
             let summary = engine::archive::run(
                 &cfg,
                 reporter,
@@ -201,7 +208,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
         }
         Some(Command::Verify { drive }) => {
             // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
-            let no_cancel = std::sync::atomic::AtomicBool::new(false);
+            let no_cancel = no_cancel();
             let report = engine::verify::run(&cfg, reporter, drive.as_deref(), &no_cancel)?;
             if report.has_corruption() {
                 bail!(

@@ -4,8 +4,10 @@
 use eframe::egui;
 
 use bftool_core::engine::find::{self, FindMatch, FindOutcome};
+use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
+use crate::views::util;
 
 /// 查找页跨帧状态。直接持有 core 返回的 `FindOutcome`,避免把命中/来源数/失败来源
 /// 拆成多个字段后还要在各分支手动同步。
@@ -47,7 +49,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     ui.separator();
     if let Some(err) = &app.find_ui.error {
-        ui.colored_label(egui::Color32::from_rgb(0xCC, 0x33, 0x33), err);
+        ui.colored_label(util::level_color(LogLevel::Error), err);
     }
     match &app.find_ui.result {
         Some(outcome) => {

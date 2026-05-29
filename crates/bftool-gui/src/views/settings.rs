@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use bftool_core::config::{Config, ConfigSource, LoadedConfig, SaveTarget};
+use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
 use crate::views::{theme, util};
@@ -147,9 +148,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     if let Some((ok, msg)) = &app.settings_ui.result {
         let color = if *ok {
-            egui::Color32::from_rgb(0x2e, 0x7d, 0x32)
+            util::level_color(LogLevel::Ok)
         } else {
-            egui::Color32::from_rgb(0xCC, 0x33, 0x33)
+            util::level_color(LogLevel::Error)
         };
         ui.colored_label(color, msg);
     }

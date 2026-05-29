@@ -118,7 +118,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         app.archive_ui.no_test_archives,
     ) {
         ui.colored_label(
-            egui::Color32::from_rgb(0xCC, 0x33, 0x33),
+            util::level_color(LogLevel::Error),
             "⚠ 当前组合 = 跳过 SHA256 且关闭压缩包测试 → 等价无校验,工具会拒绝执行。",
         );
     }
@@ -242,16 +242,22 @@ fn start_archive(app: &mut App) {
     }));
 }
 
-/// 计划动作 → (颜色, 文案)。纯函数,可测。
+/// 计划动作 → (颜色, 文案)。纯函数,可测。颜色复用 util::level_color 避免重复硬编码。
 fn action_text(a: &PlanAction) -> (egui::Color32, String) {
-    let green = egui::Color32::from_rgb(0x2e, 0x7d, 0x32);
-    let gray = egui::Color32::GRAY;
-    let orange = egui::Color32::from_rgb(0x8a, 0x6d, 0x00);
     match a {
-        PlanAction::Archive { dest_name } => (green, format!("归档 → {}", dest_name)),
-        PlanAction::RenameAndArchive { dest_name } => (green, format!("改名归档 → {}", dest_name)),
-        PlanAction::Skip(r) => (gray, format!("跳过：{}", r)),
-        PlanAction::SealAndStop(r) => (orange, format!("封盘停本轮：{}", r)),
+        PlanAction::Archive { dest_name } => (
+            util::level_color(LogLevel::Ok),
+            format!("归档 → {}", dest_name),
+        ),
+        PlanAction::RenameAndArchive { dest_name } => (
+            util::level_color(LogLevel::Ok),
+            format!("改名归档 → {}", dest_name),
+        ),
+        PlanAction::Skip(r) => (util::level_color(LogLevel::Info), format!("跳过：{}", r)),
+        PlanAction::SealAndStop(r) => (
+            util::level_color(LogLevel::Warn),
+            format!("封盘停本轮：{}", r),
+        ),
     }
 }
 
