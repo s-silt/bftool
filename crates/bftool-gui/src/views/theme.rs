@@ -241,15 +241,8 @@ pub fn callout(ui: &mut egui::Ui, accent: Color32, soft: Color32, text: &str) {
 }
 
 /// KPI 卡:标题(弱化)+ 大数字(醒目)+ 副标题(更弱)+ 右上角强调色圆点。
-/// `delta` 可选(同比),正绿负红;本静态版通常传 None。
-pub fn kpi_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    value: &str,
-    subtitle: &str,
-    accent: Color32,
-    delta: Option<(&str, Color32)>,
-) {
+/// 静态版不含同比涨跌(bftool 无历史时序数据)。
+pub fn kpi_card(ui: &mut egui::Ui, title: &str, value: &str, subtitle: &str, accent: Color32) {
     card(ui, |ui| {
         ui.set_min_height(96.0);
         ui.vertical(|ui| {
@@ -269,12 +262,7 @@ pub fn kpi_card(
                     .color(TEXT_TITLE),
             );
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(TEXT_MUTED, egui::RichText::new(subtitle).size(11.0));
-                if let Some((d, c)) = delta {
-                    ui.colored_label(c, egui::RichText::new(d).size(11.0));
-                }
-            });
+            ui.colored_label(TEXT_MUTED, egui::RichText::new(subtitle).size(11.0));
         });
     });
 }
