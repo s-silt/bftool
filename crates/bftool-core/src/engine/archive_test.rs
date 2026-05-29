@@ -160,7 +160,7 @@ enum InvokeOutcome {
     TesterError(String),
 }
 
-fn invoke_tester(tester: (Tester, &Path), archive: &Path) -> InvokeOutcome {
+fn invoke_tester(tester: (Tester, &Path), archive: &Path, strict: bool) -> InvokeOutcome {
     let args: Vec<&str> = match tester.0 {
         Tester::WinRAR => vec!["t", "-ibck", "-y", "--"],
         Tester::Bandizip => vec!["t"],
@@ -189,17 +189,35 @@ fn invoke_tester(tester: (Tester, &Path), archive: &Path) -> InvokeOutcome {
             tester_name(tester.0)
         ));
     };
-    match tester.0 {
+    classify_exit(tester.0, code, strict)
+}
+
+/// 退出码 → 结论(纯函数,便于测试)。
+/// `strict`(no_hash 模式:压缩包测试是**唯一**内容闸)下,把 WinRAR/7-Zip 的
+/// "非致命警告"(code=1,可能含"部分文件读不到")升级为失败,避免无内容校验地放行。(ledger L-009)
+fn classify_exit(tester: Tester, code: i32, strict: bool) -> InvokeOutcome {
+    match tester {
         Tester::Bandizip if code == 0 => InvokeOutcome::Ok,
         Tester::Bandizip => InvokeOutcome::ArchiveBad(code),
         Tester::WinRAR | Tester::SevenZip if code == 0 => InvokeOutcome::Ok,
-        Tester::WinRAR | Tester::SevenZip if code == 1 => InvokeOutcome::NonFatalWarn,
+        Tester::WinRAR | Tester::SevenZip if code == 1 => {
+            if strict {
+                InvokeOutcome::ArchiveBad(1)
+            } else {
+                InvokeOutcome::NonFatalWarn
+            }
+        }
         Tester::WinRAR | Tester::SevenZip => InvokeOutcome::ArchiveBad(code),
     }
 }
 
 /// 测试一个文件夹下所有压缩包。
-pub fn test_folder(folder: &Path, tester: (Tester, &Path), reporter: &dyn Reporter) -> TestReport {
+pub fn test_folder(
+    folder: &Path,
+    tester: (Tester, &Path),
+    strict: bool,
+    reporter: &dyn Reporter,
+) -> TestReport {
     let mut report = TestReport::default();
     let mut archives: Vec<PathBuf> = Vec::new();
     let mut continuations: Vec<PathBuf> = Vec::new();
@@ -265,7 +283,7 @@ pub fn test_folder(folder: &Path, tester: (Tester, &Path), reporter: &dyn Report
     }
     for a in &archives {
         report.archives_tested += 1;
-        match invoke_tester(tester, a) {
+        match invoke_tester(tester, a, strict) {
             InvokeOutcome::Ok => {}
             InvokeOutcome::NonFatalWarn => {
                 reporter.warn(&format!(
@@ -432,5 +450,39 @@ mod tests {
             seven_zip: PathBuf::from("/nonexistent/7z.exe"),
         };
         assert!(detect(&paths).is_none());
+    }
+
+    // ── L-009: strict(no_hash) 下 WinRAR/7-Zip code=1 升级为失败,不再放行 ──
+    #[test]
+    fn classify_exit_strict_treats_code1_as_bad() {
+        assert!(matches!(
+            classify_exit(Tester::SevenZip, 0, false),
+            InvokeOutcome::Ok
+        ));
+        assert!(matches!(
+            classify_exit(Tester::SevenZip, 1, false),
+            InvokeOutcome::NonFatalWarn
+        ));
+        // strict:code=1 → 失败(no_hash 下不放行)
+        assert!(matches!(
+            classify_exit(Tester::SevenZip, 1, true),
+            InvokeOutcome::ArchiveBad(1)
+        ));
+        assert!(matches!(
+            classify_exit(Tester::WinRAR, 1, true),
+            InvokeOutcome::ArchiveBad(1)
+        ));
+        assert!(matches!(
+            classify_exit(Tester::WinRAR, 2, false),
+            InvokeOutcome::ArchiveBad(2)
+        ));
+        assert!(matches!(
+            classify_exit(Tester::Bandizip, 0, true),
+            InvokeOutcome::Ok
+        ));
+        assert!(matches!(
+            classify_exit(Tester::Bandizip, 1, false),
+            InvokeOutcome::ArchiveBad(1)
+        ));
     }
 }

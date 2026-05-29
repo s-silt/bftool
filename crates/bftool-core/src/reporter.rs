@@ -2,13 +2,13 @@
 //!
 //! 设计目标：
 //! - `bftool-core` 永远不直接 `println!`。所有面向用户的输出都通过 [`Reporter`]。
-//! - CLI 端实现一个把调用渲染成 emoji 前缀 + indicatif 进度条的 reporter；
+//! - CLI 端实现一个把调用渲染成短前缀标记（`[i]`/`[✓]`/`[!]`/`[x]`/`[>]`）+ indicatif 进度条的 reporter；
 //!   未来 GUI 端实现自己的 reporter，把事件推到 channel 或更新 UI 状态。
 //! - 进度条用 [`ProgressHandle`] 抽象，避免 core 依赖 indicatif。
 //!
 //! 这是 Batch 1b 的接口；下一批（5）会把追加索引等离散动作也变成结构化事件。
 
-/// 日志级别。CLI 渲染时用不同 emoji 前缀；GUI 可按级别分色或选择是否声音提示。
+/// 日志级别。CLI 渲染时用不同短前缀标记（`[i]`/`[✓]`/`[!]`/`[x]`/`[>]`）；GUI 可按级别分色或选择是否声音提示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogLevel {
     /// 普通信息（"开始处理…"、"复制完成"）

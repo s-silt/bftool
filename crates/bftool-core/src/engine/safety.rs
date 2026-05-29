@@ -60,8 +60,9 @@ pub fn check_paths(
 
     if !qualifier(&r).eq_ignore_ascii_case(&qualifier(&a)) {
         warnings.push(format!(
-            "提醒：待备份({}) 与 已备份({}) 不在同一分区，归档成功后的「移动」会变成复制+删除（较慢、不够原子）。建议放同一块固态盘。",
-            r.display(), a.display()
+            "提醒：待备份({}) 与 已备份({}) 不在同一分区 —— 跨卷无法原子移动源,归档到「移动源」这步会失败(项目留在 待备份、可重做)。建议把两者放在同一块盘。",
+            r.display(),
+            a.display()
         ));
     }
     Ok(warnings)
@@ -83,12 +84,12 @@ fn is_inside(child: &Path, parent: &Path) -> bool {
 }
 
 fn qualifier(p: &Path) -> String {
-    // 取盘符部分 "D:" / "" ；不依赖 win32 API，直接看路径前缀
+    // 取盘符部分 "D:" / ""；字符安全:多字节首字符 / UNC 不 panic(旧 `&s[1..2]` 会)。(ledger L-023)
     let s = p.to_string_lossy();
-    if s.len() >= 2 && &s[1..2] == ":" {
-        s[..2].to_string()
-    } else {
-        String::new()
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), Some(':')) if c.is_ascii_alphabetic() => format!("{}:", c.to_ascii_uppercase()),
+        _ => String::new(),
     }
 }
 
@@ -135,5 +136,92 @@ pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
     StableCheck {
         stable: true,
         reason: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── L-023: qualifier 字符安全 ──
+    #[test]
+    fn qualifier_is_char_safe() {
+        assert_eq!(qualifier(Path::new("D:\\x")), "D:");
+        assert_eq!(qualifier(Path::new("e:\\")), "E:");
+        assert_eq!(qualifier(Path::new(r"\\srv\share")), "");
+        assert_eq!(qualifier(Path::new("中:\\x")), ""); // 多字节首字符:不 panic
+        assert_eq!(qualifier(Path::new("")), "");
+    }
+
+    // ── L-026: is_inside 边界(前缀不能误判为嵌套) ──
+    #[test]
+    fn is_inside_basic() {
+        assert!(is_inside(Path::new("D:\\a\\b"), Path::new("D:\\a")));
+        assert!(!is_inside(Path::new("D:\\ab"), Path::new("D:\\a"))); // 前缀但非父目录
+        assert!(!is_inside(Path::new("D:\\a"), Path::new("D:\\a"))); // 自身不算 inside
+    }
+
+    // ── L-026: check_paths 拒绝同目录/嵌套/同备份盘 ──
+    #[test]
+    fn check_paths_rejects_same_ready_archived() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\sys"),
+            None,
+        );
+        assert!(r.is_err(), "待备份==已备份 应拒绝");
+    }
+
+    #[test]
+    fn check_paths_rejects_archived_inside_ready() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\ready\\done"),
+            Path::new("D:\\lib\\sys"),
+            None,
+        );
+        assert!(r.is_err(), "已备份 在 待备份 之内 应拒绝");
+    }
+
+    #[test]
+    fn check_paths_rejects_root_on_backup_drive() {
+        let r = check_paths(
+            Path::new("E:\\ready"),
+            Path::new("D:\\archived"),
+            Path::new("D:\\sys"),
+            Some(Path::new("E:\\")),
+        );
+        assert!(r.is_err(), "根目录在备份盘 E: 上 应拒绝");
+    }
+
+    // ── L-010: 跨分区给出准确提醒(归档移源会失败,而非"复制+删除") ──
+    #[test]
+    fn check_paths_warns_on_different_partition() {
+        let w = check_paths(
+            Path::new("C:\\ready"),
+            Path::new("D:\\archived"),
+            Path::new("D:\\sys"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            w.iter().any(|s| s.contains("不在同一分区")),
+            "跨分区应有提醒,实际:{:?}",
+            w
+        );
+    }
+
+    #[test]
+    fn check_paths_ok_when_distinct_same_partition() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\archived"),
+            Path::new("D:\\lib\\sys"),
+            Some(Path::new("E:\\")),
+        )
+        .unwrap();
+        // 同分区、互不嵌套 → Ok,且无"不同分区"警告
+        assert!(r.is_empty(), "同分区互不嵌套应无警告,实际:{:?}", r);
     }
 }

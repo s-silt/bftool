@@ -13,20 +13,36 @@ env:
 
 jobs:
   check:
-    name: cargo check
+    name: fmt + build + test + clippy
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # review+修复 campaign 后全部转为**硬门禁**(去掉 continue-on-error):本地每轮必过,
+      # CI 也强制,防 78 项测试 / fmt / clippy 回归。(ledger CI-1/CI-2/CI-3/CI-4)
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-        continue-on-error: true   # 格式不阻断构建，留作 advisory
-      - name: cargo check
-        run: cargo check --workspace --all-targets --locked || cargo check --workspace --all-targets
-      - name: cargo clippy
+      - name: cargo build (all targets)
+        run: cargo build --workspace --all-targets --locked || cargo build --workspace --all-targets
+      - name: cargo test (all targets)
+        run: cargo test --workspace --all-targets
+      - name: cargo clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true   # MVP 阶段先 advisory，稳定后再 strict
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit（依赖已知漏洞扫描）
+        run: cargo audit
 
   build:
     name: build (${{ matrix.target }})

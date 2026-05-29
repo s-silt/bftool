@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::engine::archive_test::{self, Tester, TesterPaths};
 use crate::engine::drive::{self, DriveInfo};
 use crate::engine::manifest::{self, ManifestOpts};
-use crate::engine::{cruft, paths, safety, txn};
+use crate::engine::{cruft, durable, paths, safety, txn};
 use crate::reporter::Reporter;
 
 #[derive(Debug, Default)]
@@ -29,9 +29,48 @@ pub struct Options {
     pub no_test_archives: bool,
 }
 
-pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
-    // Spec B D14/D15 core-level fail-closed guard
-    if opts.no_hash && (!cfg.test_archives || opts.no_test_archives) {
+/// 一轮归档的结果汇总。`failed>0` = 有项目处理失败 —— CLI 据此设非零退出码,
+/// 自动化/计划任务才能识别"批量归档里有失败"(此前总是 exit 0)。(ledger L-007)
+#[derive(Debug, Default, Clone)]
+pub struct ArchiveSummary {
+    pub handled: usize,
+    pub failed: usize,
+}
+
+/// 是否处于"没有任何内容完整性校验"的状态:跳过 SHA256(no_hash) 且 archive test 实际关闭。
+/// 等价于只剩 size+count+mtime,是禁止的组合。判定集中在此,core::run 守卫与 CLI 守卫共用
+/// 同一真值,避免两处条件漂移把"无校验后门"悄悄打开。(ledger L-008)
+pub fn verify_disabled(no_hash: bool, test_archives: bool, no_test_archives: bool) -> bool {
+    no_hash && (!test_archives || no_test_archives)
+}
+
+/// 校验强度的类型化表示:由"是否跑了 SHA256"派生,避免 "SHA256-OK"/"SIZE+COUNT" 字面量
+/// 散落各处、与实际校验脱钩。token() 是写入索引 CSV 的稳定列值(保持旧版兼容)。(ledger L-020)
+#[derive(Debug, Clone, Copy)]
+enum VerifyStatus {
+    Sha256Ok,
+    SizeCount,
+}
+
+impl VerifyStatus {
+    fn from_opts(no_hash: bool) -> Self {
+        if no_hash {
+            Self::SizeCount
+        } else {
+            Self::Sha256Ok
+        }
+    }
+    fn token(self) -> &'static str {
+        match self {
+            Self::Sha256Ok => "SHA256-OK",
+            Self::SizeCount => "SIZE+COUNT",
+        }
+    }
+}
+
+pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<ArchiveSummary> {
+    // Spec B D14/D15 core-level fail-closed guard(判定收口到 verify_disabled,与 CLI 共用)(ledger L-008)
+    if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
         anyhow::bail!(
             "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
              opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
@@ -54,12 +93,12 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     // 找当前可用备份盘
     let drive = match opts.drive_letter_override.as_deref() {
         Some(letter) => drive::info_by_letter(letter)?,
-        None => match drive::pick_active()? {
+        None => match drive::pick_active(cfg.min_drive_gb, reporter)? {
             Some(d) => d,
             None => {
                 reporter.error("未发现已初始化且未封盘的备份盘。");
                 reporter.info("插入空盘后运行：bftool init <盘符>（例：bftool init E）");
-                return Ok(());
+                return Ok(ArchiveSummary::default());
             }
         },
     };
@@ -68,7 +107,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
             "盘 {} ({}:) 已封盘，禁止写入。请换上一块未封盘的备份盘或初始化新盘。",
             drive.id, drive.letter
         ));
-        return Ok(());
+        return Ok(ArchiveSummary::default());
     }
 
     reporter.ok(&format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
@@ -119,7 +158,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     // 列出待归档项目
     if !cfg.ready_root.is_dir() {
         reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
-        return Ok(());
+        return Ok(ArchiveSummary::default());
     }
     let mut projects: Vec<_> = fs::read_dir(&cfg.ready_root)?
         .filter_map(|e| e.ok())
@@ -133,7 +172,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     });
     if projects.is_empty() {
         reporter.info("待备份 中没有待归档项目，结束。");
-        return Ok(());
+        return Ok(ArchiveSummary::default());
     }
     reporter.info(&format!(
         "发现 {} 个待归档项目（按编号升序处理）。",
@@ -141,6 +180,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     ));
 
     let mut handled = 0usize;
+    let mut failed = 0usize;
     for proj in &projects {
         if opts.limit > 0 && handled >= opts.limit {
             reporter.action(&format!(
@@ -182,12 +222,21 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
                     "项目 {} 处理时发生意外错误：{} → 跳过该项目，继续下一个。",
                     name, e
                 ));
-                append_manual(cfg, &name, &format!("未捕获异常：{}", e))?;
+                // 用 note_manual(非致命):台账写失败不再把整轮归档拖垮。(ledger L-018)
+                note_manual(cfg, reporter, &name, &format!("未捕获异常：{}", e));
+                failed += 1;
             }
         }
     }
-    reporter.ok("本轮结束。");
-    Ok(())
+    if failed > 0 {
+        reporter.error(&format!(
+            "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」)。",
+            handled, failed
+        ));
+    } else {
+        reporter.ok("本轮结束。");
+    }
+    Ok(ArchiveSummary { handled, failed })
 }
 
 enum HandleOutcome {
@@ -225,10 +274,52 @@ fn handle_one(
     let size = stats.bytes;
     let size_gb = size as f64 / 1024.0 / 1024.0 / 1024.0;
 
+    // 枚举/元数据错误:dry-run 与正式路径都要 fail-closed —— 此前只有 dry-run 报告,
+    // 正式路径靠后面 manifest::build 兜底但太晚,且容量按可能偏小的 size 误判。(ledger L-005)
+    if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
+        for e in &stats.enum_errors {
+            reporter.error(&format!("枚举失败：{}", e));
+        }
+        for e in &stats.metadata_errors {
+            reporter.error(&format!("读元数据失败：{}", e));
+        }
+        let msg = format!(
+            "统计不完整({} 个枚举错误 + {} 个 metadata 错误)→ 不归档。请先解决环境问题\
+             (权限拒绝？路径过长？被 AV 锁住？)再重试。",
+            stats.enum_errors.len(),
+            stats.metadata_errors.len()
+        );
+        reporter.error(&msg);
+        note_manual(cfg, reporter, &name, &msg);
+        return Ok(HandleOutcome::Skipped);
+    }
+
     // 重名保护
     let mut dest_name = name.clone();
     let catalog = paths::drive_catalog_path(&drive.root);
-    let dup_in_drive = catalog_has_project(&catalog, &name).unwrap_or(false);
+    let dup_in_drive = match catalog_has_project(&catalog, &name) {
+        Ok(b) => b,
+        Err(e) => {
+            // 本盘索引存在但读不出(损坏/非 UTF-8):fail-closed —— 不确定是否重名时,既不能覆盖
+            // 旧备份,也不该每轮用新时间戳名重复全量写盘(会塞满)。停下让用户修索引。(Phase 4 F-4;修订 L-017)
+            reporter.error(&format!(
+                "读本盘索引失败({}):无法判断是否重名 → 跳过本项目,避免覆盖旧备份或重复写盘。请检查 {}",
+                e,
+                catalog.display()
+            ));
+            note_manual(
+                cfg,
+                reporter,
+                &name,
+                &format!(
+                    "本盘索引读取失败:{} —— 请人工检查/修复 {}",
+                    e,
+                    catalog.display()
+                ),
+            );
+            return Ok(HandleOutcome::Skipped);
+        }
+    };
     if dup_in_drive {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
         dest_name = format!("{}_{}", name, stamp);
@@ -279,28 +370,13 @@ fn handle_one(
             "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
             name, stats.files, size_gb, drive.id
         ));
-        if !stats.enum_errors.is_empty() || !stats.metadata_errors.is_empty() {
-            for e in &stats.enum_errors {
-                reporter.warn(&format!("[演练] 枚举失败：{}", e));
-            }
-            for e in &stats.metadata_errors {
-                reporter.warn(&format!("[演练] 读元数据失败：{}", e));
-            }
-            reporter.warn(&format!(
-                "[演练] {} 项目的统计可能不完整 ({} 个枚举错误 + {} 个 metadata 错误)。\
-                 正式归档会因为同样的错误失败 —— 请先解决环境问题(权限拒绝？路径过长？\
-                 被 AV 锁住？)再去掉 --dry-run 跑。",
-                name,
-                stats.enum_errors.len(),
-                stats.metadata_errors.len()
-            ));
-        }
         return Ok(HandleOutcome::Done);
     }
 
     // Spec B 源压缩包测试 —— 在 dry_run check 之后,在生成 manifest 之前
     if let Some((kind, path)) = tester_opt {
-        let r = archive_test::test_folder(proj_path, (*kind, path.as_path()), reporter);
+        let r =
+            archive_test::test_folder(proj_path, (*kind, path.as_path()), opts.no_hash, reporter);
         if !r.ok {
             for detail in r.details() {
                 reporter.error(&detail);
@@ -342,6 +418,17 @@ fn handle_one(
         reporter,
     )?;
 
+    // 0 真实文件:不归档、不移源 —— 否则"什么都没备份"会被记成 SHA256-OK 成功并把源移走。(ledger L-003)
+    if src.count() == 0 {
+        reporter.warn(&format!("跳过(无可备份的真实文件):{}", name));
+        append_manual(
+            cfg,
+            &name,
+            "项目内没有可备份的真实文件(空目录或全是 cruft)——不归档、不移源,请人工确认。",
+        )?;
+        return Ok(HandleOutcome::Skipped);
+    }
+
     // 复制
     fs::create_dir_all(&dest).context("创建目标目录失败")?;
     reporter.info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
@@ -357,7 +444,7 @@ fn handle_one(
         reporter,
     )?;
     let d = manifest::diff(&src, &dst, !opts.no_hash);
-    if !d.ok {
+    if !d.ok() {
         reporter.error(&format!(
             "校验失败：{} → 不写索引、不移动源。",
             d.reasons.join("; ")
@@ -371,7 +458,16 @@ fn handle_one(
                 if src_p.exists() {
                     let dst_p = quar.join(rel);
                     if let Some(p) = dst_p.parent() {
-                        fs::create_dir_all(p).ok();
+                        if let Err(e) = fs::create_dir_all(p) {
+                            // 不 swallow:建隔离目录失败时明确归因、跳过该文件隔离。(ledger L-015)
+                            reporter.warn(&format!(
+                                "建隔离目录失败 {}:{} —— 坏文件 {} 未隔离,请手动检查。",
+                                p.display(),
+                                e,
+                                src_p.display()
+                            ));
+                            continue;
+                        }
                     }
                     if let Err(e) = fs::rename(&src_p, &dst_p) {
                         reporter.warn(&format!(
@@ -397,7 +493,7 @@ fn handle_one(
 
     // Spec B 目标压缩包测试 —— 在 SHA256 校验通过后、源复核之前
     if let Some((kind, path)) = tester_opt {
-        let r = archive_test::test_folder(&dest, (*kind, path.as_path()), reporter);
+        let r = archive_test::test_folder(&dest, (*kind, path.as_path()), opts.no_hash, reporter);
         if !r.ok {
             for detail in r.details() {
                 reporter.error(&detail);
@@ -409,7 +505,15 @@ fn handle_one(
                     if let Ok(rel) = bad.strip_prefix(&dest) {
                         let to = quar.join(rel);
                         if let Some(p) = to.parent() {
-                            fs::create_dir_all(p).ok();
+                            if let Err(e) = fs::create_dir_all(p) {
+                                reporter.warn(&format!(
+                                    "建隔离目录失败 {}:{} —— 坏压缩包 {} 未隔离,请手动检查。",
+                                    p.display(),
+                                    e,
+                                    bad.display()
+                                ));
+                                continue;
+                            }
                         }
                         if let Err(e) = fs::rename(bad, &to) {
                             reporter.warn(&format!("隔离失败 {}：{}", bad.display(), e));
@@ -456,11 +560,7 @@ fn handle_one(
     let utc = Utc::now().to_rfc3339();
     let src_bytes = src.total_bytes();
     let size_gbval = src_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    let verify_status = if opts.no_hash {
-        "SIZE+COUNT"
-    } else {
-        "SHA256-OK"
-    };
+    let verify_status = VerifyStatus::from_opts(opts.no_hash);
     let manifest_path =
         paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
     let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
@@ -484,12 +584,24 @@ fn handle_one(
     pending.write(&txn_path)?;
 
     // 移动源（先动它；失败抛错 → 不写索引；源留在 待备份 下次重做）
-    fs::rename(proj_path, &arch_dest).with_context(|| {
-        format!(
-            "移动源失败：{} → {}",
-            proj_path.display(),
-            arch_dest.display()
-        )
+    fs::rename(proj_path, &arch_dest).map_err(|e| {
+        // 跨卷 rename 在 Windows 返回 ERROR_NOT_SAME_DEVICE(17):给可操作的 fail-closed 提示。(ledger L-010)
+        if e.raw_os_error() == Some(17) {
+            anyhow::anyhow!(
+                "移动源失败:待备份({})与已备份({})不在同一磁盘卷,无法原子移动。\n\
+                 如何修:把 ready_root 与 archived_root 配到同一块盘(通常都在你的 SSD 上)。\n\
+                 项目仍留在 待备份,改好配置后会自动重做(目标盘上的副本+校验清单已写好)。",
+                proj_path.display(),
+                arch_dest.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "移动源失败:{} → {}: {}",
+                proj_path.display(),
+                arch_dest.display(),
+                e
+            )
+        }
     })?;
 
     // 写清单 + 本盘索引 + 全局索引
@@ -502,7 +614,7 @@ fn handle_one(
             file_count: src.count() as u64,
             total_bytes: src_bytes,
             archived_utc: utc.clone(),
-            verify_status: verify_status.to_string(),
+            verify_status: verify_status.token().to_string(),
             status: "Complete".to_string(),
             notes: if dup_in_drive {
                 format!("原名 {}", name)
@@ -521,7 +633,7 @@ fn handle_one(
             in_drive_path: format!("项目\\{}", dest_name),
             file_count: src.count() as u64,
             size_gb: size_gbval,
-            verify: verify_status.to_string(),
+            verify: verify_status.token().to_string(),
             manifest_path: rel_manifest,
         },
     )?;
@@ -590,6 +702,11 @@ fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
         .from_writer(file);
     wtr.serialize(row)?;
     wtr.flush()?;
+    // fsync:索引必须先于"删事务标记"真正落盘,否则断电后会出现"标记已删、索引未落"。(ledger L-001)
+    let f = wtr
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("刷新索引缓冲失败：{}", e))?;
+    durable::sync_file(&f).with_context(|| format!("索引刷盘失败：{}", path.display()))?;
     Ok(())
 }
 
@@ -607,6 +724,11 @@ fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
         .from_writer(file);
     wtr.serialize(row)?;
     wtr.flush()?;
+    // fsync:索引必须先于"删事务标记"真正落盘,否则断电后会出现"标记已删、索引未落"。(ledger L-001)
+    let f = wtr
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("刷新索引缓冲失败：{}", e))?;
+    durable::sync_file(&f).with_context(|| format!("索引刷盘失败：{}", path.display()))?;
     Ok(())
 }
 
@@ -625,6 +747,14 @@ fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// best-effort 记一行"需人工处理"台账:写失败只 warn,不向上抛 —— 台账写入故障
+/// 不该把"跳过该项目继续下一个"升级成整轮中止(此前 run 的 catch-all 用 `?` 会)。(ledger L-018)
+fn note_manual(cfg: &Config, reporter: &dyn Reporter, name: &str, why: &str) {
+    if let Err(e) = append_manual(cfg, name, why) {
+        reporter.warn(&format!("写「需人工处理」台账失败({}):{}", name, e));
+    }
 }
 
 fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
@@ -652,10 +782,25 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
-    let text = txn::PendingTxn::read_text(&path)?;
-    let pname = grab_field(&text, "项目").unwrap_or_default();
-    let psrc = grab_field(&text, "源名").unwrap_or_else(|| pname.clone());
-    let parch = grab_field(&text, "将移至").unwrap_or_default();
+    // 结构化读回(替代脆弱的 grab_field 标签抓取);解析失败 → 提示人工核对,不擅自删标记。(ledger L-022)
+    let pending = match txn::PendingTxn::read(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            reporter.error(&format!(
+                "→ 发现事务标记但解析失败({})。请人工核对该项目是否已归档,确认后删除：{}",
+                e,
+                path.display()
+            ));
+            return Ok(());
+        }
+    };
+    let pname = pending.project_dest_name.clone();
+    let psrc = if pending.project_src_name.is_empty() {
+        pname.clone()
+    } else {
+        pending.project_src_name.clone()
+    };
+    let parch = pending.move_to.clone();
     let in_ready = !psrc.is_empty() && cfg.ready_root.join(&psrc).exists();
     let moved = !parch.is_empty() && Path::new(&parch).exists();
     let global = paths::system_global_catalog(&cfg.system_root);
@@ -676,24 +821,11 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
         ));
     } else {
         reporter.error(&format!(
-            "→ 无法自动判定（源不在待备份、目标也未确认）。请按以下信息人工核对，标记保留：\n{}",
-            text
+            "→ 无法自动判定（源不在待备份、目标也未确认）。请人工核对事务标记后处理,标记保留：{}",
+            path.display()
         ));
     }
     Ok(())
-}
-
-fn grab_field(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        // 兼容 "key:" 和 "key  :" 写法（PowerShell 旧版用全角/空格混排）
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(key) {
-            let r = rest.trim_start();
-            let r = r.trim_start_matches([':', '：']).trim();
-            return Some(r.to_string());
-        }
-    }
-    None
 }
 
 fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
@@ -762,7 +894,14 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target).ok();
         } else if entry.file_type().is_file() {
-            // 已存在且大小一致 → 视为已传，跳过（与 robocopy 的默认行为一致）
+            // 原子复制的临时名;先清理可能残留的孤儿 .part(上次中断留下),避免在备份盘累积。(Phase 4 F-3)
+            let part = {
+                let mut s = target.clone().into_os_string();
+                s.push(".bftool-part");
+                PathBuf::from(s)
+            };
+            let _ = fs::remove_file(&part); // best-effort:失败也会被下面 fs::copy 覆盖
+                                            // 已存在且大小一致 → 视为已传，跳过（断点续传）
             if let (Ok(meta_src), Ok(meta_dst)) = (path.metadata(), target.metadata()) {
                 if meta_src.len() == meta_dst.len() {
                     continue;
@@ -771,8 +910,20 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
             if let Some(p) = target.parent() {
                 fs::create_dir_all(p).ok();
             }
-            fs::copy(path, &target)
-                .with_context(|| format!("复制失败：{} → {}", path.display(), target.display()))?;
+            // 原子复制:写 <target>.bftool-part → fsync → rename。崩溃只会留下 .part
+            // (被当 cruft 忽略、下轮重写),不会留下"大小对得上的半成品"被续传误跳过。(ledger L-014)
+            fs::copy(path, &part)
+                .with_context(|| format!("复制失败：{} → {}", path.display(), part.display()))?;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .with_context(|| format!("打开临时文件刷盘失败：{}", part.display()))?;
+            f.sync_all()
+                .with_context(|| format!("临时文件刷盘失败：{}", part.display()))?;
+            drop(f);
+            fs::rename(&part, &target).with_context(|| {
+                format!("提交复制失败：{} → {}", part.display(), target.display())
+            })?;
         }
     }
     if !errors.is_empty() {
@@ -797,4 +948,184 @@ fn leading_number(name: &str) -> Option<u64> {
 fn leading_digits(name: &str) -> String {
     let s = name.trim_start();
     s.chars().take_while(|c| c.is_ascii_digit()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reporter::NoopReporter;
+
+    /// 搭一个临时"世界":ready/archived/sys + 一块假备份盘,供 handle_one 集成测试复用。
+    fn temp_world() -> (tempfile::TempDir, Config, DriveInfo) {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let cfg = Config {
+            ready_root: base.join("ready"),
+            archived_root: base.join("archived"),
+            system_root: base.join("sys"),
+            reserve_gb: 0,
+            stable_minutes: 0, // 不卡稳定性
+            min_drive_gb: 0,
+            name_prefix: "备份".into(),
+            test_archives: false,
+            winrar_path: std::path::PathBuf::new(),
+            bandizip_path: std::path::PathBuf::new(),
+            seven_zip_path: std::path::PathBuf::new(),
+        };
+        fs::create_dir_all(&cfg.ready_root).unwrap();
+        fs::create_dir_all(&cfg.archived_root).unwrap();
+        fs::create_dir_all(&cfg.system_root).unwrap();
+        let drive_root = base.join("drive");
+        fs::create_dir_all(&drive_root).unwrap();
+        let drive = DriveInfo {
+            letter: "T".into(),
+            root: drive_root,
+            id: "备份1".into(),
+            sealed: false,
+            free_bytes: 1 << 40,
+            total_bytes: 1 << 40,
+        };
+        (d, cfg, drive)
+    }
+
+    fn test_opts() -> Options {
+        Options {
+            dry_run: false,
+            no_hash: false,
+            limit: 0,
+            drive_letter_override: None,
+            no_test_archives: false,
+        }
+    }
+
+    struct RecordingReporter(std::sync::Mutex<Vec<String>>);
+    impl crate::reporter::Reporter for RecordingReporter {
+        fn log(&self, level: crate::reporter::LogLevel, msg: &str) {
+            self.0.lock().unwrap().push(format!("{:?} {}", level, msg));
+        }
+        fn progress_bytes(&self, _l: &str, _t: u64) -> Box<dyn crate::reporter::ProgressHandle> {
+            struct P;
+            impl crate::reporter::ProgressHandle for P {
+                fn inc(&mut self, _: u64) {}
+                fn finish(&mut self) {}
+            }
+            Box::new(P)
+        }
+    }
+
+    // ── L-003: 空源(0 真实文件)不被记成功、不移源 ──
+    #[test]
+    fn handle_one_empty_source_does_not_move() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001empty");
+        fs::create_dir_all(&proj).unwrap();
+        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
+        assert!(matches!(outcome, HandleOutcome::Skipped), "空源应 Skipped");
+        assert!(proj.is_dir(), "空源不应被移走(应仍在 待备份)");
+    }
+
+    // ── happy-path:正常项目完整走通 复制→校验→提交→移源(覆盖 L-001 fsync 提交链路) ──
+    #[test]
+    fn handle_one_happy_path_archives_and_moves() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        fs::write(proj.join("b.bin"), b"world!!").unwrap();
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        let outcome = handle_one(&cfg, &rep, &drive, &proj, &test_opts(), None).unwrap();
+        let log = rep.0.lock().unwrap().join("\n");
+        assert!(
+            matches!(outcome, HandleOutcome::Done),
+            "正常项目应 Done;日志:\n{}",
+            log
+        );
+        assert!(!proj.exists(), "源应已移到 已备份");
+        assert!(cfg.archived_root.join("001proj").is_dir(), "源应在 已备份");
+        assert!(
+            paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .is_dir(),
+            "目标盘应有项目副本"
+        );
+        assert!(
+            paths::drive_manifest_dir(&drive.root)
+                .join("001proj.sha256.csv")
+                .is_file(),
+            "应写出校验清单"
+        );
+    }
+
+    // ── L-014: copy_folder 原子复制,内容正确且不遗留 .bftool-part ──
+    #[test]
+    fn copy_folder_atomic_no_part_left() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("t");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"hello").unwrap();
+        fs::write(src.join("sub").join("b.bin"), b"xyz").unwrap();
+        copy_folder(&src, &dst, &NoopReporter).unwrap();
+        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(dst.join("sub").join("b.bin")).unwrap(), b"xyz");
+        assert!(!dst.join("a.txt.bftool-part").exists(), "不应遗留 .part");
+    }
+
+    // ── L-017 修订(Phase 4 F-4):本盘索引损坏 → fail-closed Skipped,不覆盖也不重复写盘 ──
+    #[test]
+    fn handle_one_corrupt_drive_catalog_fails_closed() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        let cat = paths::drive_catalog_path(&drive.root);
+        if let Some(p) = cat.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(&cat, [0xff, 0xfe, 0x00]).unwrap(); // 非 UTF-8 → 读索引必失败
+        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None).unwrap();
+        assert!(
+            matches!(outcome, HandleOutcome::Skipped),
+            "索引损坏应 fail-closed Skipped"
+        );
+        assert!(proj.is_dir(), "不应移源");
+        assert!(
+            !paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .exists(),
+            "不应写盘"
+        );
+    }
+
+    // ── L-018: 台账写失败不致命(note_manual 返回 () 不向上抛) ──
+    #[test]
+    fn note_manual_infallible_when_system_root_unwritable() {
+        let (_d, mut cfg, _drive) = temp_world();
+        let bogus = cfg.system_root.join("not_a_dir");
+        fs::write(&bogus, b"x").unwrap();
+        cfg.system_root = bogus; // system_root 指向文件 → 台账写入必失败
+                                 // 关键:返回 () 且不 panic —— 写失败只 warn,不会中止整轮归档
+        note_manual(&cfg, &NoopReporter, "proj", "校验失败：xxx");
+    }
+
+    // ── L-020: VerifyStatus token 稳定且单一来源 ──
+    #[test]
+    fn verify_status_tokens() {
+        assert_eq!(VerifyStatus::from_opts(false).token(), "SHA256-OK");
+        assert_eq!(VerifyStatus::from_opts(true).token(), "SIZE+COUNT");
+    }
+
+    // ── L-008: 无校验判定单一来源,core/cli 共用 verify_disabled ──
+    #[test]
+    fn verify_disabled_truth_table() {
+        // no_hash=false → 始终有 SHA256 兜底,绝不算无校验
+        assert!(!verify_disabled(false, true, false));
+        assert!(!verify_disabled(false, false, true));
+        // no_hash=true 且 archive test 开启 → 有压缩包测试兜底,允许
+        assert!(!verify_disabled(true, true, false));
+        // no_hash=true 且 test_archives=false → 无校验,禁止
+        assert!(verify_disabled(true, false, false));
+        // no_hash=true 且 no_test_archives=true → 无校验,禁止
+        assert!(verify_disabled(true, true, true));
+    }
 }

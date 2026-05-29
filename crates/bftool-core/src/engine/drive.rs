@@ -80,10 +80,36 @@ pub fn scan_mounted() -> Result<Vec<DriveInfo>> {
     Ok(out)
 }
 
-/// 返回唯一一块未封盘的备份盘；多块返回错误；零块返回 None。
-pub fn pick_active() -> Result<Option<DriveInfo>> {
-    let all = scan_mounted()?;
-    let usable: Vec<_> = all.into_iter().filter(|d| !d.sealed).collect();
+/// 从一组盘里挑出"可写入"的(未封盘且容量 ≥ min_drive_gb),并把"过小被忽略"的单独返回。
+/// 纯函数便于测试;容量过滤是「防误抓 U 盘」安全闸 —— 此前 min_drive_gb 形同虚设。(ledger L-006)
+fn usable_drives(all: Vec<DriveInfo>, min_drive_gb: u64) -> (Vec<DriveInfo>, Vec<DriveInfo>) {
+    let min_bytes = min_drive_gb.saturating_mul(1024 * 1024 * 1024);
+    let mut usable = Vec::new();
+    let mut too_small = Vec::new();
+    for d in all.into_iter().filter(|d| !d.sealed) {
+        if d.total_bytes >= min_bytes {
+            usable.push(d);
+        } else {
+            too_small.push(d);
+        }
+    }
+    (usable, too_small)
+}
+
+/// 返回唯一一块未封盘且容量达标的备份盘；多块返回错误；零块返回 None。
+/// 容量过滤(min_drive_gb)是防误抓 U 盘/SD 卡的安全闸。(ledger L-006)
+pub fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
+    let (usable, too_small) = usable_drives(scan_mounted()?, min_drive_gb);
+    for d in &too_small {
+        reporter.warn(&format!(
+            "忽略疑似过小的盘 {} ({}:) {:.0}GB(低于最小 {}GB)—— 防误抓 U 盘/SD 卡。\
+             若确需用它,把配置 min_drive_gb 调低后重试。",
+            d.id,
+            d.letter,
+            d.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+            min_drive_gb
+        ));
+    }
     if usable.len() > 1 {
         let names = usable
             .iter()
@@ -99,9 +125,13 @@ pub fn pick_active() -> Result<Option<DriveInfo>> {
 }
 
 fn drive_letter_of(p: &Path) -> Option<String> {
+    // 字符安全:对 UNC(\\server)、卷 GUID、多字节首字符的挂载点返回 None 而非 panic。
+    // 旧实现 `&s[1..2]`/`s[..1]` 按字节切片,首字符是多字节字符时会 panic。(ledger L-023)
     let s = p.to_string_lossy();
-    if s.len() >= 2 && &s[1..2] == ":" {
-        Some(s[..1].to_uppercase())
+    let mut it = s.chars();
+    let first = it.next()?;
+    if first.is_ascii_alphabetic() && it.next() == Some(':') {
+        Some(first.to_ascii_uppercase().to_string())
     } else {
         None
     }
@@ -214,13 +244,18 @@ pub fn parse_drive_number(prefix: &str, id: &str) -> Option<u32> {
     id.strip_prefix(prefix).and_then(|s| s.parse::<u32>().ok())
 }
 
+/// 下一个编号 = 所有已知「备份N」里的最大值 + 1(空 → 1)。纯函数,保证单调不碰撞。(ledger L-027)
+fn next_number(found: &[u32]) -> u32 {
+    found.iter().copied().max().unwrap_or(0) + 1
+}
+
 /// 计算下一个可用「备份N」编号 = max(序号文件, 全局索引里出现过的「备份N」, 当前挂载盘里的「备份N」) + 1
 fn next_drive_number(cfg: &Config) -> Result<u32> {
-    let mut max = 0u32;
+    let mut found: Vec<u32> = Vec::new();
     let seq_file = paths::system_drive_seq(&cfg.system_root);
     if let Ok(text) = fs::read_to_string(&seq_file) {
         if let Ok(n) = text.trim().parse::<u32>() {
-            max = max.max(n);
+            found.push(n);
         }
     }
     let gc = paths::system_global_catalog(&cfg.system_root);
@@ -232,7 +267,7 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
                 for rec in rdr.records().flatten() {
                     if let Some(v) = rec.get(col) {
                         if let Some(n) = parse_drive_number(&cfg.name_prefix, v.trim()) {
-                            max = max.max(n);
+                            found.push(n);
                         }
                     }
                 }
@@ -241,10 +276,10 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
     }
     for d in scan_mounted()? {
         if let Some(n) = parse_drive_number(&cfg.name_prefix, &d.id) {
-            max = max.max(n);
+            found.push(n);
         }
     }
-    Ok(max + 1)
+    Ok(next_number(&found))
 }
 
 fn bump_drive_seq(cfg: &Config, n: u32) -> Result<()> {
@@ -305,12 +340,8 @@ fn system_drive_letter() -> String {
 }
 
 fn qualifier_letter(p: &Path) -> Option<String> {
-    let s = p.to_string_lossy();
-    if s.len() >= 2 && &s[1..2] == ":" {
-        Some(s[..1].to_uppercase())
-    } else {
-        None
-    }
+    // 与 drive_letter_of 同义,直接复用避免重复的盘符解析。(ledger L-023 / TD-06)
+    drive_letter_of(p)
 }
 
 /// 把盘符字符串规范化为根路径 PathBuf。
@@ -358,4 +389,84 @@ pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
         free_bytes: free,
         total_bytes: total,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn di(letter: &str, total_gb: u64, sealed: bool) -> DriveInfo {
+        let bytes = total_gb * 1024 * 1024 * 1024;
+        DriveInfo {
+            letter: letter.into(),
+            root: PathBuf::from(format!("{}:\\", letter)),
+            id: format!("备份{}", letter),
+            sealed,
+            free_bytes: bytes,
+            total_bytes: bytes,
+        }
+    }
+
+    // ── L-006: min_drive_gb 真正生效,排除过小盘(防误抓 U 盘) ──
+    #[test]
+    fn usable_drives_excludes_below_min_size() {
+        let all = vec![di("F", 8, false), di("E", 500, false)];
+        let (usable, too_small) = usable_drives(all, 200);
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].letter, "E");
+        assert_eq!(too_small.len(), 1);
+        assert_eq!(too_small[0].letter, "F");
+    }
+
+    #[test]
+    fn usable_drives_excludes_sealed_without_marking_too_small() {
+        let all = vec![di("E", 500, true)];
+        let (usable, too_small) = usable_drives(all, 200);
+        assert!(usable.is_empty());
+        assert!(too_small.is_empty(), "已封盘不应被算作'过小'");
+    }
+
+    #[test]
+    fn usable_drives_keeps_large_unsealed() {
+        let all = vec![di("E", 500, false)];
+        let (usable, too_small) = usable_drives(all, 200);
+        assert_eq!(usable.len(), 1);
+        assert!(too_small.is_empty());
+    }
+
+    #[test]
+    fn usable_drives_at_exact_threshold_is_usable() {
+        let all = vec![di("E", 200, false)];
+        let (usable, _) = usable_drives(all, 200);
+        assert_eq!(usable.len(), 1, "恰好等于阈值应可用");
+    }
+
+    // ── L-023: 盘符解析字符安全,不对多字节首字符/UNC panic ──
+    #[test]
+    fn drive_letter_of_is_char_safe() {
+        assert_eq!(drive_letter_of(Path::new("E:\\")), Some("E".to_string()));
+        assert_eq!(drive_letter_of(Path::new("c:\\x")), Some("C".to_string()));
+        assert_eq!(drive_letter_of(Path::new(r"\\server\share")), None);
+        assert_eq!(drive_letter_of(Path::new("中:\\x")), None); // 多字节首字符:不 panic
+        assert_eq!(drive_letter_of(Path::new("")), None);
+        // qualifier_letter 复用 drive_letter_of
+        assert_eq!(qualifier_letter(Path::new("E:\\")), Some("E".to_string()));
+    }
+
+    // ── L-027: 盘编号单调不碰撞 ──
+    #[test]
+    fn next_number_is_max_plus_one() {
+        assert_eq!(next_number(&[]), 1);
+        assert_eq!(next_number(&[1, 2, 3]), 4);
+        assert_eq!(next_number(&[5, 2, 5]), 6); // 乱序 + 重复
+        assert_eq!(next_number(&[10]), 11);
+    }
+
+    #[test]
+    fn parse_drive_number_basic() {
+        assert_eq!(parse_drive_number("备份", "备份12"), Some(12));
+        assert_eq!(parse_drive_number("备份", "备份"), None);
+        assert_eq!(parse_drive_number("备份", "X3"), None);
+        assert_eq!(parse_drive_number("备份", "备份0"), Some(0));
+    }
 }

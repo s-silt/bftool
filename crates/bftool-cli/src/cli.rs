@@ -36,7 +36,7 @@ use bftool_core::reporter::Reporter;
 "
 )]
 pub struct Cli {
-    /// 配置文件路径；不传则按当前目录 → 可执行文件目录 → %APPDATA%\bftool\config.toml 顺序查找
+    /// 配置文件路径；不传则按 当前目录\bftool.toml → 可执行文件目录\bftool.toml → %APPDATA%\bftool\config.toml 顺序查找
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
@@ -86,7 +86,7 @@ pub enum Command {
         no_test_archives: bool,
     },
 
-    /// 初始化一块空盘为下一个「备份N」（写本盘信息、设卷标）
+    /// 初始化一块空盘为下一个「备份N」（写本盘信息）
     Init {
         /// 要初始化的盘符（例如 E、F）
         drive: String,
@@ -146,9 +146,10 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                 );
             }
 
-            // Batch 3.5：--unsafe-no-hash + 任何方式关 archive test = 几乎无校验
-            let effective_test_archives = cfg.test_archives && !no_test_archives;
-            if unsafe_no_hash && !effective_test_archives {
+            // Batch 3.5：--unsafe-no-hash + 任何方式关 archive test = 几乎无校验。
+            // 判定收口到 core 的 verify_disabled,与 core::run 守卫同一真值(防漂移)。(ledger L-008)
+            if engine::archive::verify_disabled(unsafe_no_hash, cfg.test_archives, no_test_archives)
+            {
                 bail!(
                     "拒绝运行：--unsafe-no-hash 与「压缩包测试关闭」不能同时存在。\n\
                      同时关掉 SHA256 内容校验和压缩包内部测试 → 只剩文件数 + 大小 + 修改时间，\n\
@@ -167,7 +168,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             if let Some(r) = reserve_gb {
                 cfg.reserve_gb = r;
             }
-            engine::archive::run(
+            let summary = engine::archive::run(
                 &cfg,
                 reporter,
                 engine::archive::Options {
@@ -178,12 +179,32 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                     drive_letter_override: drive,
                     no_test_archives,
                 },
-            )
+            )?;
+            if summary.failed > 0 {
+                bail!(
+                    "{} 个项目未成功归档(详见上方与「需人工处理.txt」);其余 {} 个已完成。\n\
+                     (本命令以非零退出码结束,便于脚本/计划任务识别失败。)",
+                    summary.failed,
+                    summary.handled
+                );
+            }
+            Ok(())
         }
         Some(Command::Init { drive, id, force }) => {
             engine::drive::init(&cfg, reporter, &drive, id.as_deref(), force)
         }
-        Some(Command::Verify { drive }) => engine::verify::run(&cfg, reporter, drive.as_deref()),
+        Some(Command::Verify { drive }) => {
+            let report = engine::verify::run(&cfg, reporter, drive.as_deref())?;
+            if report.has_corruption() {
+                bail!(
+                    "复查发现 {} 处损坏/缺失/大小不符 —— 本盘完整性有问题。\n\
+                     请用其它副本恢复受损项目,或重做本盘。\n\
+                     (本命令以非零退出码结束,便于定期复查脚本/计划任务识别坏盘。)",
+                    report.bad
+                );
+            }
+            Ok(())
+        }
         Some(Command::Find { keyword }) => engine::find::run(&cfg, &keyword),
         Some(Command::Drives) => engine::drive::list_mounted(&cfg, reporter),
         Some(Command::ConfigShow) => {

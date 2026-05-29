@@ -5,16 +5,20 @@
 //! - drive.rs    ── 找盘 / 初始化 / 列出 / 序号管理
 //! - manifest.rs ── 文件清单生成（Rel/Size/Hash/Mtime）+ 比对
 //! - archive.rs  ── 主归档流程
+//! - archive_test.rs ── 压缩包内部结构测试（7-Zip/WinRAR/Bandizip 跑 t）
+//! - cruft.rs    ── OS 杂文件名单 + 共享 cruft-aware walker
 //! - verify.rs   ── 复查（重算哈希、比对清单）
 //! - find.rs     ── 全局索引查询
 //! - safety.rs   ── 路径安全检查 / 稳定性检测
 //! - txn.rs      ── 事务标记（进行中事务.txt）
 //! - paths.rs    ── 盘内/系统路径常量与构造
+//! - durable.rs  ── 写文件后 fsync,崩溃/断电后真正落盘
 
 pub mod archive;
 pub mod archive_test;
 pub mod cruft;
 pub mod drive;
+pub mod durable;
 pub mod find;
 pub mod manifest;
 pub mod paths;

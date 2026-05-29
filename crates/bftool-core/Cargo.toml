@@ -23,3 +23,7 @@ csv.workspace     = true
 chrono.workspace  = true
 toml.workspace    = true
 sysinfo.workspace = true
+
+[dev-dependencies]
+# fs 相关回归测试用临时目录(review+修复 campaign 引入)
+tempfile = "3"

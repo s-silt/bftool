@@ -12,7 +12,28 @@ use crate::config::Config;
 use crate::engine::{cruft, drive, paths};
 use crate::reporter::Reporter;
 
-pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) -> Result<()> {
+/// 复查结果。`bad>0` = 本盘完整性有问题(损坏/缺失/大小不符/枚举失败)。
+/// 返回给调用方:CLI 据此设非零退出码(cron/计划任务能识别坏盘),GUI 可读字段。
+/// 此前 `run` 永远返回 `Ok(())`,损坏只走 reporter 文本 → 自动化层看不到。(ledger L-007)
+#[derive(Debug, Default, Clone)]
+pub struct VerifyReport {
+    pub checked: u64,
+    pub bad: u64,
+    pub extra: u64,
+}
+
+impl VerifyReport {
+    /// 是否发现损坏/缺失。多余文件(extra)只是警告,不算数据损坏。
+    pub fn has_corruption(&self) -> bool {
+        self.bad > 0
+    }
+}
+
+pub fn run(
+    cfg: &Config,
+    reporter: &dyn Reporter,
+    drive_letter: Option<&str>,
+) -> Result<VerifyReport> {
     let drives = drive::scan_mounted()?;
     if drives.is_empty() {
         bail!("未发现已初始化的备份盘。");
@@ -49,18 +70,38 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
         target.id, target.letter
     ));
 
-    let mut checked: u64 = 0;
-    let mut bad: u64 = 0;
-    let mut extra: u64 = 0;
+    let projects_dir = paths::drive_projects_dir(&target.root);
+    let _ = cfg; // 当前 verify 不需要 cfg；保留参数便于将来加 --full 整库交叉核对
 
-    let mut manifest_files: Vec<_> = fs::read_dir(&mdir)?
+    let report = verify_tree(&mdir, &projects_dir, reporter)?;
+
+    let summary = format!(
+        "复查完成：检查 {} 个文件，损坏/缺失/大小/枚举问题 {} 个,清单外多余 {} 个。",
+        report.checked, report.bad, report.extra
+    );
+    if report.bad > 0 {
+        reporter.error(&summary);
+    } else if report.extra > 0 {
+        reporter.warn(&summary);
+    } else {
+        reporter.ok(&summary);
+    }
+    if report.extra > 0 {
+        reporter.info("（多余文件不会自动删除；如确认无用可人工清理。）");
+    }
+    Ok(report)
+}
+
+/// 按"校验清单目录 + 项目目录"做复查,不依赖挂载盘检测 —— 便于测试。
+/// 覆盖四类损坏:缺失 / 大小不符 / 内容(SHA)不符 / 枚举失败;另统计清单外多余文件。
+fn verify_tree(mdir: &Path, projects_dir: &Path, reporter: &dyn Reporter) -> Result<VerifyReport> {
+    let mut report = VerifyReport::default();
+
+    let mut manifest_files: Vec<_> = fs::read_dir(mdir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".sha256.csv"))
         .collect();
     manifest_files.sort_by_key(|e| e.file_name());
-
-    let projects_dir = paths::drive_projects_dir(&target.root);
-    let _ = cfg; // 当前 verify 不需要 cfg；保留参数便于将来加 --full 整库交叉核对
 
     for mf in &manifest_files {
         let stem = mf.file_name();
@@ -88,47 +129,55 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
             let rel = rec.get(i_rel).unwrap_or("").to_string();
             // 第七轮 P2:用 rel_has_cruft_component 检查全部路径段,覆盖 cruft 目录下的旧条目
             if cruft::rel_has_cruft_component(&rel) {
-                // legacy cruft:旧清单有这条,但 Batch 3 后我们不再关心 cruft
-                // → 不加入 expected,不 check 存在/大小/哈希
                 continue;
             }
+            // size 为 Option:列缺失/不可解析 = 未知(不校验大小);存在(含 0)就精确比对。
+            // 旧实现的 `size>0 &&` 守卫会让"清单记 0、实际非 0"的真实 0 字节文件被篡改时漏判。(ledger L-013)
             let size = i_size
                 .and_then(|c| rec.get(c))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+                .and_then(|s| s.parse::<u64>().ok());
             let hash = i_hash.and_then(|c| rec.get(c)).unwrap_or("").to_string();
-            expected.insert(rel.clone(), (size, hash.clone()));
+            expected.insert(rel.clone(), (size.unwrap_or(0), hash.clone()));
 
             let f = proj_dir.join(&rel);
-            checked += 1;
+            report.checked += 1;
             if !f.is_file() {
                 reporter.error(&format!("  缺失: {}", rel));
-                bad += 1;
+                report.bad += 1;
                 continue;
             }
             let meta = match fs::metadata(&f) {
                 Ok(m) => m,
                 Err(e) => {
                     reporter.error(&format!("  无法读元数据 {}: {}", rel, e));
-                    bad += 1;
+                    report.bad += 1;
                     continue;
                 }
             };
-            if size > 0 && meta.len() != size {
-                reporter.error(&format!("  大小不一致: {}", rel));
-                bad += 1;
+            // 清单项既无 Size 也无 Hash → 无任何可校验属性 → fail-closed,不能只查存在性就放过。
+            // (Phase 4 对抗复审 F-01/F-6:防"清单损坏/半截 → verify 仍报全绿 exit 0"。)
+            if size.is_none() && hash.is_empty() {
+                reporter.error(&format!("  清单项缺 Size 且缺 Hash,无法校验: {}", rel));
+                report.bad += 1;
                 continue;
+            }
+            if let Some(sz) = size {
+                if meta.len() != sz {
+                    reporter.error(&format!("  大小不一致: {}", rel));
+                    report.bad += 1;
+                    continue;
+                }
             }
             if !hash.is_empty() {
                 match sha256_hex(&f) {
                     Ok(h) if h == hash => {}
                     Ok(_) => {
                         reporter.error(&format!("  损坏/不一致: {}", rel));
-                        bad += 1;
+                        report.bad += 1;
                     }
                     Err(e) => {
                         reporter.error(&format!("  读取失败 {}: {}", rel, e));
-                        bad += 1;
+                        report.bad += 1;
                     }
                 }
             }
@@ -136,13 +185,14 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
 
         // 报告清单外的多余文件（不删除）
         if proj_dir.is_dir() {
-            let base = proj_dir.canonicalize().unwrap_or(proj_dir.clone());
+            // 同 L-044:不 canonicalize,否则 `\\?\` 前缀与 walk 路径失配 → extra 全部误报。
+            let base = proj_dir.clone();
             for entry in cruft::walk(&proj_dir) {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(err) => {
                         reporter.error(&format!("  枚举失败: {}", err));
-                        bad += 1;
+                        report.bad += 1;
                         continue;
                     }
                 };
@@ -156,27 +206,13 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, drive_letter: Option<&str>) ->
                     .unwrap_or_default();
                 if !expected.contains_key(&rel) {
                     reporter.warn(&format!("  多余(清单外): {}", rel));
-                    extra += 1;
+                    report.extra += 1;
                 }
             }
         }
     }
 
-    let summary = format!(
-        "复查完成：检查 {} 个文件，损坏/缺失/大小/枚举问题 {} 个,清单外多余 {} 个。",
-        checked, bad, extra
-    );
-    if bad > 0 {
-        reporter.error(&summary);
-    } else if extra > 0 {
-        reporter.warn(&summary);
-    } else {
-        reporter.ok(&summary);
-    }
-    if extra > 0 {
-        reporter.info("（多余文件不会自动删除；如确认无用可人工清理。）");
-    }
-    Ok(())
+    Ok(report)
 }
 
 fn sha256_hex(path: &Path) -> Result<String> {
@@ -198,4 +234,146 @@ fn sha256_hex(path: &Path) -> Result<String> {
         write!(&mut s, "{:02X}", b).ok();
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reporter::NoopReporter;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    fn sha_of(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let out = h.finalize();
+        let mut s = String::new();
+        for b in out {
+            use std::fmt::Write as _;
+            write!(&mut s, "{:02X}", b).ok();
+        }
+        s
+    }
+
+    /// 在 dir 下铺一个最小"盘":校验清单 m/proj.sha256.csv + 项目 p/proj/<files>。
+    /// 返回 (mdir, projects_dir);projects_dir 用**非 canonical** 临时路径 —— 正是 L-044
+    /// 修复前会让 extra 检测把全部文件误报为"多余"的场景。
+    fn setup(
+        dir: &Path,
+        rows: &[(&str, u64, &str)],
+        files: &[(&str, &[u8])],
+    ) -> (PathBuf, PathBuf) {
+        let mdir = dir.join("m");
+        let pdir = dir.join("p");
+        let proj = pdir.join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        let mut csv = String::from("Rel,Size,Hash\n");
+        for (rel, size, hash) in rows {
+            csv.push_str(&format!("{},{},{}\n", rel, size, hash));
+        }
+        fs::write(mdir.join("proj.sha256.csv"), csv).unwrap();
+        for (rel, bytes) in files {
+            let p = proj.join(rel);
+            if let Some(par) = p.parent() {
+                fs::create_dir_all(par).unwrap();
+            }
+            let mut f = fs::File::create(&p).unwrap();
+            f.write_all(bytes).unwrap();
+        }
+        (mdir, pdir)
+    }
+
+    #[test]
+    fn verify_tree_clean_reports_no_bad() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        let (mdir, pdir) = setup(
+            d.path(),
+            &[("a.txt", 5, &sha_of(content))],
+            &[("a.txt", content)],
+        );
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0);
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.extra, 0);
+    }
+
+    #[test]
+    fn verify_tree_detects_missing_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (mdir, pdir) = setup(d.path(), &[("a.txt", 5, &sha_of(b"hello"))], &[]);
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1);
+        assert!(r.has_corruption());
+    }
+
+    #[test]
+    fn verify_tree_detects_size_mismatch() {
+        let d = tempfile::tempdir().unwrap();
+        // 清单 size=5,实际 3 字节
+        let (mdir, pdir) = setup(d.path(), &[("a.txt", 5, "")], &[("a.txt", b"abc")]);
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1);
+    }
+
+    #[test]
+    fn verify_tree_detects_content_change_same_size() {
+        let d = tempfile::tempdir().unwrap();
+        // 清单记 "hello" 的 hash,实际是等长 "world":size 不变,只能靠 SHA 抓
+        let (mdir, pdir) = setup(
+            d.path(),
+            &[("a.txt", 5, &sha_of(b"hello"))],
+            &[("a.txt", b"world")],
+        );
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1, "等长内容篡改必须靠 SHA 抓出");
+    }
+
+    // ── L-013: 清单记 size=0 不能跳过大小校验 ──
+    #[test]
+    fn verify_tree_detects_tampered_zero_byte_file() {
+        let d = tempfile::tempdir().unwrap();
+        // 清单记 size=0、无 hash(no_hash 模式),但实际文件被塞了内容
+        let (mdir, pdir) = setup(d.path(), &[("z.txt", 0, "")], &[("z.txt", b"surprise")]);
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1, "清单记 0 字节、实际非 0 必须报大小不一致");
+    }
+
+    #[test]
+    fn verify_tree_real_zero_byte_file_is_ok() {
+        let d = tempfile::tempdir().unwrap();
+        let (mdir, pdir) = setup(d.path(), &[("z.txt", 0, "")], &[("z.txt", b"")]);
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "真实 0 字节文件应通过");
+    }
+
+    // ── Phase 4 F-01/F-6: 清单缺 Size 且缺 Hash → 无可校验属性 → fail-closed ──
+    #[test]
+    fn verify_tree_unverifiable_row_is_bad() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // Size 不可解析(abc)+ Hash 空 → 该行无任何可校验属性
+        fs::write(mdir.join("proj.sha256.csv"), "Rel,Size,Hash\nz.txt,abc,\n").unwrap();
+        fs::write(proj.join("z.txt"), b"whatever").unwrap();
+        let r = verify_tree(&mdir, &d.path().join("p"), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 1, "Size 不可解析 + 无 Hash 应判 bad(fail-closed)");
+    }
+
+    #[test]
+    fn verify_tree_counts_extra_files() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        let (mdir, pdir) = setup(
+            d.path(),
+            &[("a.txt", 5, &sha_of(content))],
+            &[("a.txt", content), ("extra.txt", b"x")],
+        );
+        let r = verify_tree(&mdir, &pdir, &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0);
+        assert_eq!(r.extra, 1);
+    }
 }

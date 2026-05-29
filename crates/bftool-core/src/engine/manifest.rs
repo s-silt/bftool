@@ -1,4 +1,4 @@
-//! 项目清单：枚举文件夹下所有「真实文件」（不进 junction、跳过 reparse point），
+//! 项目清单：枚举文件夹下所有「真实文件」（follow_links=false,不跟随目录 symlink/junction），
 //! 算大小 / SHA256 / 修改时间。复制前生成源清单，复制后生成目标清单做三重比对。
 
 use anyhow::{Context, Result};
@@ -21,9 +21,9 @@ pub struct Entry {
     pub rel: String,
     #[serde(rename = "Size")]
     pub size: u64,
-    /// SHA256 大写十六进制；`no_hash` 模式下为空串
+    /// SHA256 大写十六进制；`no_hash` 模式下为 `None`(不再用空串当"没算哈希"的哨兵)。(ledger L-019)
     #[serde(rename = "Hash")]
-    pub hash: String,
+    pub hash: Option<String>,
     /// 修改时间，RFC3339 UTC；用于 `no_hash` 模式的源稳定性二次复核
     #[serde(rename = "Mtime")]
     pub mtime: String,
@@ -65,17 +65,22 @@ impl Manifest {
             wtr.serialize(Row {
                 rel: &e.rel,
                 size: e.size,
-                hash: &e.hash,
+                hash: e.hash.as_deref().unwrap_or(""),
             })?;
         }
         wtr.flush()?;
+        // fsync:校验清单是恢复/复查的依据,必须先于"删事务标记"真正落盘。(ledger L-001)
+        let file = wtr
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("刷新校验清单缓冲失败：{}", e))?;
+        crate::engine::durable::sync_file(&file)
+            .with_context(|| format!("校验清单刷盘失败：{}", path.display()))?;
         Ok(())
     }
 }
 
 /// 列举一个文件夹下所有真实文件。
-/// - 不进入目录链接（symlink/junction）
-/// - 跳过文件 reparse point
+/// - 不跟随目录链接（symlink/junction；follow_links=false）
 /// - 跳过 cruft（Thumbs.db、$RECYCLE.BIN 等）
 /// - 枚举失败 → 收集所有错误,本项目 bail（D4 一次输出）；本项目跳过,不影响后续项目；下次运行重做。
 fn real_files(root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {
@@ -106,7 +111,7 @@ pub struct ManifestOpts {
     pub no_hash: bool,
 }
 
-/// 生成文件夹清单。`no_hash=true` 时 Hash 字段为空串。
+/// 生成文件夹清单。`no_hash=true` 时 `Entry.hash` 为 `None`(CSV 落盘仍写空串保持兼容)。
 pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result<Manifest> {
     let files = real_files(root, reporter)?;
     let total_bytes: u64 = files
@@ -116,7 +121,10 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 
     let mut bar = reporter.progress_bytes(if opts.no_hash { "枚举" } else { "校验" }, total_bytes);
 
-    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // 不要 canonicalize:Windows 上它会加 `\\?\` 前缀,而 cruft::walk(WalkDir)产出的路径
+    // 不带前缀 → strip_prefix 失配 → rel 退化成绝对路径 → diff/verify 永远失败。
+    // WalkDir 产出的路径必以传入的 root 为前缀,直接用 root 做 base 即可。(ledger L-044)
+    let base = root.to_path_buf();
     let mut entries = Vec::with_capacity(files.len());
     let mut metadata_errors: Vec<String> = Vec::new();
     let mut hash_errors: Vec<String> = Vec::new();
@@ -130,14 +138,20 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
             }
         };
         let size = meta.len();
-        let mtime = system_time_to_rfc3339(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        // mtime 读不到时存空串(不要用 UNIX_EPOCH 兜底):空串在 no_hash 复核里被当作
+        // "无法证明未变" → 保守判定为已变,而 UNIX_EPOCH 兜底会让两次都相等从而漏判。(ledger L-004)
+        let mtime = meta
+            .modified()
+            .ok()
+            .map(system_time_to_rfc3339)
+            .unwrap_or_default();
         let rel = path_relative(&base, f);
 
         let hash = if opts.no_hash {
-            String::new()
+            None
         } else {
             match sha256_hex(f) {
-                Ok(h) => h,
+                Ok(h) => Some(h),
                 Err(e) => {
                     hash_errors.push(format!("{}: {}", f.display(), e));
                     continue;
@@ -206,27 +220,27 @@ fn system_time_to_rfc3339(t: SystemTime) -> String {
 /// 三重比对结果
 #[derive(Debug, Default)]
 pub struct Diff {
-    pub ok: bool,
     pub reasons: Vec<String>,
     /// 目标侧有问题的相对路径（多余/大小不符/哈希不符），用来隔离重传
     pub bad_dst_rels: Vec<String>,
 }
 
+impl Diff {
+    /// 是否通过:由 reasons 派生(有任何 reason = 不通过),消除 ok 字段与 reasons 漂移的可能。(ledger L-024)
+    pub fn ok(&self) -> bool {
+        self.reasons.is_empty()
+    }
+}
+
 /// 用源清单核对目标清单：数量、字节、逐文件相对路径 + 大小 (+ 哈希)。
 pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
-    let mut d = Diff {
-        ok: true,
-        reasons: Vec::new(),
-        bad_dst_rels: Vec::new(),
-    };
+    let mut d = Diff::default();
 
     if src.count() != dst.count() {
-        d.ok = false;
         d.reasons
             .push(format!("文件数 src={} dst={}", src.count(), dst.count()));
     }
     if src.total_bytes() != dst.total_bytes() {
-        d.ok = false;
         d.reasons.push(format!(
             "总字节 src={} dst={}",
             src.total_bytes(),
@@ -236,21 +250,27 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
     let smap: HashMap<&str, &Entry> = src.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
     for ent in &dst.entries {
         let Some(s) = smap.get(ent.rel.as_str()) else {
-            d.ok = false;
             d.reasons.push(format!("目标多出 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
             continue;
         };
         if s.size != ent.size {
-            d.ok = false;
             d.reasons.push(format!("大小不一致 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
             continue;
         }
-        if check_hash && !s.hash.is_empty() && s.hash != ent.hash {
-            d.ok = false;
+        if check_hash && s.hash.is_some() && s.hash != ent.hash {
             d.reasons.push(format!("哈希不一致 {}", ent.rel));
             d.bad_dst_rels.push(ent.rel.clone());
+        }
+    }
+    // 对称检查:源有但目标缺的文件,显式报告,不只靠 count/total_bytes 聚合量兜底
+    // (聚合量在 cruft 过滤不对称时可能被凑平 → 漏检;reason 也更准)。缺失文件不进
+    // bad_dst_rels(目标侧无此文件可隔离),copy_folder 下轮会自动补传。(ledger L-002)
+    let dmap: HashMap<&str, &Entry> = dst.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
+    for ent in &src.entries {
+        if !dmap.contains_key(ent.rel.as_str()) {
+            d.reasons.push(format!("源有目标缺 {}", ent.rel));
         }
     }
     d
@@ -294,6 +314,12 @@ pub fn source_changed(
                 break;
             }
             if no_hash {
+                // 空 mtime = 该文件 mtime 不可读 → 无法证明复制期间未变 → 保守判为已变(fail-closed)
+                if i.mtime.is_empty() || j.mtime.is_empty() {
+                    changed = true;
+                    reasons.push(format!("修改时间不可读,无法确认未变 {}", i.rel));
+                    break;
+                }
                 if j.mtime != i.mtime {
                     changed = true;
                     reasons.push(format!("修改时间变化 {}", i.rel));
@@ -307,4 +333,110 @@ pub fn source_changed(
         }
     }
     (changed, reasons)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(rel: &str, size: u64, hash: &str, mtime: &str) -> Entry {
+        Entry {
+            rel: rel.into(),
+            size,
+            hash: if hash.is_empty() {
+                None
+            } else {
+                Some(hash.to_string())
+            },
+            mtime: mtime.into(),
+        }
+    }
+
+    // ── L-004: no_hash 复核不能被"不可读 mtime"绕过 ──
+    #[test]
+    fn source_changed_no_hash_treats_unreadable_mtime_as_changed() {
+        // 两次 build 都读不到 mtime(空串):旧实现用 UNIX_EPOCH 兜底会让两者相等 → 漏判;
+        // 现在应保守判为"已变",防止"复制期间内容变了但 mtime 读不到"时把旧/坏版本移走。
+        let a = Manifest {
+            entries: vec![e("x", 10, "", "")],
+        };
+        let b = Manifest {
+            entries: vec![e("x", 10, "", "")],
+        };
+        assert!(
+            source_changed(&a, &b, true).0,
+            "空 mtime 无法证明未变,应保守判为已变"
+        );
+    }
+
+    #[test]
+    fn source_changed_no_hash_same_mtime_unchanged() {
+        let a = Manifest {
+            entries: vec![e("x", 10, "", "2026-01-01T00:00:00+00:00")],
+        };
+        let b = Manifest {
+            entries: vec![e("x", 10, "", "2026-01-01T00:00:00+00:00")],
+        };
+        assert!(!source_changed(&a, &b, true).0);
+    }
+
+    #[test]
+    fn source_changed_no_hash_diff_mtime_changed() {
+        let a = Manifest {
+            entries: vec![e("x", 10, "", "2026-01-01T00:00:00+00:00")],
+        };
+        let b = Manifest {
+            entries: vec![e("x", 10, "", "2026-02-02T00:00:00+00:00")],
+        };
+        assert!(source_changed(&a, &b, true).0);
+    }
+
+    // ── L-002: diff 显式报告"源有目标缺",不只靠 count/bytes 兜底 ──
+    #[test]
+    fn diff_reports_missing_source_file_explicitly() {
+        // 同 count、同字节,但 b 缺失、c 多出(改名/替换):旧实现只报"目标多出 c",
+        // 漏报缺 b;现在应同时显式报"源有目标缺 b"。
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("b", 10, "h2", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("c", 10, "h3", "")],
+        };
+        let d = diff(&src, &dst, true);
+        assert!(!d.ok());
+        assert!(
+            d.reasons
+                .iter()
+                .any(|r| r.contains("源有目标缺") && r.contains('b')),
+            "应显式报告缺失的源文件 b,实际 reasons={:?}",
+            d.reasons
+        );
+    }
+
+    #[test]
+    fn diff_missing_in_dst_sets_not_ok() {
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("b", 10, "h2", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let d = diff(&src, &dst, true);
+        assert!(!d.ok());
+        assert!(d
+            .reasons
+            .iter()
+            .any(|r| r.contains("源有目标缺") && r.contains('b')));
+    }
+
+    #[test]
+    fn diff_identical_is_ok() {
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        assert!(diff(&src, &dst, true).ok());
+    }
 }
