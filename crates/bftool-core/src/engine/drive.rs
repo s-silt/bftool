@@ -125,9 +125,13 @@ pub fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<
 }
 
 fn drive_letter_of(p: &Path) -> Option<String> {
+    // 字符安全:对 UNC(\\server)、卷 GUID、多字节首字符的挂载点返回 None 而非 panic。
+    // 旧实现 `&s[1..2]`/`s[..1]` 按字节切片,首字符是多字节字符时会 panic。(ledger L-023)
     let s = p.to_string_lossy();
-    if s.len() >= 2 && &s[1..2] == ":" {
-        Some(s[..1].to_uppercase())
+    let mut it = s.chars();
+    let first = it.next()?;
+    if first.is_ascii_alphabetic() && it.next() == Some(':') {
+        Some(first.to_ascii_uppercase().to_string())
     } else {
         None
     }
@@ -331,12 +335,8 @@ fn system_drive_letter() -> String {
 }
 
 fn qualifier_letter(p: &Path) -> Option<String> {
-    let s = p.to_string_lossy();
-    if s.len() >= 2 && &s[1..2] == ":" {
-        Some(s[..1].to_uppercase())
-    } else {
-        None
-    }
+    // 与 drive_letter_of 同义,直接复用避免重复的盘符解析。(ledger L-023 / TD-06)
+    drive_letter_of(p)
 }
 
 /// 把盘符字符串规范化为根路径 PathBuf。
@@ -434,5 +434,17 @@ mod tests {
         let all = vec![di("E", 200, false)];
         let (usable, _) = usable_drives(all, 200);
         assert_eq!(usable.len(), 1, "恰好等于阈值应可用");
+    }
+
+    // ── L-023: 盘符解析字符安全,不对多字节首字符/UNC panic ──
+    #[test]
+    fn drive_letter_of_is_char_safe() {
+        assert_eq!(drive_letter_of(Path::new("E:\\")), Some("E".to_string()));
+        assert_eq!(drive_letter_of(Path::new("c:\\x")), Some("C".to_string()));
+        assert_eq!(drive_letter_of(Path::new(r"\\server\share")), None);
+        assert_eq!(drive_letter_of(Path::new("中:\\x")), None); // 多字节首字符:不 panic
+        assert_eq!(drive_letter_of(Path::new("")), None);
+        // qualifier_letter 复用 drive_letter_of
+        assert_eq!(qualifier_letter(Path::new("E:\\")), Some("E".to_string()));
     }
 }
