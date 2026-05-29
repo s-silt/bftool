@@ -17,6 +17,8 @@ path = "src/main.rs"
 bftool-core = { path = "../bftool-core" }
 eframe.workspace = true
 anyhow.workspace = true
+# 校验 CJK 字体能否解析 + 是否含中文字形(避免把坏字体喂给 egui 触发 panic / tofu)。
+ab_glyph = "0.2"
 
 # 仅 Windows 构建:给 exe 嵌入图标 + 版本/产品信息(调 MSVC rc.exe)。
 [target.'cfg(windows)'.build-dependencies]

@@ -84,8 +84,10 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        setup_style(&cc.egui_ctx);
-        let mut logs = Vec::new();
+        // 先装中文字体(否则界面中文渲染成方块),状态记进日志便于排查;再应用主题。
+        let font_status = install_cjk_font(&cc.egui_ctx);
+        apply_visuals(&cc.egui_ctx);
+        let mut logs = vec![(LogLevel::Info, font_status)];
         // 不吞错:配置加载失败时退默认,但把错误进日志面板让用户可见(Spec D §6 / 不掩盖 fail-closed)。
         let (cfg, config_source) = match Config::load_with_source(None) {
             Ok(l) => (l.config, l.source),
@@ -170,9 +172,8 @@ impl App {
     }
 }
 
-/// 启动时设置外观:装中文字体(关键!)+ 浅色主题(新手友好,贴近 Windows 风格)+ 略宽间距。
-fn setup_style(ctx: &egui::Context) {
-    install_cjk_font(ctx);
+/// 外观:浅色主题(新手友好,贴近 Windows 风格)+ 略宽间距/按钮内边距。
+fn apply_visuals(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::light();
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -180,32 +181,49 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// 装一个系统自带的 CJK 字体(否则中文渲染成方块)。运行时从 Windows 字体目录读,
-/// 不内嵌(避免 ~16MB 二进制膨胀)。插在字体链首位,但保留 egui 默认字体作后备(emoji 仍可渲染)。
-/// 找不到任何 CJK 字体 → 退默认(中文可能方块,但不崩)。
-fn install_cjk_font(ctx: &egui::Context) {
+/// 装一个系统自带的 CJK 字体(否则界面中文渲染成方块)。运行时从 Windows 字体目录读,
+/// 不内嵌(避免 ~16MB 二进制膨胀)。**先用 ab_glyph 校验能解析且含中文字形**——绝不把坏字体
+/// 喂给 egui(epaint 解析失败会 panic)。选中的插入字体链首位,保留 egui 默认字体作后备(emoji 仍渲染)。
+/// 返回一行人类可读状态(记进日志 + 打到终端),把"字体到底加载了什么"变成可观测事实。
+fn install_cjk_font(ctx: &egui::Context) -> String {
+    use ab_glyph::{Font, FontRef};
     const CANDIDATES: [&str; 4] = [
         r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑(优先)
         r"C:\Windows\Fonts\msyh.ttf",   // 旧版雅黑
         r"C:\Windows\Fonts\simhei.ttf", // 黑体
         r"C:\Windows\Fonts\simsun.ttc", // 宋体
     ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "cjk".to_owned());
+    for path in CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        // 校验:face 0 能解析 + 含中文字形('备' 非 .notdef)。借用在本语句结束即释放,随后可移动 bytes。
+        let usable = FontRef::try_from_slice_and_index(&bytes, 0)
+            .map(|f| f.glyph_id('备').0 != 0)
+            .unwrap_or(false);
+        if !usable {
+            continue;
+        }
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, "cjk".to_owned());
+        }
+        ctx.set_fonts(fonts);
+        let msg = format!("已加载中文字体: {path}");
+        eprintln!("[bftool-gui] {msg}");
+        return msg;
     }
-    ctx.set_fonts(fonts);
+    let msg = "未找到可用中文字体,界面中文可能显示为方块(请确认系统装有中文字体)".to_string();
+    eprintln!("[bftool-gui] 警告: {msg}");
+    msg
 }
 
 impl eframe::App for App {
