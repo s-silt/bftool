@@ -63,6 +63,15 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     ),
                 );
             }
+            if outcome.malformed_rows > 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xB0, 0x6A, 0x00),
+                    format!(
+                        "{} 行因格式错误被跳过(未计入结果)。",
+                        outcome.malformed_rows
+                    ),
+                );
+            }
             if outcome.matches.is_empty() {
                 ui.label("无匹配。");
             } else {
