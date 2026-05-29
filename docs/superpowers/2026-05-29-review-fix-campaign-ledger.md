@@ -9,7 +9,9 @@
 
 ## 进度(实时,Phase 3)
 
-测试数:0 → **64 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
+测试数:0 → **70 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
+
+> **⚠ 重大发现 L-044(P1,集成测试新抓到)**:`manifest::build` 与 `verify_tree` 对 base 做 `canonicalize()`(Windows 加 `\\?\` 前缀),而 `cruft::walk` 的 `WalkDir` 产出路径不带前缀 → `strip_prefix` 失配 → rel 退化成**绝对路径** → **diff/verify 在 Windows 上必然失败,核心归档功能根本跑不通**。因 CI 不跑 `cargo test`(CI-4)+ 核心零集成测试,一直未暴露。已修(base 改用传入 root)+ handle_one happy-path 集成测试锁定。commit `0582389`。
 
 **已修复(Fixed,待 Phase 4 对抗复审升 Verified):**
 
@@ -26,6 +28,13 @@
 | L-026 | P2 | `800c36e` | check_paths/is_inside ×6 |
 | L-003 | P2 | `672d890` | handle_one 空源(脚手架 temp_world)×1 |
 | L-017 | P2 | `e694c69` | dup 读失败保守 ×1 |
+| L-018 | P2 | `a0d2b90` | note_manual 非致命 ×1 |
+| L-024 | P2 | `31d7a4b` | Diff.ok 派生(重构) |
+| L-025 | P2 | `20af56a` | Config::validate ×3 |
+| L-009 | P2 | `14a78b8` | classify_exit strict ×1 |
+| L-005 | P2 | `0582389` | folder_stats fail-closed + happy-path ×1 |
+| **L-044** | **P1** | `0582389` | **canonicalize rel 失配(核心校验必败)** + happy-path 锁定 |
+| L-014 | P2 | `d66c9b1` | copy_folder 原子复制 + cruft .part ×2 |
 
 **严重度修正(主控复核;拟交 Phase 4 确认):**
 - L-003 / L-005 / L-008 / L-009:P1 → **P2**。复核后均非"当前可触发的数据丢失/校验绕过",而是 fail-closed 缺口/维护性风险(L-003 空源假成功但不删数据;L-005 跨卷失败可经 check_pending_txn 恢复、不丢数据;L-008 core+cli 双 guard 当前都在、仅未来漂移风险;L-009 仅 no_hash 且 exit code=1 罕见)。仍会修。
