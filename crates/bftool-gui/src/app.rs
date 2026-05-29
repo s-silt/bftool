@@ -70,6 +70,8 @@ pub struct App {
     pub archive_ui: crate::views::archive::ArchiveUiState,
     /// 盘列表缓存(None = 未扫;带「刷新」按钮,不每帧重扫)。
     pub drives_cache: Option<Vec<bftool_core::engine::drive::DriveInfo>>,
+    /// 查找页跨帧状态(关键词 + 结果)。
+    pub find_ui: crate::views::find::FindUiState,
 }
 
 impl App {
@@ -98,6 +100,7 @@ impl App {
             archive_plan: None,
             archive_ui: crate::views::archive::ArchiveUiState::default(),
             drives_cache: None,
+            find_ui: crate::views::find::FindUiState::default(),
         }
     }
 
@@ -160,6 +163,7 @@ impl eframe::App for App {
             View::Dashboard => crate::views::dashboard::ui(self, ui),
             View::Archive => crate::views::archive::ui(self, ui),
             View::Drives => crate::views::drives::ui(self, ui),
+            View::Find => crate::views::find::ui(self, ui),
             other => {
                 ui.heading(other.label());
                 ui.label("（此视图将在 Phase 3 接入）");
