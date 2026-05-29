@@ -32,7 +32,7 @@ bftool-core (引擎,79 测试)
 
 archive/verify 是长阻塞操作,**绝不能在 UI 线程跑**。
 
-- **后台线程**:点「备份/复查」→ `std::thread::spawn` 跑 `core::archive::run` / `verify::run`。
+- **后台线程**:点「备份/复查」→ `std::thread::spawn` 跑 **`core::archive::run_plan(plan, ..)`**(GUI 走 `plan()` → 预览 → `run_plan`,见 §4.1)/ `core::verify::run`。绝不在 UI 线程跑。
 - **`GuiReporter` 实现 core `Reporter` trait**:`log(level,msg)` → 推进 `mpsc::Sender<UiEvent>`;`progress_bytes()` 返回的句柄 → 更新 `Arc<Mutex<ProgressState>>`。UI 每帧 `try_recv` drain + `ctx.request_repaint()` 保持刷新。这是 `Reporter` 抽象的既定用途。
 - **取消(收严)**:
   - core 的 `run`/`verify::run` 新增参数 `cancel: &AtomicBool`(或 `&CancelToken`)。
