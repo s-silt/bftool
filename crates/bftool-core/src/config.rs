@@ -97,17 +97,25 @@ impl Default for Config {
 
 impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        let cfg = if let Some(p) = explicit {
-            Self::from_path(p)
-                .with_context(|| format!("读取 --config 指定的配置文件失败：{}", p.display()))?
-        } else if let Some(c) = Self::candidate_paths().iter().find(|c| c.is_file()) {
-            Self::from_path(c).with_context(|| format!("读取配置文件失败：{}", c.display()))?
+        Ok(Self::load_with_source(explicit)?.config)
+    }
+
+    /// 加载并记录来源(GUI 需要知道"从哪读、能写回哪")。(Spec D §4.3)
+    pub fn load_with_source(explicit: Option<&Path>) -> Result<LoadedConfig> {
+        let (config, source) = if let Some(p) = explicit {
+            let c = Self::from_path(p)
+                .with_context(|| format!("读取 --config 指定的配置文件失败：{}", p.display()))?;
+            (c, ConfigSource::Explicit(p.to_path_buf()))
+        } else if let Some(cand) = Self::candidate_paths().into_iter().find(|c| c.is_file()) {
+            let c = Self::from_path(&cand)
+                .with_context(|| format!("读取配置文件失败：{}", cand.display()))?;
+            (c, ConfigSource::Candidate(cand))
         } else {
             // 找不到任何配置文件 → 用默认值；用户首次跑 `bftool` 会看到提示
-            Self::default()
+            (Self::default(), ConfigSource::Default)
         };
-        cfg.validate()?;
-        Ok(cfg)
+        config.validate()?;
+        Ok(LoadedConfig { config, source })
     }
 
     /// 加载后校验配置的内在不变量(不依赖具体备份盘;盘相关的根目录关系检查在 safety::check_paths)。
@@ -150,6 +158,68 @@ impl Config {
     }
 }
 
+/// 配置来源(GUI 据此知道 CLI 下次会从哪读 → 写回同处不错位)。(Spec D §4.3)
+#[derive(Debug, Clone)]
+pub enum ConfigSource {
+    Explicit(PathBuf),
+    Candidate(PathBuf),
+    Default,
+}
+
+/// 加载结果 = 配置 + 来源。
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub source: ConfigSource,
+}
+
+/// GUI 设置页保存目标。默认推荐 `AppData`(与 cwd 无关,CLI 与 GUI 双击都查到)。
+#[derive(Debug, Clone)]
+pub enum SaveTarget {
+    /// 写回当前来源(source 为 Default 时报错,让用户选位置)
+    CurrentSource,
+    /// `%APPDATA%\bftool\config.toml`
+    AppData,
+    /// 当前工作目录 `bftool.toml`(注意:GUI 双击的 cwd 可能与 CLI 终端运行不同)
+    CurrentDir,
+    Custom(PathBuf),
+}
+
+/// `%APPDATA%\bftool\config.toml`(与 cwd 无关)。
+pub fn appdata_config_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("bftool").join("config.toml"))
+}
+
+impl LoadedConfig {
+    /// 校验后把配置写到目标,返回实际写入路径。(Spec D §4.3)
+    pub fn save(&self, target: &SaveTarget) -> Result<PathBuf> {
+        self.config.validate()?;
+        let path = match target {
+            SaveTarget::CurrentSource => match &self.source {
+                ConfigSource::Explicit(p) | ConfigSource::Candidate(p) => p.clone(),
+                ConfigSource::Default => {
+                    anyhow::bail!("当前没有配置文件来源,请选择保存位置(推荐 %APPDATA%)。")
+                }
+            },
+            SaveTarget::AppData => {
+                appdata_config_path().context("无法定位 %APPDATA%,请改存到其它位置。")?
+            }
+            SaveTarget::CurrentDir => std::env::current_dir()
+                .context("无法获取当前目录")?
+                .join("bftool.toml"),
+            SaveTarget::Custom(p) => p.clone(),
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建配置目录失败：{}", parent.display()))?;
+        }
+        let body = toml::to_string_pretty(&self.config).context("序列化配置失败")?;
+        crate::engine::durable::write_synced(&path, body.as_bytes())
+            .with_context(|| format!("写配置失败：{}", path.display()))?;
+        Ok(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +228,31 @@ mod tests {
     #[test]
     fn validate_accepts_default() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    // ── Spec D §4.3: LoadedConfig::save ──
+    #[test]
+    fn save_custom_roundtrips() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("sub").join("bftool.toml");
+        let lc = LoadedConfig {
+            config: Config::default(),
+            source: ConfigSource::Default,
+        };
+        let written = lc.save(&SaveTarget::Custom(p.clone())).unwrap();
+        assert_eq!(written, p);
+        let back = Config::from_path(&p).unwrap();
+        assert_eq!(back.ready_root, Config::default().ready_root);
+        assert_eq!(back.name_prefix, Config::default().name_prefix);
+    }
+
+    #[test]
+    fn save_current_source_errs_when_default() {
+        let lc = LoadedConfig {
+            config: Config::default(),
+            source: ConfigSource::Default,
+        };
+        assert!(lc.save(&SaveTarget::CurrentSource).is_err());
     }
 
     #[test]
