@@ -11,16 +11,44 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-/// 写入全部内容后 `sync_all` 落盘。用于事务标记、校验清单等关键写入。
+/// 原子写入：写临时文件 + fsync + rename 替换目标。用于事务标记、校验清单、索引等关键写入。
 ///
-/// 这是"截断重写 + fsync",不是原子替换;调用方若需要原子性应写临时文件再 rename。
-/// 对 bftool 当前用法(标记/清单/索引,写失败即整步失败重做)足够。
+/// 旧实现是"`File::create`(截断)+ write + fsync"。崩溃/断电若发生在截断之后、写完之前,
+/// 目标文件会留下零字节或半截内容 —— 对"存在即生效"的事务标记尤其危险(SEC-006)。
+/// 改为先把内容写进同目录的临时文件并 fsync,再 `rename` 原子替换目标:
+/// rename 在同卷上是原子的,读者只会看到"旧内容"或"完整新内容",绝不会看到半截。
+/// 临时文件放在**目标同目录**(而非系统临时目录),保证与目标同卷 → rename 不退化成跨卷拷贝。
+///
+/// 注:这里不对父目录 fsync(Windows 上目录 fsync 语义不明确,见本模块头注);
+/// 内容本身已 fsync,rename 后即便目录项尚未落盘,也只是"看到旧名/新名"的差别,不会半截。
 pub fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = File::create(path).with_context(|| format!("创建文件失败：{}", path.display()))?;
-    f.write_all(bytes)
-        .with_context(|| format!("写入失败：{}", path.display()))?;
-    f.sync_all()
-        .with_context(|| format!("刷盘(fsync)失败：{}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // 临时名带目标文件名 + .bftool-tmp 后缀,放在同目录(同卷)。不同步并发写同一目标时,
+    // 调用方本就该串行(事务/单盘不变式保证),故不额外加唯一后缀。
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bftool".to_string());
+    let tmp = parent.join(format!("{file_name}.bftool-tmp"));
+
+    // 写临时文件 + fsync(块作用域确保 File 在 rename 前已 drop/关闭,Windows 上句柄未关无法 rename)。
+    {
+        let mut f =
+            File::create(&tmp).with_context(|| format!("创建临时文件失败：{}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("写入临时文件失败：{}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("刷盘(fsync)失败：{}", tmp.display()))?;
+    }
+
+    // 原子替换。`std::fs::rename` 在 Windows 走 MoveFileExW + MOVEFILE_REPLACE_EXISTING,
+    // 目标已存在也会原子覆盖(POSIX 同样允许覆盖)。失败时清理临时文件再上抛,
+    // 避免在目标目录里留下 .bftool-tmp 残渣。
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e)
+            .with_context(|| format!("原子替换失败：{} → {}", tmp.display(), path.display()));
+    }
     Ok(())
 }
 

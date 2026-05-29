@@ -276,7 +276,7 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
     d
 }
 
-/// 复制期间源是否变化（在「移动源 → 写索引」之前最后一道防线）。
+/// 复制期间源是否变化（移动源之前最后一道防线；新顺序下索引已写、就差移源）。
 pub fn source_changed(
     initial: &Manifest,
     current: &Manifest,

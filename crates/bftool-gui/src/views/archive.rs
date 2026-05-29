@@ -170,6 +170,14 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 /// 后台跑 archive::plan(只读)生成预览——`plan` 会遍历待备份所有项目(folder_stats),
 /// 大目录时耗时,故放后台线程,不冻 UI。plan 消息经 GuiReporter 进日志;结果经 plan_task 回传。
 fn refresh_plan(app: &mut App) {
+    // R-06:refresh_plan 与 start_archive 共用 app.rx,无编译期"互斥"保证。
+    // 运行期保证:两个入口按钮都 add_enabled(!busy)(busy = task 或 plan_task 在跑),
+    // 任一任务进行中时按钮禁用 → 不会重入 → 不会 clobber 正在用的 rx。
+    // debug_assert 在 debug 构建里把这个隐式契约显式化,违反即 panic 早暴露。
+    debug_assert!(
+        app.plan_task.is_none(),
+        "rx clobber: plan_task still running"
+    );
     app.logs.clear();
     app.last_summary = None;
     app.archive_plan = None;
@@ -193,6 +201,9 @@ fn refresh_plan(app: &mut App) {
 
 /// 把当前 plan 交给后台线程跑 run_plan(GuiReporter 推日志/进度,cancel 项目边界)。
 fn start_archive(app: &mut App) {
+    // R-06:同 refresh_plan——「正式备份」按钮 add_enabled(can_run = !busy && plan.is_some()),
+    // busy 时禁用,运行期不会重入 clobber app.rx;debug_assert 把该契约显式化。
+    debug_assert!(app.task.is_none(), "rx clobber: task still running");
     let Some(plan) = app.archive_plan.take() else {
         return;
     };

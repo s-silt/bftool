@@ -67,10 +67,30 @@ impl<T: Send + 'static> BackgroundTask<T> {
 
     /// 取走最终结果(join 线程)。仅在 is_finished 后调用;重复调用返回 None。
     pub fn take_outcome(&mut self) -> Option<TaskOutcome<T>> {
+        let join_result = self.handle.take().map(|h| h.join());
+        let outcome = self.result.lock().ok().and_then(|mut s| s.take());
+        // 若线程 join 返回 Err 且 result 为 None，说明任务 panic 了
+        if outcome.is_none() {
+            if let Some(Err(_)) = join_result {
+                return Some(TaskOutcome::Failed("后台任务崩溃（内部错误）".to_string()));
+            }
+        }
+        outcome
+    }
+}
+
+/// Drop 时**先置取消、再 join**(不 detach)。
+/// 为什么 join 而非 detach:与 core 的 AR-01 不变式一致——绝不让后台线程在进程/视图撤销后
+/// 还继续改动半移动状态的归档(否则可能在退出后写坏盘/索引)。数据完整性 > 即时关闭。
+/// 已知代价:若正在跑一个大项目,取消在**项目边界**才生效,join 会阻塞到下一个边界,
+/// 关窗时窗口可能短暂"无响应"(几秒)。这是有意权衡,可接受。
+impl<T> Drop for BackgroundTask<T> {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        self.result.lock().ok().and_then(|mut s| s.take())
     }
 }
 
@@ -102,6 +122,19 @@ mod tests {
         // 泛型:Done 可携带任意 Send 类型(这里 Vec<u32> 模拟结构化结果如 ArchivePlan)。
         let t = BackgroundTask::spawn(|_cancel| Ok(vec![1u32, 2, 3]));
         assert!(matches!(drain(t), TaskOutcome::Done(v) if v == vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn task_panic_maps_to_failed() {
+        // 契约(G-03):闭包 panic → 线程 result 槽为 None 且 join 返回 Err →
+        // take_outcome 兜底为 TaskOutcome::Failed,UI 不会卡在"运行中"。
+        // 临时静默 panic hook,避免测试输出里出现吓人的 backtrace。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let t = BackgroundTask::<String>::spawn(|_cancel| panic!("boom"));
+        let outcome = drain::<String>(t);
+        std::panic::set_hook(prev);
+        assert!(matches!(outcome, TaskOutcome::Failed(_)));
     }
 
     #[test]

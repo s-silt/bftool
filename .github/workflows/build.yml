@@ -16,27 +16,27 @@ jobs:
     name: fmt + build + test + clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       # review+修复 campaign 后全部转为**硬门禁**(去掉 continue-on-error):本地每轮必过,
-      # CI 也强制,防 78 项测试 / fmt / clippy 回归。(ledger CI-1/CI-2/CI-3/CI-4)
+      # CI 也强制,防全部测试 / fmt / clippy 回归。(ledger CI-1/CI-2/CI-3/CI-4)
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo build (all targets)
-        run: cargo build --workspace --all-targets --locked || cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
       - name: cargo test (all targets)
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
       - name: cargo clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -54,7 +54,7 @@ jobs:
         target:
           - x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -85,7 +85,7 @@ jobs:
 
   release:
     name: release
-    needs: build
+    needs: [build, audit]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

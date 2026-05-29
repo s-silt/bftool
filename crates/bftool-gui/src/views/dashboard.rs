@@ -14,17 +14,44 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(theme::GAP);
     progress_card(app, ui);
 
-    let report = match status::gather(&app.cfg) {
-        Ok(r) => r,
-        Err(e) => {
-            theme::callout(
-                ui,
-                theme::DANGER,
-                theme::DANGER_SOFT,
-                &format!("读取状态失败：{:#}", e),
-            );
-            return;
+    const CACHE_TTL_MS: u128 = 1500;
+    let report = {
+        let now = std::time::Instant::now();
+        let stale = app
+            .status_cache
+            .as_ref()
+            .map(|(_, t)| t.elapsed().as_millis() > CACHE_TTL_MS)
+            .unwrap_or(true);
+        if stale {
+            match status::gather(&app.cfg) {
+                Ok(r) => {
+                    app.status_cache = Some((r.clone(), now));
+                    Some(r)
+                }
+                // R-03:gather 失败时不直接 return——否则用户连"去设置/初始化"的入口都看不到,
+                // 卡死在仪表盘。改为显示 error callout 后仍渲染操作按钮,让用户能去其他页修配置。
+                Err(e) => {
+                    theme::callout(
+                        ui,
+                        theme::DANGER,
+                        theme::DANGER_SOFT,
+                        &format!("读取状态失败：{:#}", e),
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(app.status_cache.as_ref().unwrap().0.clone())
         }
+    };
+
+    // gather 失败:仍渲染操作按钮 + 来源提示,让用户能跳去设置/初始化页修配置。
+    let Some(report) = report else {
+        ui.add_space(theme::GAP);
+        actions_row(app, ui);
+        ui.add_space(6.0);
+        ui.weak(util::source_hint(&app.config_source));
+        return;
     };
 
     egui::ScrollArea::vertical().show(ui, |ui| {

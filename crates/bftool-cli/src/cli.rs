@@ -79,9 +79,9 @@ pub enum Command {
         #[arg(long)]
         drive: Option<String>,
 
-        /// 关闭压缩包内部结构测试（默认开启）。仅 SHA256 字节级校验时可用。
-        /// 关掉后 SHA256 校验仍在，但压缩包内部结构损坏的可能被漏判。
-        /// 与 --unsafe-no-hash 互斥：同时关 SHA256 + archive test 只剩 size+count+mtime ≈ 无校验。
+        /// 关闭压缩包内部结构测试（默认开启）。
+        /// 单独关掉它没问题：SHA256 字节级校验仍在，只是压缩包内部结构损坏可能被漏判。
+        /// 但不能与 --unsafe-no-hash 同时用：两者一起关 → 只剩 size+count+mtime ≈ 无校验，会被拒绝。
         #[arg(long)]
         no_test_archives: bool,
     },
@@ -122,6 +122,7 @@ pub enum Command {
 pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
     // 用 LoadedConfig 读:既拿到生效配置,也记住「从哪读的」供 config-show 显示(Spec D §4.3)。
     let loaded = Config::load_with_source(args.config.as_deref()).context("加载配置失败")?;
+    // move 出 config(非 clone);loaded.source 仍可用(部分移动),config-show 分支再读它。(EH-002)
     let cfg = loaded.config;
 
     match args.cmd {
@@ -204,7 +205,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             let report = engine::verify::run(&cfg, reporter, drive.as_deref(), &no_cancel)?;
             if report.has_corruption() {
                 bail!(
-                    "复查发现 {} 处损坏/缺失/大小不符 —— 本盘完整性有问题。\n\
+                    "复查发现 {} 处完整性问题（损坏/缺失/大小不符/读取失败等） —— 本盘完整性有问题。\n\
                      请用其它副本恢复受损项目,或重做本盘。\n\
                      (本命令以非零退出码结束,便于定期复查脚本/计划任务识别坏盘。)",
                     report.bad

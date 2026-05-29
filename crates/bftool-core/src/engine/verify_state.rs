@@ -4,7 +4,7 @@
 //! **verify 对备份盘严格只读**,故复查记录写在本机 system_root(`复查记录.csv`),不碰盘 ——
 //! 这样封盘/写保护盘也能复查,且不混淆"元数据写失败"与"数据损坏"。(Spec D §4.4)
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use std::path::Path;
 
@@ -68,7 +68,10 @@ fn decode(status: &str, bad: u64, extra: u64) -> VerifyOutcome {
     match status {
         "IssuesFound" => VerifyOutcome::IssuesFound { bad },
         "ExtraOnly" => VerifyOutcome::ExtraOnly { extra },
-        _ => VerifyOutcome::Clean,
+        "Clean" => VerifyOutcome::Clean,
+        // Cancelled 表示"跑完但未记录确认的结果",比静默 Clean 安全:
+        // 未知/损坏的 status 字段不应静默显示为"无问题"。
+        _ => VerifyOutcome::Cancelled,
     }
 }
 
@@ -95,6 +98,10 @@ fn read_rows(path: &Path) -> Result<Vec<Row>> {
 }
 
 fn write_rows(path: &Path, rows: &[Row]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建复查记录目录失败：{}", parent.display()))?;
+    }
     let mut wtr = csv::Writer::from_writer(Vec::new());
     wtr.write_record(["drive_id", "when", "status", "bad", "extra"])?;
     for r in rows {

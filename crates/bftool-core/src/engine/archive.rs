@@ -5,7 +5,7 @@
 //! 2. 单项目 try/catch 隔离，意外只跳过该项目不中断整轮
 //! 3. 校验失败时把目标侧坏文件移到 异常文件/，下次自动重传
 //! 4. 移动源前再次比对源（防"备份的是旧版本"）
-//! 5. 写事务标记 → 移动源 → 写清单/索引 → 删标记（宁可漏写索引也不要"假装归档好了"）
+//! 5. 写事务标记 → 写清单/索引 → 移动源 → 删标记（索引先于移源落盘;write_csv/catalog 失败源仍可重做）
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
@@ -25,6 +25,7 @@ use crate::reporter::Reporter;
 pub struct Options {
     pub dry_run: bool,
     pub no_hash: bool,
+    /// 本轮最多处理多少个项目。`0 = 不限`（处理本轮计划里的全部项目）。
     pub limit: usize,
     pub drive_letter_override: Option<String>,
     pub no_test_archives: bool,
@@ -87,6 +88,22 @@ impl std::error::Error for NoWritableDrive {}
 /// 是否处于"没有任何内容完整性校验"的状态:跳过 SHA256(no_hash) 且 archive test 实际关闭。
 /// 等价于只剩 size+count+mtime,是禁止的组合。判定集中在此,core::run 守卫与 CLI 守卫共用
 /// 同一真值,避免两处条件漂移把"无校验后门"悄悄打开。(ledger L-008)
+///
+/// SEC-008: 三个 bool 参数语义重叠，签名暂不改（改了牵动 core+cli 两处调用点，
+/// 风险中、收益低）。三者各自含义与组合真值如下，调用方务必按命名传值：
+/// - `no_hash`        —— 用户是否传了 `--unsafe-no-hash`（**关掉** SHA256 整文件校验）。
+/// - `test_archives`  —— 配置项 `cfg.test_archives`（是否**启用**压缩包内部测试）。
+/// - `no_test_archives` —— 本轮 `opts.no_test_archives`（是否**临时关掉**压缩包测试，覆盖配置）。
+///
+/// 「archive test 实际开启」≡ `test_archives && !no_test_archives`（配置开 且 本轮没关）。
+/// 「无校验」≡ `no_hash && !(test_archives && !no_test_archives)`，化简即下式。真值表：
+///
+/// | no_hash | test_archives | no_test_archives | 结果(=无校验) |
+/// |---------|---------------|------------------|----------------|
+/// | false   | *             | *                | false（SHA256 兜底） |
+/// | true    | true          | false            | false（压缩包测试兜底） |
+/// | true    | false         | *                | **true**（配置没开测试） |
+/// | true    | true          | true             | **true**（本轮关了测试） |
 pub fn verify_disabled(no_hash: bool, test_archives: bool, no_test_archives: bool) -> bool {
     no_hash && (!test_archives || no_test_archives)
 }
@@ -171,6 +188,9 @@ pub fn plan(cfg: &Config, opts: &Options, reporter: &dyn Reporter) -> Result<Arc
     // 列出待归档项目(读不到/为空 → 空计划,友好提示)。
     let mut items = Vec::new();
     if !cfg.ready_root.is_dir() {
+        // AR-16: ready_root 非目录时**有意**返回空 items 而非 Err —— 让 run/run_plan 走
+        // 友好的「本轮无项目可做」收尾路径(打印提示、退出码 0)，而不是抛硬错误把
+        // CLI/GUI 弹成异常。配置写错盘符等情况下，用户看到的是可读提示而非堆栈。
         reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
         return Ok(ArchivePlan {
             drive,
@@ -267,7 +287,7 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
         }
     };
     // 超单盘容量(空盘也放不下)
-    let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
+    let reserve = cfg.reserve_gb.saturating_mul(1024 * 1024 * 1024);
     if size > drive.total_bytes.saturating_sub(reserve) {
         return skip(
             size,
@@ -278,6 +298,10 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
         );
     }
     // 冻结目标名(重名 → 唯一时间戳名)
+    // AR-11: 时间戳精度为秒(%Y%m%d%H%M%S)。同一秒内对两个同名项目算计划，会得到相同的时间戳目标名。
+    // 这种「同秒 + 同名」极罕见(秒级竞态 + 重名两条件叠加)，且即便发生也不会写坏数据：
+    // run_plan 执行前 handle_one 会用 forced_dest_name 复验该名是否已被占用(索引或磁盘)，
+    // 命中即判 StalePlan 跳过、不照旧误写。这里接受秒级精度，不引入更细粒度(纳秒会让目标名难读)。
     let dest_name = if dup {
         format!("{}_{}", name, Local::now().format("%Y%m%d%H%M%S"))
     } else {
@@ -285,6 +309,8 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
     };
     // 余量(断点续传时仅按"还需写入"判断)→ 不足则封盘停本轮
     let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
+    // dest_have 可能含孤儿 .bftool-part 文件(copy_folder 开头会先删它,最终不影响完成大小)。
+    // 此处轻微高估已有量导致 need 偏小,极端情况下可能多余地触发封盘;属已知可接受的精度损失。
     let dest_have = if dest.is_dir() {
         folder_stats(&dest).bytes
     } else {
@@ -396,6 +422,38 @@ pub fn run_plan(
         });
     }
 
+    // SEC-007: 单盘不变式复验。`pick_active` 的「多块可写盘 → 停」检查只在 plan() 跑过一次；
+    // 预览→执行之间若插入第二块未封盘备份盘，原来的检查就被绕过、可能写错盘。
+    // 仅在**自动选盘**(drive_letter_override 为 None)时复验——显式 --drive 指定盘符时是用户
+    // 主动选定，不在此拦。重新 scan：出现 >1 块可写盘即中止本轮，让用户确认只留一块。
+    if opts.drive_letter_override.is_none() {
+        match drive::usable_drives_now(cfg.min_drive_gb) {
+            Ok(usable) if usable.len() > 1 => {
+                let names = usable
+                    .iter()
+                    .map(|d| format!("{}({}:)", d.id, d.letter))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                reporter.error(&format!(
+                    "计划已过期：预览后检测到多块未封盘的备份盘：{} —— 为防止写错盘已停止。\
+                     请只保留一块在线(其余盘可封盘或拔下)后重新运行 `bftool archive`。",
+                    names
+                ));
+                return Ok(ArchiveSummary::default());
+            }
+            // 0 块/1 块都不阻断:1 块是正常情形;0 块(此盘恰好被拔)由后面 drive_id 重验已覆盖。
+            Ok(_) => {}
+            // scan 失败不静默吞:复验本身出错时 fail-closed 中止,不冒「漏检多盘」的险。
+            Err(e) => {
+                reporter.error(&format!(
+                    "无法复验在线备份盘数量({}) → 为防止写错盘,本轮不执行,请检查盘连接后重试。",
+                    e
+                ));
+                return Ok(ArchiveSummary::default());
+            }
+        }
+    }
+
     // 路径安全检查
     let warnings = safety::check_paths(
         &cfg.ready_root,
@@ -482,10 +540,17 @@ pub fn run_plan(
             }
         }
     }
+    // AR-13: 取消与失败可同时发生(取消前已有项目失败)。汇总里同时体现取消原因,
+    // 否则只打失败消息会让「为什么没处理完」对用户不可见。
+    let cancel_note = if summary.cancelled {
+        "（本轮被取消，剩余项目未处理）"
+    } else {
+        ""
+    };
     if summary.failed > 0 {
         reporter.error(&format!(
-            "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」)。",
-            summary.handled, summary.failed
+            "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」){}。",
+            summary.handled, summary.failed, cancel_note
         ));
     } else if !summary.cancelled {
         reporter.ok("本轮结束。");
@@ -496,14 +561,13 @@ pub fn run_plan(
 /// fail-closed 守卫:无校验组合(no_hash + archive test 关闭)直接拒。(ledger L-008)
 fn guard_verify_enabled(cfg: &Config, opts: &Options) -> Result<()> {
     if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
+        // EH-006: 纯用户向文案（不含 core/调用方等内部开发说明），CLI 与 GUI 都直接展示。
         anyhow::bail!(
-            "拒绝运行：no_hash=true 与 archive test 关闭(配置 test_archives=false 或 \
-             opts.no_test_archives=true)不能同时存在 —— 等价于「没在做完整性校验」。\n\
-             这是 core 级 fail-closed 拦截,调用方应该在传 Options 之前就做合并检查\
-             (CLI dispatch 已经做了一次更友好的)。\n\
-             如何修：\n\
-               - 去掉 no_hash 让 SHA256 兜底；或\n\
-               - 不要把 test_archives 设成 false 也不要把 no_test_archives 设成 true"
+            "已停止：当前设置会让 SHA256 校验和压缩包测试同时关闭 —— 等于「没有做任何完整性校验」，\
+             不能这样备份。\n\
+             如何修（任选其一）：\n\
+               - 不要使用 --unsafe-no-hash（让 SHA256 整文件校验兜底）；或\n\
+               - 开启压缩包测试（不要把 test_archives 设为 false，也不要使用 --no-test-archives）"
         );
     }
     Ok(())
@@ -527,10 +591,10 @@ fn detect_tester(
         Some(t) => Ok(Some(t)),
         None => {
             if opts.no_hash {
+                // AR-08: 与 guard_verify_enabled 保持一致的措辞风格——都是"拒绝运行：…等价于没在做完整性校验"。
                 anyhow::bail!(
-                    "拒绝运行：开启了 --unsafe-no-hash 但**机器上一个压缩包测试器都没装**。\n\
-                     此时 SHA256 没在跑,archive test 也跑不起来 —— 只剩\n\
-                     文件数+大小+修改时间,等价于「没在做完整性校验」。\n\
+                    "拒绝运行：开启了 --unsafe-no-hash 但没有可用的压缩包测试器(WinRAR/Bandizip/7-Zip 均未检测到)。\n\
+                     此时 SHA256 与 archive test 均不运行,等价于「没在做完整性校验」。\n\
                      如何修：\n\
                        - 装一个测试器：推荐 7-Zip(免费开源 https://7-zip.org);或\n\
                        - 去掉 --unsafe-no-hash,让 SHA256 兜底"
@@ -639,14 +703,18 @@ fn handle_one(
         // run_plan 路径:用冻结名,但**复验**它未被占用(预览→执行间可能有人占了它)。
         // 时间戳唯一名(重名场景)不会撞;普通名若现在已存在 → 计划已过期(StalePlan),不照旧误写。
         Some(frozen) => {
+            let drive_projects = paths::drive_projects_dir(&drive.root);
+            let dest_phys = drive_projects.join(frozen);
+            // 索引检查:frozen==name 时用 dup_in_drive;重命名场景重新查 catalog。
+            // 额外 OR 物理路径检查:索引与磁盘不一致时(写索引前宕机等),磁盘上已有目录也算被占用。
             let taken = if frozen == name {
-                dup_in_drive
+                dup_in_drive || dest_phys.exists()
             } else {
-                catalog_has_project(&catalog, frozen).unwrap_or(false)
+                catalog_has_project(&catalog, frozen).unwrap_or(false) || dest_phys.exists()
             };
             if taken {
                 reporter.warn(&format!(
-                    "计划已过期：目标名『{}』在本盘索引中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
+                    "计划已过期：目标名『{}』在本盘索引或磁盘中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
                     frozen
                 ));
                 return Ok(HandleOutcome::StalePlan);
@@ -677,7 +745,7 @@ fn handle_one(
     let need = size.saturating_sub(dest_have);
 
     // 容量
-    let reserve = cfg.reserve_gb * 1024 * 1024 * 1024;
+    let reserve = cfg.reserve_gb.saturating_mul(1024 * 1024 * 1024);
     if size > drive.total_bytes.saturating_sub(reserve) {
         reporter.error(&format!(
             "项目 {:.2}GB 超过单盘容量，空盘也放不下 → 需人工拆分",
@@ -705,6 +773,8 @@ fn handle_one(
         return Ok(HandleOutcome::DriveSealed);
     }
 
+    // dry_run 路径由 run() 在 plan() 后直接 render_dry_run(),不会进入 run_plan/handle_one。
+    // 此处 dry_run 分支仅供直接调用 handle_one(如旧测试)触发时兜底,正常流程不会到达。
     if opts.dry_run {
         reporter.info(&format!(
             "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
@@ -896,6 +966,9 @@ fn handle_one(
     }
 
     // 事务式提交
+    // AR-01 提交顺序:写标记 → 写清单/索引 → rename 移源 → 清标记。
+    // 这样如果 write_csv/catalog 失败,源还在 待备份,下次可以重做。
+    // rename 失败时不清标记(抛错 → 标记留着,下次 check_pending_txn 感知)。
     let local_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let utc = Utc::now().to_rfc3339();
     let src_bytes = src.total_bytes();
@@ -904,6 +977,8 @@ fn handle_one(
     let manifest_path =
         paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
     let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
+    // AR-04: arch_dest 的最终值(含时间戳冲突处理)在 pending.write 之前确定,
+    // 保证 PendingTxn.move_to 记录的是真正的目标路径。
     let mut arch_dest = cfg.archived_root.join(&name);
     if arch_dest.exists() {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
@@ -923,28 +998,7 @@ fn handle_one(
     };
     pending.write(&txn_path)?;
 
-    // 移动源（先动它；失败抛错 → 不写索引；源留在 待备份 下次重做）
-    fs::rename(proj_path, &arch_dest).map_err(|e| {
-        // 跨卷 rename 在 Windows 返回 ERROR_NOT_SAME_DEVICE(17):给可操作的 fail-closed 提示。(ledger L-010)
-        if e.raw_os_error() == Some(17) {
-            anyhow::anyhow!(
-                "移动源失败:待备份({})与已备份({})不在同一磁盘卷,无法原子移动。\n\
-                 如何修:把 ready_root 与 archived_root 配到同一块盘(通常都在你的 SSD 上)。\n\
-                 项目仍留在 待备份,改好配置后会自动重做(目标盘上的副本+校验清单已写好)。",
-                proj_path.display(),
-                arch_dest.display()
-            )
-        } else {
-            anyhow::anyhow!(
-                "移动源失败:{} → {}: {}",
-                proj_path.display(),
-                arch_dest.display(),
-                e
-            )
-        }
-    })?;
-
-    // 写清单 + 本盘索引 + 全局索引
+    // 写清单 + 本盘索引 + 全局索引(在 rename 之前写;失败则源仍在 待备份 可重做)
     src.write_csv(&manifest_path)?;
     append_drive_catalog(
         &catalog,
@@ -977,6 +1031,27 @@ fn handle_one(
             manifest_path: rel_manifest,
         },
     )?;
+
+    // 移动源（索引已落盘后再移；失败抛错 → 不清标记；源留在 待备份 下次重做）
+    fs::rename(proj_path, &arch_dest).map_err(|e| {
+        // 跨卷 rename 在 Windows 返回 ERROR_NOT_SAME_DEVICE(17):给可操作的 fail-closed 提示。(ledger L-010)
+        if e.raw_os_error() == Some(17) {
+            anyhow::anyhow!(
+                "移动源失败:待备份({})与已备份({})不在同一磁盘卷,无法原子移动。\n\
+                 如何修:把 ready_root 与 archived_root 配到同一块盘(通常都在你的 SSD 上)。\n\
+                 项目仍留在 待备份,改好配置后会自动重做(目标盘上的副本+校验清单已写好)。",
+                proj_path.display(),
+                arch_dest.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "移动源失败:{} → {}: {}",
+                proj_path.display(),
+                arch_dest.display(),
+                e
+            )
+        }
+    })?;
 
     txn::PendingTxn::clear(&txn_path)?;
     reporter.ok(&format!(
@@ -1029,6 +1104,10 @@ struct GlobalCatalogRow {
 }
 
 fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
+    // AR-10: 「文件是否已存在」(决定要不要写 CSV header) 与下面 OpenOptions::create 之间存在
+    // TOCTOU 窗口。此 race 可接受：归档是单进程串行执行(一次只处理一个项目，没有并发写同一索引)，
+    // 不会有第二个写者在这两步之间创建该文件。若将来引入并发归档，需改用「打开后 seek 到 0 探测
+    // 是否已有 header 行」之类的更稳健判断。
     let file_existed = path.is_file();
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).ok();
@@ -1051,6 +1130,8 @@ fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
 }
 
 fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
+    // AR-10: 同 append_drive_catalog —— file_existed 探测与 OpenOptions::create 之间的
+    // TOCTOU 在单进程串行归档下可接受(无并发写者)。详见 append_drive_catalog 注释。
     let file_existed = path.is_file();
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).ok();
@@ -1114,6 +1195,10 @@ fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
         .append(true)
         .open(&path)?;
     f.write_all(line.as_bytes())?;
+    // EH-009: 追加后 fsync，与 catalog 写入(append_drive_catalog/append_global_catalog)的落盘
+    // 语义一致。「需人工处理.txt」本身不是关键事务(它是给人看的提醒台账，丢一行不影响数据安全)，
+    // 但这里 sync 成本极低且能保证断电后提醒不丢；用 durable::sync_file 对追加场景同样适用。
+    durable::sync_file(&f)?;
     Ok(())
 }
 
@@ -1135,13 +1220,22 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
         }
     };
     let pname = pending.project_dest_name.clone();
-    let psrc = if pending.project_src_name.is_empty() {
-        pname.clone()
-    } else {
-        pending.project_src_name.clone()
-    };
     let parch = pending.move_to.clone();
-    let in_ready = !psrc.is_empty() && cfg.ready_root.join(&psrc).exists();
+    // AR-09: 判断「源是否仍在待备份」时，绝不能回退到 project_dest_name —— 重名场景下它带秒级
+    // 时间戳后缀(如 001proj_20260529...)，而待备份里的源名永远是**原始名**(001proj)，
+    // 拿带时间戳的名去 ready_root 拼路径会永远查不到、把「源还在」误判成「源已移走」。
+    // 可靠来源优先级：
+    //   1. project_src_name —— 现版本一定会写的原始项目名；
+    //   2. src_path —— 写标记时记录的源**完整路径**，直接 exists() 最可靠(兼容旧标记)；
+    //   3. 两者都没有(极旧标记) → 无法判定源名，不猜，in_ready=false 交给「无法自动判定」分支
+    //      保留标记请人工核对，而不是用时间戳名误判。
+    let in_ready = if !pending.project_src_name.is_empty() {
+        cfg.ready_root.join(&pending.project_src_name).exists()
+    } else if !pending.src_path.is_empty() {
+        Path::new(&pending.src_path).exists()
+    } else {
+        false
+    };
     let moved = !parch.is_empty() && Path::new(&parch).exists();
     let global = paths::system_global_catalog(&cfg.system_root);
     let indexed = global_has_folder(&global, &pname).unwrap_or(false);
@@ -1216,7 +1310,14 @@ fn folder_stats(p: &Path) -> FolderStats {
 /// 简单的递归复制；与 robocopy 比缺少 /Z 断点续传中段恢复，但小文件/中等大小够用。
 /// 已存在且大小相同的文件直接跳过（保留断点续传的核心语义）。
 ///
-/// TODO(Batch 4)：改为 .bftool-part 临时文件 + 写完 sync + 重读目标算 hash + 原子 rename。
+/// 原子写已实现：每个文件先写 `<target>.bftool-part` → fsync → rename 到正式名(见下方循环)。
+/// 崩溃只会留下 .part(被当 cruft 忽略、下轮重写)，不会留下「大小对得上的半成品」被续传误跳过。
+///
+/// EH-010 续传策略 + 兜底：续传时以「目标已存在且**大小相同**」判定该文件已传、直接跳过。
+/// 大小相同但内容损坏(如坏扇区、之前被截断后又恰好补到同样字节数)的文件会被这一步跳过，
+/// 但**不会漏检**：copy_folder 返回后，handle_one 会对整个目标目录重算 manifest 并与源做
+/// SHA256 diff(manifest::diff，非 no_hash 时逐文件比哈希)，内容不一致的文件在那一步被发现、
+/// 移入隔离目录，下次运行补传重校。即「大小跳过」是性能优化，「SHA256 diff」是正确性兜底。
 fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
     fs::create_dir_all(dst).ok();
     let mut errors: Vec<String> = Vec::new();
@@ -1294,6 +1395,12 @@ fn leading_digits(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::reporter::NoopReporter;
+
+    // AR-12 测试分工说明:本模块的 handle_one / run_plan 集成测试都跑在 test_archives=false 下,
+    // 是**有意**的——它们聚焦核心归档流程(复制/SHA256 校验/源复核/事务提交/移源/断点续传),
+    // 不想被外部压缩包测试器(WinRAR/Bandizip/7-Zip 是否安装)的环境依赖污染、影响可重复性。
+    // 「archive test 通路」(detect / test_folder / 覆盖率 / 坏包隔离)有 archive_test.rs 自己的
+    // 单元测试覆盖(见 engine::archive_test 的 tests 模块);两边职责不重叠。
 
     /// 搭一个临时"世界":ready/archived/sys + 一块假备份盘,供 handle_one 集成测试复用。
     fn temp_world() -> (tempfile::TempDir, Config, DriveInfo) {
@@ -1624,5 +1731,114 @@ mod tests {
             "应提示计划已过期;日志:\n{}",
             log
         );
+    }
+
+    // ── AR-01 崩溃恢复回归(TEST-AR01):check_pending_txn 三分支 + 重做幂等 ──
+
+    /// 在 cfg.system_root 造一个事务标记。
+    fn write_marker(cfg: &Config, src_name: &str, dest_name: &str, src_path: &str, move_to: &str) {
+        txn::PendingTxn {
+            project_dest_name: dest_name.into(),
+            project_src_name: src_name.into(),
+            drive_id: "备份1".into(),
+            drive_letter: "T".into(),
+            in_drive_path: format!("项目\\{dest_name}"),
+            src_path: src_path.into(),
+            move_to: move_to.into(),
+            started_at: "2026-05-29 12:00:00".into(),
+        }
+        .write(&paths::system_pending_txn(&cfg.system_root))
+        .unwrap();
+    }
+
+    #[test]
+    fn check_pending_txn_source_in_ready_clears_marker() {
+        // 新顺序"写索引→移源"崩在"索引已写、移源未发生"→ 源还在待备份 → 清标记自动重做。
+        let (_d, cfg, _drive) = temp_world();
+        let src = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&src).unwrap();
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &src.display().to_string(),
+            &cfg.archived_root.join("001proj").display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        assert!(marker.is_file());
+        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(!marker.exists(), "源仍在待备份 → 清标记自动重做");
+    }
+
+    #[test]
+    fn check_pending_txn_moved_and_indexed_clears_marker() {
+        // 已移源 + 索引已写 → 完整完成,仅标记残留 → 自动清除。
+        let (_d, cfg, _drive) = temp_world();
+        let arch = cfg.archived_root.join("001proj");
+        fs::create_dir_all(&arch).unwrap();
+        fs::write(
+            paths::system_global_catalog(&cfg.system_root),
+            "文件夹名,备份盘名\n001proj,备份1\n",
+        )
+        .unwrap();
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &cfg.ready_root.join("001proj").display().to_string(),
+            &arch.display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(!marker.exists(), "已移+已索引 → 判定完成,清标记");
+    }
+
+    #[test]
+    fn check_pending_txn_moved_not_indexed_keeps_marker() {
+        // 罕见:已移源但索引漏写 → 保留标记,交人工核对(不自动清)。
+        let (_d, cfg, _drive) = temp_world();
+        let arch = cfg.archived_root.join("001proj");
+        fs::create_dir_all(&arch).unwrap();
+        // 不写 global catalog → indexed=false
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &cfg.ready_root.join("001proj").display().to_string(),
+            &arch.display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(marker.exists(), "已移但索引漏写 → 保留标记待人工");
+    }
+
+    #[test]
+    fn crash_after_index_before_move_redo_is_idempotent() {
+        // AR-01 核心保证:新顺序"写索引→移源",若崩在"索引已写、源未移",源还在待备份;
+        // 重做时本盘索引已有该项 → 改时间戳唯一名归档,绝不覆盖已写副本,源不丢失。
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        // 首次归档成功(源移走,本盘索引写入 001proj)。
+        handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        assert!(!proj.exists(), "首次归档后源已移走");
+        // 复现崩溃残留:源又出现在待备份(= 索引已写但移源被中断,源还在)。
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        // 重做:本盘索引已有 001proj → 走重名 → 改时间戳唯一名。
+        let out = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        assert!(matches!(out, HandleOutcome::Done), "重做应成功(改名归档)");
+        assert!(!proj.exists(), "重做后源被移走,不丢失");
+        let proj_dir = paths::drive_projects_dir(&drive.root);
+        assert!(proj_dir.join("001proj").is_dir(), "原副本未被覆盖");
+        let renamed = fs::read_dir(&proj_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("001proj_") && n != "001proj"
+            });
+        assert!(renamed, "重做应以时间戳唯一名归档,不覆盖原 001proj");
     }
 }

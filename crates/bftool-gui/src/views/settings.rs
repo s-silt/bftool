@@ -8,7 +8,7 @@ use eframe::egui;
 use bftool_core::config::{Config, ConfigSource, LoadedConfig, SaveTarget};
 
 use crate::app::App;
-use crate::views::util;
+use crate::views::{theme, util};
 
 /// 保存位置(GUI 暴露 3 种;Custom 需文件对话框,暂不在 GUI 提供)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -125,9 +125,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.selectable_value(
             &mut app.settings_ui.save_choice,
             SaveChoice::CurrentDir,
-            "当前目录(仅 CLI 也在此目录运行才生效)",
+            "当前目录(= 程序所在目录,通常不是你预期的位置)",
         );
     });
+    if app.settings_ui.save_choice == SaveChoice::CurrentDir {
+        // R-05:GUI 双击启动时,current_dir() 是 .exe 所在目录(而非用户"当前在看的"
+        // 文件夹),配置会落在程序旁边,既难找又可能随程序移动而丢失。引导用 %APPDATA%。
+        ui.colored_label(
+            theme::WARN,
+            "提示:GUI 双击启动时,这里是 .exe 所在目录,通常不是你预期的位置。除非你清楚 CLI 也固定从此目录运行,否则建议选「%APPDATA%」。",
+        );
+    }
     if is_default && app.settings_ui.save_choice == SaveChoice::CurrentSource {
         // Default 时该选项禁用;若残留选中,纠回 AppData
         app.settings_ui.save_choice = SaveChoice::AppData;
