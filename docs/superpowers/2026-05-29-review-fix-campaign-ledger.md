@@ -9,7 +9,7 @@
 
 ## 进度(实时,Phase 3)
 
-测试数:0 → **78 passed**。每条修复后门禁(fmt/build/test/clippy)全绿。
+测试数:0 → **79 passed**。每条修复后门禁(fmt/build/test/clippy)全绿;CI 已硬化(`0792d66`)。
 
 > **⚠ 重大发现 L-044(P1,集成测试新抓到)**:`manifest::build` 与 `verify_tree` 对 base 做 `canonicalize()`(Windows 加 `\\?\` 前缀),而 `cruft::walk` 的 `WalkDir` 产出路径不带前缀 → `strip_prefix` 失配 → rel 退化成**绝对路径** → **diff/verify 在 Windows 上必然失败,核心归档功能根本跑不通**。因 CI 不跑 `cargo test`(CI-4)+ 核心零集成测试,一直未暴露。已修(base 改用传入 root)+ handle_one happy-path 集成测试锁定。commit `0582389`。
 
@@ -49,10 +49,25 @@
 - L-043 → **已由 L-044 修复**(同根因 canonicalize/strip_prefix;verify_tree 与 manifest::build 的 base 都已改)。
 - L-044(P1)→ 见上「重大发现」,已修 `0582389`。
 
-**剩余:**
-- P2 未修:L-011(本盘/全局 catalog 非原子)、L-012(提交失败分类)、L-015(隔离 create_dir_all 吞错)、**L-019(Entry.hash→类型,大改)**、**L-021(DriveInfo sealed→newtype,大改)**
-- P3 未修:L-016(scan_mounted 丢盘静默→降 P3)、L-031(status/find println 绕过 Reporter)、L-039(spec A 行号 banner)、L-041(find 测试)、L-042(leading_number 测试)、L-028/029/030(冗余读/folder_stable 吞错/seal 统计)
-- Phase 4 对抗复审 → Phase 5(CI 硬化 + cargo-audit + DoD)→ 桌面版设计
+**剩余 P2/P3(已评估,见下「取舍」):** L-021、L-011、L-012(P2);L-016/L-031/L-039/L-041/L-042/L-028/029/030(P3)。
+
+## Phase 4 对抗复审结果(2 个独立 agent)
+
+code-reviewer + silent-failure-hunter 各自独立尝试推翻这批修复 → **绝大多数被逐条背书 sound**。发现的真残留已修(commit `3f71c7f`):
+- F-01/F-6(P2):verify 清单行缺 Size 且缺 Hash → 只查存在性的 fail-open,已改 fail-closed(+测试)。
+- F-4(P2,修订 L-017):本盘索引损坏时原"假设重名+改名续写"会每轮全量重写填盘 → 已改 fail-closed Skipped(+集成测试)。
+- F-3(P2):孤儿 `.bftool-part` 不清理 → 已加清理。
+- F-5(P3):build doc 跟进 L-019。
+- **F-2(P1 质疑,接受为已知残留):L-001 的 fsync 是文件级真改进,但未做父目录 fsync,非 NTFS 介质(exFAT/FAT32)断电仍可能丢目录项。README 已强制备份盘用 NTFS(元数据日志兜底);非 NTFS 目录项 durability 记为残留(真闭合需 FILE_FLAG_BACKUP_SEMANTICS 目录 fsync = FFI,deferred)。L-001 如实表述为「文件级 fsync + 提交顺序 + NTFS 假设」,而非「P0 完全闭合」。**
+- F-1(P1 活锁)→ 主控复核**驳回**:copy_folder 会重传缺失文件、无法复制的会 bail 报错,不会静默活锁。
+- F-04 / F-02(P3)→ 评估为非 fail-open(经 run catch 优雅降级 / 均 Skipped 非假成功),接受不改。
+
+## 取舍(剩余 P2/P3 处置,交用户拍板)
+
+- **L-021 / L-011 / L-012(P2)**:L-021 是最大的类型重构(`DriveInfo`→`WritableDrive`/`SealedDrive` 拆分,贯穿 drive/archive/verify),价值是"塑造 GUI 直接调用的 core API"——建议**与桌面版设计一并做**(届时才知 GUI 需要什么 API 形状),而非现在盲改。L-011/L-012 是事务恢复的微秒级崩溃窗口边角,数据已被 txn 标记机制守住(不丢、提示人工),价值低改动深,建议记 backlog。
+- P3 多为文档/小测,可随手清或留。
+
+## 下一步:Phase 5(CI 已硬化 `0792d66`,待 push 实跑)→ 桌面版设计
 
 ---
 
