@@ -29,7 +29,15 @@ pub struct Options {
     pub no_test_archives: bool,
 }
 
-pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
+/// 一轮归档的结果汇总。`failed>0` = 有项目处理失败 —— CLI 据此设非零退出码,
+/// 自动化/计划任务才能识别"批量归档里有失败"(此前总是 exit 0)。(ledger L-007)
+#[derive(Debug, Default, Clone)]
+pub struct ArchiveSummary {
+    pub handled: usize,
+    pub failed: usize,
+}
+
+pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<ArchiveSummary> {
     // Spec B D14/D15 core-level fail-closed guard
     if opts.no_hash && (!cfg.test_archives || opts.no_test_archives) {
         anyhow::bail!(
@@ -59,7 +67,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
             None => {
                 reporter.error("未发现已初始化且未封盘的备份盘。");
                 reporter.info("插入空盘后运行：bftool init <盘符>（例：bftool init E）");
-                return Ok(());
+                return Ok(ArchiveSummary::default());
             }
         },
     };
@@ -68,7 +76,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
             "盘 {} ({}:) 已封盘，禁止写入。请换上一块未封盘的备份盘或初始化新盘。",
             drive.id, drive.letter
         ));
-        return Ok(());
+        return Ok(ArchiveSummary::default());
     }
 
     reporter.ok(&format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
@@ -119,7 +127,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     // 列出待归档项目
     if !cfg.ready_root.is_dir() {
         reporter.error(&format!("待备份 不存在：{}", cfg.ready_root.display()));
-        return Ok(());
+        return Ok(ArchiveSummary::default());
     }
     let mut projects: Vec<_> = fs::read_dir(&cfg.ready_root)?
         .filter_map(|e| e.ok())
@@ -133,7 +141,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     });
     if projects.is_empty() {
         reporter.info("待备份 中没有待归档项目，结束。");
-        return Ok(());
+        return Ok(ArchiveSummary::default());
     }
     reporter.info(&format!(
         "发现 {} 个待归档项目（按编号升序处理）。",
@@ -141,6 +149,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
     ));
 
     let mut handled = 0usize;
+    let mut failed = 0usize;
     for proj in &projects {
         if opts.limit > 0 && handled >= opts.limit {
             reporter.action(&format!(
@@ -183,11 +192,19 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<()> {
                     name, e
                 ));
                 append_manual(cfg, &name, &format!("未捕获异常：{}", e))?;
+                failed += 1;
             }
         }
     }
-    reporter.ok("本轮结束。");
-    Ok(())
+    if failed > 0 {
+        reporter.error(&format!(
+            "本轮结束：{} 个成功,{} 个失败(详见上方与「需人工处理.txt」)。",
+            handled, failed
+        ));
+    } else {
+        reporter.ok("本轮结束。");
+    }
+    Ok(ArchiveSummary { handled, failed })
 }
 
 enum HandleOutcome {

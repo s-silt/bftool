@@ -167,7 +167,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             if let Some(r) = reserve_gb {
                 cfg.reserve_gb = r;
             }
-            engine::archive::run(
+            let summary = engine::archive::run(
                 &cfg,
                 reporter,
                 engine::archive::Options {
@@ -178,12 +178,32 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
                     drive_letter_override: drive,
                     no_test_archives,
                 },
-            )
+            )?;
+            if summary.failed > 0 {
+                bail!(
+                    "{} 个项目未成功归档(详见上方与「需人工处理.txt」);其余 {} 个已完成。\n\
+                     (本命令以非零退出码结束,便于脚本/计划任务识别失败。)",
+                    summary.failed,
+                    summary.handled
+                );
+            }
+            Ok(())
         }
         Some(Command::Init { drive, id, force }) => {
             engine::drive::init(&cfg, reporter, &drive, id.as_deref(), force)
         }
-        Some(Command::Verify { drive }) => engine::verify::run(&cfg, reporter, drive.as_deref()),
+        Some(Command::Verify { drive }) => {
+            let report = engine::verify::run(&cfg, reporter, drive.as_deref())?;
+            if report.has_corruption() {
+                bail!(
+                    "复查发现 {} 处损坏/缺失/大小不符 —— 本盘完整性有问题。\n\
+                     请用其它副本恢复受损项目,或重做本盘。\n\
+                     (本命令以非零退出码结束,便于定期复查脚本/计划任务识别坏盘。)",
+                    report.bad
+                );
+            }
+            Ok(())
+        }
         Some(Command::Find { keyword }) => engine::find::run(&cfg, &keyword),
         Some(Command::Drives) => engine::drive::list_mounted(&cfg, reporter),
         Some(Command::ConfigShow) => {
