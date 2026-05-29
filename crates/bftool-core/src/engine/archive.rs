@@ -44,6 +44,30 @@ pub fn verify_disabled(no_hash: bool, test_archives: bool, no_test_archives: boo
     no_hash && (!test_archives || no_test_archives)
 }
 
+/// 校验强度的类型化表示:由"是否跑了 SHA256"派生,避免 "SHA256-OK"/"SIZE+COUNT" 字面量
+/// 散落各处、与实际校验脱钩。token() 是写入索引 CSV 的稳定列值(保持旧版兼容)。(ledger L-020)
+#[derive(Debug, Clone, Copy)]
+enum VerifyStatus {
+    Sha256Ok,
+    SizeCount,
+}
+
+impl VerifyStatus {
+    fn from_opts(no_hash: bool) -> Self {
+        if no_hash {
+            Self::SizeCount
+        } else {
+            Self::Sha256Ok
+        }
+    }
+    fn token(self) -> &'static str {
+        match self {
+            Self::Sha256Ok => "SHA256-OK",
+            Self::SizeCount => "SIZE+COUNT",
+        }
+    }
+}
+
 pub fn run(cfg: &Config, reporter: &dyn Reporter, opts: Options) -> Result<ArchiveSummary> {
     // Spec B D14/D15 core-level fail-closed guard(判定收口到 verify_disabled,与 CLI 共用)(ledger L-008)
     if verify_disabled(opts.no_hash, cfg.test_archives, opts.no_test_archives) {
@@ -497,11 +521,7 @@ fn handle_one(
     let utc = Utc::now().to_rfc3339();
     let src_bytes = src.total_bytes();
     let size_gbval = src_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    let verify_status = if opts.no_hash {
-        "SIZE+COUNT"
-    } else {
-        "SHA256-OK"
-    };
+    let verify_status = VerifyStatus::from_opts(opts.no_hash);
     let manifest_path =
         paths::drive_manifest_dir(&drive.root).join(format!("{}.sha256.csv", dest_name));
     let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
@@ -543,7 +563,7 @@ fn handle_one(
             file_count: src.count() as u64,
             total_bytes: src_bytes,
             archived_utc: utc.clone(),
-            verify_status: verify_status.to_string(),
+            verify_status: verify_status.token().to_string(),
             status: "Complete".to_string(),
             notes: if dup_in_drive {
                 format!("原名 {}", name)
@@ -562,7 +582,7 @@ fn handle_one(
             in_drive_path: format!("项目\\{}", dest_name),
             file_count: src.count() as u64,
             size_gb: size_gbval,
-            verify: verify_status.to_string(),
+            verify: verify_status.token().to_string(),
             manifest_path: rel_manifest,
         },
     )?;
@@ -1039,6 +1059,13 @@ mod tests {
         cfg.system_root = bogus; // system_root 指向文件 → 台账写入必失败
                                  // 关键:返回 () 且不 panic —— 写失败只 warn,不会中止整轮归档
         note_manual(&cfg, &NoopReporter, "proj", "校验失败：xxx");
+    }
+
+    // ── L-020: VerifyStatus token 稳定且单一来源 ──
+    #[test]
+    fn verify_status_tokens() {
+        assert_eq!(VerifyStatus::from_opts(false).token(), "SHA256-OK");
+        assert_eq!(VerifyStatus::from_opts(true).token(), "SIZE+COUNT");
     }
 
     // ── L-008: 无校验判定单一来源,core/cli 共用 verify_disabled ──
