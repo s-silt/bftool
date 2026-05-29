@@ -79,6 +79,11 @@ impl<T: Send + 'static> BackgroundTask<T> {
     }
 }
 
+/// Drop 时**先置取消、再 join**(不 detach)。
+/// 为什么 join 而非 detach:与 core 的 AR-01 不变式一致——绝不让后台线程在进程/视图撤销后
+/// 还继续改动半移动状态的归档(否则可能在退出后写坏盘/索引)。数据完整性 > 即时关闭。
+/// 已知代价:若正在跑一个大项目,取消在**项目边界**才生效,join 会阻塞到下一个边界,
+/// 关窗时窗口可能短暂"无响应"(几秒)。这是有意权衡,可接受。
 impl<T> Drop for BackgroundTask<T> {
     fn drop(&mut self) {
         self.cancel

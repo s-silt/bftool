@@ -1732,4 +1732,113 @@ mod tests {
             log
         );
     }
+
+    // ── AR-01 崩溃恢复回归(TEST-AR01):check_pending_txn 三分支 + 重做幂等 ──
+
+    /// 在 cfg.system_root 造一个事务标记。
+    fn write_marker(cfg: &Config, src_name: &str, dest_name: &str, src_path: &str, move_to: &str) {
+        txn::PendingTxn {
+            project_dest_name: dest_name.into(),
+            project_src_name: src_name.into(),
+            drive_id: "备份1".into(),
+            drive_letter: "T".into(),
+            in_drive_path: format!("项目\\{dest_name}"),
+            src_path: src_path.into(),
+            move_to: move_to.into(),
+            started_at: "2026-05-29 12:00:00".into(),
+        }
+        .write(&paths::system_pending_txn(&cfg.system_root))
+        .unwrap();
+    }
+
+    #[test]
+    fn check_pending_txn_source_in_ready_clears_marker() {
+        // 新顺序"写索引→移源"崩在"索引已写、移源未发生"→ 源还在待备份 → 清标记自动重做。
+        let (_d, cfg, _drive) = temp_world();
+        let src = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&src).unwrap();
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &src.display().to_string(),
+            &cfg.archived_root.join("001proj").display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        assert!(marker.is_file());
+        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(!marker.exists(), "源仍在待备份 → 清标记自动重做");
+    }
+
+    #[test]
+    fn check_pending_txn_moved_and_indexed_clears_marker() {
+        // 已移源 + 索引已写 → 完整完成,仅标记残留 → 自动清除。
+        let (_d, cfg, _drive) = temp_world();
+        let arch = cfg.archived_root.join("001proj");
+        fs::create_dir_all(&arch).unwrap();
+        fs::write(
+            paths::system_global_catalog(&cfg.system_root),
+            "文件夹名,备份盘名\n001proj,备份1\n",
+        )
+        .unwrap();
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &cfg.ready_root.join("001proj").display().to_string(),
+            &arch.display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(!marker.exists(), "已移+已索引 → 判定完成,清标记");
+    }
+
+    #[test]
+    fn check_pending_txn_moved_not_indexed_keeps_marker() {
+        // 罕见:已移源但索引漏写 → 保留标记,交人工核对(不自动清)。
+        let (_d, cfg, _drive) = temp_world();
+        let arch = cfg.archived_root.join("001proj");
+        fs::create_dir_all(&arch).unwrap();
+        // 不写 global catalog → indexed=false
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &cfg.ready_root.join("001proj").display().to_string(),
+            &arch.display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(marker.exists(), "已移但索引漏写 → 保留标记待人工");
+    }
+
+    #[test]
+    fn crash_after_index_before_move_redo_is_idempotent() {
+        // AR-01 核心保证:新顺序"写索引→移源",若崩在"索引已写、源未移",源还在待备份;
+        // 重做时本盘索引已有该项 → 改时间戳唯一名归档,绝不覆盖已写副本,源不丢失。
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        // 首次归档成功(源移走,本盘索引写入 001proj)。
+        handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        assert!(!proj.exists(), "首次归档后源已移走");
+        // 复现崩溃残留:源又出现在待备份(= 索引已写但移源被中断,源还在)。
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        // 重做:本盘索引已有 001proj → 走重名 → 改时间戳唯一名。
+        let out = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        assert!(matches!(out, HandleOutcome::Done), "重做应成功(改名归档)");
+        assert!(!proj.exists(), "重做后源被移走,不丢失");
+        let proj_dir = paths::drive_projects_dir(&drive.root);
+        assert!(proj_dir.join("001proj").is_dir(), "原副本未被覆盖");
+        let renamed = fs::read_dir(&proj_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("001proj_") && n != "001proj"
+            });
+        assert!(renamed, "重做应以时间戳唯一名归档,不覆盖原 001proj");
+    }
 }
