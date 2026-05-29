@@ -4,10 +4,10 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
@@ -201,105 +201,262 @@ fn verify_tree(
             .to_string();
         reporter.action(&format!("· {}", project_name));
         let proj_dir = projects_dir.join(&project_name);
-        let mut expected: HashMap<String, (u64, String)> = HashMap::new();
 
-        let mut rdr = csv::Reader::from_path(mf.path())
-            .with_context(|| format!("读校验清单失败：{}", mf.path().display()))?;
-        let headers = rdr.headers()?.clone();
-        let i_rel = headers.iter().position(|h| h == "Rel");
-        let i_size = headers.iter().position(|h| h == "Size");
-        let i_hash = headers.iter().position(|h| h == "Hash");
-        let Some(i_rel) = i_rel else {
-            reporter.warn(&format!("清单缺少 Rel 列，跳过：{}", mf.path().display()));
-            continue;
+        // 一个坏清单(读不出/缺 Rel 列)只跳过该项目(warn),不中断整盘复查。
+        let rows = match read_manifest_rows(&mf.path()) {
+            Ok(r) => r,
+            Err(e) => {
+                reporter.warn(&format!("跳过(清单有问题):{} —— {}", project_name, e));
+                continue;
+            }
         };
-
-        for rec in rdr.records().flatten() {
-            let rel = rec.get(i_rel).unwrap_or("").to_string();
-            // 用 rel_has_cruft_component 检查全部路径段,覆盖 cruft 目录下的旧条目
-            if cruft::rel_has_cruft_component(&rel) {
-                continue;
-            }
-            // size 为 Option:列缺失/不可解析 = 未知(不校验大小);存在(含 0)就精确比对。(ledger L-013)
-            let size = i_size
-                .and_then(|c| rec.get(c))
-                .and_then(|s| s.parse::<u64>().ok());
-            let hash = i_hash.and_then(|c| rec.get(c)).unwrap_or("").to_string();
-            expected.insert(rel.clone(), (size.unwrap_or(0), hash.clone()));
-
-            let f = proj_dir.join(&rel);
-            report.checked += 1;
-            if !f.is_file() {
-                reporter.error(&format!("  缺失: {}", rel));
-                report.push_issue(&project_name, &rel, VerifyIssueKind::Missing);
-                continue;
-            }
-            let meta = match fs::metadata(&f) {
-                Ok(m) => m,
-                Err(e) => {
-                    reporter.error(&format!("  无法读元数据 {}: {}", rel, e));
-                    report.push_issue(&project_name, &rel, VerifyIssueKind::ReadError);
-                    continue;
-                }
-            };
-            // 既无 Size 也无 Hash → 无任何可校验属性 → fail-closed。(Phase 4 F-01/F-6)
-            if size.is_none() && hash.is_empty() {
-                reporter.error(&format!("  清单项缺 Size 且缺 Hash,无法校验: {}", rel));
-                report.push_issue(&project_name, &rel, VerifyIssueKind::Unverifiable);
-                continue;
-            }
-            if let Some(sz) = size {
-                if meta.len() != sz {
-                    reporter.error(&format!("  大小不一致: {}", rel));
-                    report.push_issue(&project_name, &rel, VerifyIssueKind::SizeMismatch);
-                    continue;
-                }
-            }
-            if !hash.is_empty() {
-                match sha256_hex(&f) {
-                    Ok(h) if h == hash => {}
-                    Ok(_) => {
-                        reporter.error(&format!("  损坏/不一致: {}", rel));
-                        report.push_issue(&project_name, &rel, VerifyIssueKind::Corrupt);
-                    }
-                    Err(e) => {
-                        reporter.error(&format!("  读取失败 {}: {}", rel, e));
-                        report.push_issue(&project_name, &rel, VerifyIssueKind::ReadError);
-                    }
-                }
-            }
+        let mut expected: HashSet<String> = HashSet::new();
+        for (rel, size, hash) in &rows {
+            expected.insert(rel.clone());
+            check_one_file(
+                &proj_dir,
+                &project_name,
+                rel,
+                *size,
+                hash,
+                reporter,
+                &mut report,
+            );
         }
+        report_extras(&proj_dir, &project_name, &expected, reporter, &mut report);
+    }
 
-        // 报告清单外的多余文件（不删除）
-        if proj_dir.is_dir() {
-            // 同 L-044:不 canonicalize,否则 `\\?\` 前缀与 walk 路径失配 → extra 全部误报。
-            let base = proj_dir.clone();
-            for entry in cruft::walk(&proj_dir) {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(err) => {
-                        reporter.error(&format!("  枚举失败: {}", err));
-                        report.push_issue(&project_name, "", VerifyIssueKind::EnumError);
-                        continue;
-                    }
-                };
-                if !entry.file_type().is_file() {
-                    continue;
+    Ok(report)
+}
+
+/// 复查单个目标:一个项目文件夹(选的是 `项目\<proj>`)或项目内单个文件(更深的路径)。
+/// 自动定位所在备份盘 + 项目,读该项目清单比对。**对盘只读**;不更新 last_verify
+/// (这是局部抽查,非整盘复查,记录全盘 outcome 会误导)。(Spec D §4.4 精神)
+pub fn verify_one(
+    _cfg: &Config,
+    reporter: &dyn Reporter,
+    target: &Path,
+    cancel: &AtomicBool,
+) -> Result<VerifyReport> {
+    let mut report = VerifyReport::default();
+    let (root, project, rel) = locate_backup_target(target)?;
+    let manifest = paths::drive_manifest_dir(&root).join(format!("{}.sha256.csv", project));
+    if !manifest.is_file() {
+        bail!(
+            "找不到项目「{}」的校验清单:{}(它可能不是本工具归档的项目)",
+            project,
+            manifest.display()
+        );
+    }
+    let proj_dir = paths::drive_projects_dir(&root).join(&project);
+    let rows = read_manifest_rows(&manifest)?;
+
+    match rel {
+        // 整个项目文件夹:逐清单项校验 + 报告多余文件。
+        None => {
+            reporter.info(&format!("复查项目「{}」(重算 SHA256 比对清单)…", project));
+            let mut expected: HashSet<String> = HashSet::new();
+            for (r, size, hash) in &rows {
+                if cancel.load(Ordering::Relaxed) {
+                    report.cancelled = true;
+                    reporter.warn("复查已取消。");
+                    return Ok(report);
                 }
-                let rel = entry
-                    .path()
-                    .strip_prefix(&base)
-                    .map(|p| p.to_string_lossy().replace('/', "\\"))
-                    .unwrap_or_default();
-                if !expected.contains_key(&rel) {
-                    reporter.warn(&format!("  多余(清单外): {}", rel));
-                    report.push_extra(&project_name, &rel);
+                expected.insert(r.clone());
+                check_one_file(&proj_dir, &project, r, *size, hash, reporter, &mut report);
+            }
+            report_extras(&proj_dir, &project, &expected, reporter, &mut report);
+        }
+        // 单个文件:在清单里找它的期望值再比对;清单里没有 → 多余(无法比对哈希)。
+        Some(rel) => {
+            reporter.info(&format!("复查文件「{}\\{}」…", project, rel));
+            match rows.iter().find(|(r, _, _)| r == &rel) {
+                Some((r, size, hash)) => {
+                    check_one_file(&proj_dir, &project, r, *size, hash, reporter, &mut report);
+                }
+                None => {
+                    reporter.warn(&format!(
+                        "该文件不在项目清单中,无法比对哈希(可能是清单外的多余文件):{}",
+                        rel
+                    ));
+                    report.push_extra(&project, &rel);
                 }
             }
         }
     }
 
+    let summary = format!(
+        "单目标复查完成:检查 {} 个文件,损坏/缺失/大小问题 {} 个,清单外 {} 个。",
+        report.checked, report.bad, report.extra
+    );
+    if report.bad > 0 {
+        reporter.error(&summary);
+    } else if report.extra > 0 {
+        reporter.warn(&summary);
+    } else {
+        reporter.ok(&summary);
+    }
     Ok(report)
+}
+
+/// 校验单个文件 vs 清单期望(缺失/读失败/不可校验/大小/SHA),结果记进 report。
+/// verify_tree(整盘)与 verify_one(单目标)共用,保证两条路径判定一致。
+fn check_one_file(
+    proj_dir: &Path,
+    project_name: &str,
+    rel: &str,
+    size: Option<u64>,
+    hash: &str,
+    reporter: &dyn Reporter,
+    report: &mut VerifyReport,
+) {
+    let f = proj_dir.join(rel);
+    report.checked += 1;
+    if !f.is_file() {
+        reporter.error(&format!("  缺失: {}", rel));
+        report.push_issue(project_name, rel, VerifyIssueKind::Missing);
+        return;
+    }
+    let meta = match fs::metadata(&f) {
+        Ok(m) => m,
+        Err(e) => {
+            reporter.error(&format!("  无法读元数据 {}: {}", rel, e));
+            report.push_issue(project_name, rel, VerifyIssueKind::ReadError);
+            return;
+        }
+    };
+    // 既无 Size 也无 Hash → 无任何可校验属性 → fail-closed。(Phase 4 F-01/F-6)
+    if size.is_none() && hash.is_empty() {
+        reporter.error(&format!("  清单项缺 Size 且缺 Hash,无法校验: {}", rel));
+        report.push_issue(project_name, rel, VerifyIssueKind::Unverifiable);
+        return;
+    }
+    if let Some(sz) = size {
+        if meta.len() != sz {
+            reporter.error(&format!("  大小不一致: {}", rel));
+            report.push_issue(project_name, rel, VerifyIssueKind::SizeMismatch);
+            return;
+        }
+    }
+    if !hash.is_empty() {
+        match sha256_hex(&f) {
+            Ok(h) if h == hash => {}
+            Ok(_) => {
+                reporter.error(&format!("  损坏/不一致: {}", rel));
+                report.push_issue(project_name, rel, VerifyIssueKind::Corrupt);
+            }
+            Err(e) => {
+                reporter.error(&format!("  读取失败 {}: {}", rel, e));
+                report.push_issue(project_name, rel, VerifyIssueKind::ReadError);
+            }
+        }
+    }
+}
+
+/// 报告项目目录里清单外的多余文件(不删除)。
+fn report_extras(
+    proj_dir: &Path,
+    project_name: &str,
+    expected: &HashSet<String>,
+    reporter: &dyn Reporter,
+    report: &mut VerifyReport,
+) {
+    if !proj_dir.is_dir() {
+        return;
+    }
+    // 同 L-044:不 canonicalize,否则 `\\?\` 前缀与 walk 路径失配 → extra 全部误报。
+    for entry in cruft::walk(proj_dir) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                reporter.error(&format!("  枚举失败: {}", err));
+                report.push_issue(project_name, "", VerifyIssueKind::EnumError);
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(proj_dir)
+            .map(|p| p.to_string_lossy().replace('/', "\\"))
+            .unwrap_or_default();
+        if !expected.contains(&rel) {
+            reporter.warn(&format!("  多余(清单外): {}", rel));
+            report.push_extra(project_name, &rel);
+        }
+    }
+}
+
+/// 读清单为 (Rel, Size?, Hash) 行;跳过 cruft 段;缺 Rel 列/读失败 → Err(由调用方决定跳过还是报错)。
+/// size 为 Option:列缺失/不可解析 = 未知(不校验大小);存在(含 0)就精确比对。(ledger L-013)
+fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>> {
+    let mut rdr = csv::Reader::from_path(path)
+        .with_context(|| format!("读校验清单失败：{}", path.display()))?;
+    let headers = rdr.headers()?.clone();
+    let i_rel = headers.iter().position(|h| h == "Rel");
+    let i_size = headers.iter().position(|h| h == "Size");
+    let i_hash = headers.iter().position(|h| h == "Hash");
+    let Some(i_rel) = i_rel else {
+        bail!("清单缺少 Rel 列：{}", path.display());
+    };
+    let mut out = Vec::new();
+    for rec in rdr.records().flatten() {
+        let rel = rec.get(i_rel).unwrap_or("").to_string();
+        if cruft::rel_has_cruft_component(&rel) {
+            continue;
+        }
+        let size = i_size
+            .and_then(|c| rec.get(c))
+            .and_then(|s| s.parse::<u64>().ok());
+        let hash = i_hash.and_then(|c| rec.get(c)).unwrap_or("").to_string();
+        out.push((rel, size, hash));
+    }
+    Ok(out)
+}
+
+/// 从用户选的路径定位:所在备份盘根 + 项目名 + (若选的是文件)项目内相对路径(None=整个项目文件夹)。
+/// 备份盘根 = 含 `本盘信息\本盘编号.txt` 的祖先目录;目标须在该盘 `项目\` 下。
+fn locate_backup_target(target: &Path) -> Result<(PathBuf, String, Option<String>)> {
+    let root = target
+        .ancestors()
+        .find(|a| paths::drive_id_path(a).is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "选中的路径不在某块已初始化备份盘内(找不到 {}\\{}):{}",
+                paths::DRIVE_INFO_DIR,
+                paths::DRIVE_ID_FILE,
+                target.display()
+            )
+        })?
+        .to_path_buf();
+    let projects_dir = paths::drive_projects_dir(&root);
+    let rest = target.strip_prefix(&projects_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "请在备份盘的「{}」目录下选择项目文件夹或其中的文件:{}",
+            paths::DRIVE_PROJECTS_DIR,
+            target.display()
+        )
+    })?;
+    let mut comps = rest.components();
+    let project = comps
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "请选择一个具体的项目文件夹(或其中的文件),而不是「{}」根目录",
+                paths::DRIVE_PROJECTS_DIR
+            )
+        })?;
+    let remainder = comps.as_path();
+    let rel = if remainder.as_os_str().is_empty() {
+        None
+    } else {
+        Some(remainder.to_string_lossy().replace('/', "\\"))
+    };
+    Ok((root, project, rel))
 }
 
 fn sha256_hex(path: &Path) -> Result<String> {
@@ -494,5 +651,105 @@ mod tests {
         assert_eq!(r.checked, 0, "项目边界即取消,未检查任何文件");
         assert!(!r.has_corruption());
         assert_eq!(r.outcome(), VerifyOutcome::Cancelled);
+    }
+
+    /// 铺一块完整的临时"备份盘":本盘信息\本盘编号.txt + 校验清单\proj.sha256.csv + 项目\proj\<files>。
+    fn setup_drive(root: &Path, rows: &[(&str, u64, &str)], files: &[(&str, &[u8])]) {
+        let info = root.join(paths::DRIVE_INFO_DIR);
+        let mdir = info.join(paths::DRIVE_MANIFEST_DIR);
+        fs::create_dir_all(&mdir).unwrap();
+        fs::write(info.join(paths::DRIVE_ID_FILE), "备份1").unwrap();
+        let mut csv = String::from("Rel,Size,Hash\n");
+        for (rel, size, hash) in rows {
+            csv.push_str(&format!("{},{},{}\n", rel, size, hash));
+        }
+        fs::write(mdir.join("proj.sha256.csv"), csv).unwrap();
+        let proj = root.join(paths::DRIVE_PROJECTS_DIR).join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        for (rel, bytes) in files {
+            let p = proj.join(rel);
+            if let Some(par) = p.parent() {
+                fs::create_dir_all(par).unwrap();
+            }
+            fs::write(&p, bytes).unwrap();
+        }
+    }
+
+    // ── 单目标复查:整个项目文件夹(clean)──
+    #[test]
+    fn verify_one_clean_project_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        setup_drive(
+            d.path(),
+            &[("a.txt", 5, &sha_of(content))],
+            &[("a.txt", content)],
+        );
+        let target = d.path().join(paths::DRIVE_PROJECTS_DIR).join("proj");
+        let r = verify_one(&Config::default(), &NoopReporter, &target, &abool()).unwrap();
+        assert_eq!(r.bad, 0);
+        assert_eq!(r.checked, 1);
+    }
+
+    // ── 单目标复查:单个文件等长篡改 → Corrupt ──
+    #[test]
+    fn verify_one_corrupt_single_file() {
+        let d = tempfile::tempdir().unwrap();
+        setup_drive(
+            d.path(),
+            &[("a.txt", 5, &sha_of(b"hello"))],
+            &[("a.txt", b"world")],
+        );
+        let target = d
+            .path()
+            .join(paths::DRIVE_PROJECTS_DIR)
+            .join("proj")
+            .join("a.txt");
+        let r = verify_one(&Config::default(), &NoopReporter, &target, &abool()).unwrap();
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.bad, 1);
+        assert_eq!(r.issues[0].kind, VerifyIssueKind::Corrupt);
+        assert_eq!(r.issues[0].rel, "a.txt");
+    }
+
+    // ── 单目标复查:清单外的文件 → extra,不算损坏 ──
+    #[test]
+    fn verify_one_file_not_in_manifest_is_extra() {
+        let d = tempfile::tempdir().unwrap();
+        setup_drive(
+            d.path(),
+            &[("a.txt", 5, &sha_of(b"hello"))],
+            &[("a.txt", b"hello"), ("ghost.txt", b"x")],
+        );
+        let target = d
+            .path()
+            .join(paths::DRIVE_PROJECTS_DIR)
+            .join("proj")
+            .join("ghost.txt");
+        let r = verify_one(&Config::default(), &NoopReporter, &target, &abool()).unwrap();
+        assert_eq!(r.bad, 0);
+        assert_eq!(r.extra, 1);
+    }
+
+    #[test]
+    fn locate_rejects_path_outside_drive() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("whatever");
+        fs::create_dir_all(&p).unwrap();
+        assert!(locate_backup_target(&p).is_err(), "不在备份盘内应报错");
+    }
+
+    #[test]
+    fn locate_parses_project_and_rel() {
+        let d = tempfile::tempdir().unwrap();
+        setup_drive(d.path(), &[], &[]);
+        let folder = d.path().join(paths::DRIVE_PROJECTS_DIR).join("proj");
+        let (_r, project, rel) = locate_backup_target(&folder).unwrap();
+        assert_eq!(project, "proj");
+        assert!(rel.is_none(), "选项目文件夹 → rel=None");
+        let file = folder.join("sub").join("a.txt");
+        let (_r2, p2, rel2) = locate_backup_target(&file).unwrap();
+        assert_eq!(p2, "proj");
+        assert_eq!(rel2.as_deref(), Some("sub\\a.txt"));
     }
 }
