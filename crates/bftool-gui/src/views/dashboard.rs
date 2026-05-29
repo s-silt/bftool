@@ -7,6 +7,7 @@ use bftool_core::engine::status;
 use bftool_core::engine::verify::VerifyOutcome;
 
 use crate::app::{App, View};
+use crate::views::util;
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("仪表盘");
@@ -64,8 +65,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 });
                 ui.label(format!(
                     "剩余 {} / 共 {}",
-                    fmt_gb(d.free_bytes),
-                    fmt_gb(d.total_bytes)
+                    util::fmt_gb(d.free_bytes),
+                    util::fmt_gb(d.total_bytes)
                 ));
                 let lv = match &ds.last_verify {
                     Some(v) => format!(
@@ -104,7 +105,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     // 顺手把"配置来源"显示出来,方便用户确认当前生效的是哪份配置。
     ui.add_space(6.0);
-    ui.weak(source_hint(&app.config_source));
+    ui.weak(util::source_hint(&app.config_source));
 }
 
 fn banner(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
@@ -117,11 +118,6 @@ fn row(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.label(k);
     ui.monospace(v);
     ui.end_row();
-}
-
-/// 字节 → 人类可读 GB（一位小数）。纯函数,可测。
-fn fmt_gb(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
 }
 
 /// RFC3339 取日期部分（够仪表盘用）。
@@ -138,25 +134,9 @@ fn outcome_label(o: &VerifyOutcome) -> &'static str {
     }
 }
 
-fn source_hint(src: &bftool_core::config::ConfigSource) -> String {
-    use bftool_core::config::ConfigSource;
-    match src {
-        ConfigSource::Explicit(p) => format!("配置来源：命令行指定 {}", p.display()),
-        ConfigSource::Candidate(p) => format!("配置来源：自动发现 {}", p.display()),
-        ConfigSource::Default => "配置来源：内置默认（到「设置」保存一份固化你的配置）".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fmt_gb_one_decimal() {
-        assert_eq!(fmt_gb(0), "0.0 GB");
-        assert_eq!(fmt_gb(1024 * 1024 * 1024), "1.0 GB");
-        assert_eq!(fmt_gb(1024u64 * 1024 * 1024 * 3 / 2), "1.5 GB");
-    }
 
     #[test]
     fn short_date_takes_date_part() {

@@ -11,6 +11,7 @@ use bftool_core::reporter::LogLevel;
 use crate::app::App;
 use crate::reporter::{GuiReporter, ProgressState, UiEvent};
 use crate::task::BackgroundTask;
+use crate::views::util;
 
 /// 备份页高级设置的持久状态(跨帧)。默认 = 最安全(全 SHA256 + 压缩包测试)。
 #[derive(Debug, Clone, Default)]
@@ -121,12 +122,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
 
     // ── 进度条 ──
-    if let Ok(p) = app.progress.lock() {
-        if p.active && p.total > 0 {
-            let frac = (p.current as f32 / p.total as f32).clamp(0.0, 1.0);
-            ui.add(egui::ProgressBar::new(frac).text(format!("{} {:.0}%", p.label, frac * 100.0)));
-        }
-    }
+    util::progress_bar(&app.progress, ui);
 
     // ── 计划预览表 ──
     if let Some(plan) = &app.archive_plan {
@@ -164,15 +160,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     // ── 日志面板 ──
     ui.separator();
     ui.label("日志：");
-    egui::ScrollArea::vertical()
-        .max_height(180.0)
-        .id_salt("logs")
-        .stick_to_bottom(true)
-        .show(ui, |ui| {
-            for (level, msg) in &app.logs {
-                ui.colored_label(level_color(*level), msg);
-            }
-        });
+    util::log_panel(&app.logs, ui);
 }
 
 /// 同步跑 archive::plan(只读)生成预览。plan 的 reporter 消息收进日志。
@@ -255,16 +243,6 @@ fn action_text(a: &PlanAction) -> (egui::Color32, String) {
         PlanAction::RenameAndArchive { dest_name } => (green, format!("改名归档 → {}", dest_name)),
         PlanAction::Skip(r) => (gray, format!("跳过：{}", r)),
         PlanAction::SealAndStop(r) => (orange, format!("封盘停本轮：{}", r)),
-    }
-}
-
-fn level_color(level: LogLevel) -> egui::Color32 {
-    match level {
-        LogLevel::Info => egui::Color32::GRAY,
-        LogLevel::Ok => egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
-        LogLevel::Warn => egui::Color32::from_rgb(0x8a, 0x6d, 0x00),
-        LogLevel::Error => egui::Color32::from_rgb(0xCC, 0x33, 0x33),
-        LogLevel::Action => egui::Color32::from_rgb(0x15, 0x65, 0xc0),
     }
 }
 

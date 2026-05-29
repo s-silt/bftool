@@ -68,6 +68,16 @@ pub struct App {
     pub archive_plan: Option<ArchivePlan>,
     /// 备份页高级设置的持久 UI 状态(跨帧保留)。
     pub archive_ui: crate::views::archive::ArchiveUiState,
+    /// 盘列表缓存(None = 未扫;带「刷新」按钮,不每帧重扫)。
+    pub drives_cache: Option<Vec<bftool_core::engine::drive::DriveInfo>>,
+    /// 查找页跨帧状态(关键词 + 结果)。
+    pub find_ui: crate::views::find::FindUiState,
+    /// 初始化页跨帧状态(候选缓存 + 选择 + force)。
+    pub init_ui: crate::views::init::InitUiState,
+    /// 复查页跨帧状态(盘列表 + 选择)。
+    pub verify_ui: crate::views::verify::VerifyUiState,
+    /// 设置页跨帧状态(表单字段 + 保存位置)。
+    pub settings_ui: crate::views::settings::SettingsUiState,
 }
 
 impl App {
@@ -95,6 +105,11 @@ impl App {
             last_summary: None,
             archive_plan: None,
             archive_ui: crate::views::archive::ArchiveUiState::default(),
+            drives_cache: None,
+            find_ui: crate::views::find::FindUiState::default(),
+            init_ui: crate::views::init::InitUiState::default(),
+            verify_ui: crate::views::verify::VerifyUiState::default(),
+            settings_ui: crate::views::settings::SettingsUiState::default(),
         }
     }
 
@@ -156,10 +171,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
             View::Dashboard => crate::views::dashboard::ui(self, ui),
             View::Archive => crate::views::archive::ui(self, ui),
-            other => {
-                ui.heading(other.label());
-                ui.label("（此视图将在 Phase 3 接入）");
-            }
+            View::Drives => crate::views::drives::ui(self, ui),
+            View::Find => crate::views::find::ui(self, ui),
+            View::Init => crate::views::init::ui(self, ui),
+            View::Verify => crate::views::verify::ui(self, ui),
+            View::Settings => crate::views::settings::ui(self, ui),
         });
     }
 }
