@@ -194,7 +194,9 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             engine::drive::init(&cfg, reporter, &drive, id.as_deref(), force)
         }
         Some(Command::Verify { drive }) => {
-            let report = engine::verify::run(&cfg, reporter, drive.as_deref())?;
+            // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
+            let no_cancel = std::sync::atomic::AtomicBool::new(false);
+            let report = engine::verify::run(&cfg, reporter, drive.as_deref(), &no_cancel)?;
             if report.has_corruption() {
                 bail!(
                     "复查发现 {} 处损坏/缺失/大小不符 —— 本盘完整性有问题。\n\
