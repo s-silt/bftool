@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use bftool_core::config::{Config, ConfigSource};
-use bftool_core::engine::archive::ArchivePlan;
+use bftool_core::engine::archive::{ArchivePlan, Options};
+use bftool_core::engine::find::FindOutcome;
 use bftool_core::reporter::LogLevel;
 
 use crate::reporter::{ProgressState, UiEvent};
@@ -24,6 +25,12 @@ pub enum View {
     Find,
     Drives,
     Settings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePlanInputs {
+    pub cfg: Config,
+    pub opts: Options,
 }
 
 impl View {
@@ -75,16 +82,22 @@ pub struct App {
     pub task: Option<BackgroundTask<String>>,
     /// 进行中的计划预览任务(archive::plan;只读、后台算,避免 UI 线程遍历大目录卡顿)。
     pub plan_task: Option<BackgroundTask<ArchivePlan>>,
+    /// 进行中的查找任务(find::search;可能读取大索引/网络盘,不能阻塞 UI 线程)。
+    pub find_task: Option<BackgroundTask<FindOutcome>>,
     /// 执行任务的开始时刻(算"已用时间";None=空闲)。在 archive/verify 启动处置位,pump 完成处清空。
     pub task_started: Option<std::time::Instant>,
     /// 上一个任务的摘要(Done/Failed 文案),供结果区显示。
     pub last_summary: Option<String>,
     /// 备份页的计划预览(archive::plan 的结果)。
     pub archive_plan: Option<ArchivePlan>,
+    /// 生成 `archive_plan` 时使用的配置/选项快照。执行前必须仍一致,否则要求重新演练。
+    pub archive_plan_inputs: Option<ArchivePlanInputs>,
     /// 备份页高级设置的持久 UI 状态(跨帧保留)。
     pub archive_ui: crate::views::archive::ArchiveUiState,
     /// 盘列表缓存(None = 未扫;带「刷新」按钮,不每帧重扫)。
     pub drives_cache: Option<Vec<bftool_core::engine::drive::DriveInfo>>,
+    /// 盘列表页本页结果/错误提示。
+    pub drives_result: Option<(bool, String)>,
     /// 查找页跨帧状态(关键词 + 结果)。
     pub find_ui: crate::views::find::FindUiState,
     /// 初始化页跨帧状态(候选缓存 + 选择 + force)。
@@ -125,11 +138,14 @@ impl App {
             rx: None,
             task: None,
             plan_task: None,
+            find_task: None,
             task_started: None,
             last_summary: None,
             archive_plan: None,
+            archive_plan_inputs: None,
             archive_ui: crate::views::archive::ArchiveUiState::default(),
             drives_cache: None,
+            drives_result: None,
             find_ui: crate::views::find::FindUiState::default(),
             init_ui: crate::views::init::InitUiState::default(),
             verify_ui: crate::views::verify::VerifyUiState::default(),
@@ -177,9 +193,16 @@ impl App {
             Some(true) => {
                 if let Some(outcome) = self.plan_task.as_mut().and_then(|t| t.take_outcome()) {
                     match outcome {
-                        TaskOutcome::Done(plan) => self.archive_plan = Some(plan),
+                        TaskOutcome::Done(plan) => {
+                            self.archive_plan_inputs = Some(ArchivePlanInputs {
+                                cfg: self.cfg.clone(),
+                                opts: plan.opts.clone(),
+                            });
+                            self.archive_plan = Some(plan);
+                        }
                         TaskOutcome::Failed(e) => {
                             self.archive_plan = None;
+                            self.archive_plan_inputs = None;
                             self.logs.push((LogLevel::Error, e));
                         }
                     }
@@ -204,11 +227,30 @@ impl App {
             Some(false) => ctx.request_repaint(),
             None => {}
         }
+        match self.find_task.as_ref().map(|t| t.is_finished()) {
+            Some(true) => {
+                if let Some(outcome) = self.find_task.as_mut().and_then(|t| t.take_outcome()) {
+                    match outcome {
+                        TaskOutcome::Done(result) => {
+                            self.find_ui.result = Some(result);
+                            self.find_ui.error = None;
+                        }
+                        TaskOutcome::Failed(e) => {
+                            self.find_ui.result = None;
+                            self.find_ui.error = Some(format!("查找失败：{}", e));
+                        }
+                    }
+                }
+                self.find_task = None;
+            }
+            Some(false) => ctx.request_repaint(),
+            None => {}
+        }
     }
 
     /// 是否有进行中的后台任务(执行或计划预览)。导航/按钮据此禁用。
     pub fn is_busy(&self) -> bool {
-        self.task.is_some() || self.plan_task.is_some()
+        self.task.is_some() || self.plan_task.is_some() || self.find_task.is_some()
     }
 
     /// 底部全局状态栏:区分 执行任务(可取消)/ 生成计划(不可取消)/ 空闲。
@@ -267,11 +309,16 @@ impl App {
                                 }
                             }
                         });
-                    } else if self.plan_task.is_some() {
+                    } else if self.plan_task.is_some() || self.find_task.is_some() {
                         // 生成计划:只读、不可中途取消 → 不给取消按钮。
                         ui.add(egui::Spinner::new().size(14.0).color(theme::PRIMARY));
                         ui.add_space(6.0);
-                        ui.colored_label(theme::PRIMARY, "正在生成计划…");
+                        let text = if self.find_task.is_some() {
+                            "正在查找…"
+                        } else {
+                            "正在生成计划…"
+                        };
+                        ui.colored_label(theme::PRIMARY, text);
                     } else {
                         // 空闲
                         let (r, _) =

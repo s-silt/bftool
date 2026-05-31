@@ -106,7 +106,10 @@ fn read_catalog(
     }
     let bytes = fs::read(path).with_context(|| format!("读索引失败：{}", path.display()))?;
     let mut rdr = csv::Reader::from_reader(std::io::Cursor::new(bytes));
-    let headers = rdr.headers().cloned().unwrap_or_default();
+    let headers = rdr
+        .headers()
+        .with_context(|| format!("读索引表头失败：{}", path.display()))?
+        .clone();
     let idx = |name: &str| headers.iter().position(|h| h == name);
     let i_folder = idx("文件夹名");
     let i_no = idx("编号");

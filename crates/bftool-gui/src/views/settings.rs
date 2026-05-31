@@ -279,6 +279,8 @@ fn do_save(app: &mut App) {
             match loaded.save(&target) {
                 Ok(path) => {
                     app.cfg = cfg;
+                    app.archive_plan = None;
+                    app.archive_plan_inputs = None;
                     // 保存后,配置现落在 path —— 后续视为可自动发现的来源。
                     app.config_source = ConfigSource::Candidate(path.clone());
                     app.settings_ui.result = Some((true, format!("已保存到 {}", path.display())));

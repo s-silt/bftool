@@ -27,14 +27,15 @@ pub struct ArchiveUiState {
 }
 
 impl ArchiveUiState {
-    fn to_options(&self) -> Options {
-        Options {
+    fn to_options(&self) -> Result<Options, String> {
+        let limit = parse_limit(&self.limit_text)?;
+        Ok(Options {
             dry_run: false,
             no_hash: self.unsafe_no_hash,
-            limit: self.limit_text.trim().parse::<usize>().unwrap_or(0),
+            limit,
             drive_letter_override: None,
             no_test_archives: self.no_test_archives,
-        }
+        })
     }
 }
 
@@ -79,7 +80,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             refresh_plan(app);
         }
 
-        let can_run = !busy && app.archive_plan.is_some();
+        let can_run = !busy && app.archive_plan.is_some() && plan_matches_current(app);
         if ui
             .add_enabled(can_run, egui::Button::new("▶ 正式备份"))
             .clicked()
@@ -154,6 +155,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     } else if !busy {
         ui.weak("点「演练 / 刷新计划」生成本轮计划预览。");
     }
+    if app.archive_plan.is_some() && !plan_matches_current(app) {
+        ui.colored_label(
+            util::level_color(LogLevel::Warn),
+            "配置或高级设置已变化，请重新演练后再正式备份。",
+        );
+    }
 
     // ── 摘要 ──
     if let Some(s) = &app.last_summary {
@@ -181,6 +188,7 @@ fn refresh_plan(app: &mut App) {
     app.logs.clear();
     app.last_summary = None;
     app.archive_plan = None;
+    app.archive_plan_inputs = None;
     if app.archive_ui.unsafe_no_hash && !app.archive_ui.confirm_unsafe {
         app.logs.push((
             LogLevel::Error,
@@ -188,7 +196,13 @@ fn refresh_plan(app: &mut App) {
         ));
         return;
     }
-    let opts = app.archive_ui.to_options();
+    let opts = match app.archive_ui.to_options() {
+        Ok(o) => o,
+        Err(e) => {
+            app.logs.push((LogLevel::Error, e));
+            return;
+        }
+    };
     let (tx, rx) = mpsc::channel();
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
     app.rx = Some(rx);
@@ -204,6 +218,13 @@ fn start_archive(app: &mut App) {
     // R-06:同 refresh_plan——「正式备份」按钮 add_enabled(can_run = !busy && plan.is_some()),
     // busy 时禁用,运行期不会重入 clobber app.rx;debug_assert 把该契约显式化。
     debug_assert!(app.task.is_none(), "rx clobber: task still running");
+    if !plan_matches_current(app) {
+        app.logs.push((
+            LogLevel::Error,
+            "配置或高级设置已变化，请先重新演练，再正式备份。".to_string(),
+        ));
+        return;
+    }
     let Some(plan) = app.archive_plan.take() else {
         return;
     };
@@ -216,6 +237,7 @@ fn start_archive(app: &mut App) {
         app.archive_plan = Some(plan);
         return;
     }
+    app.archive_plan_inputs = None;
     app.logs.clear();
     app.last_summary = None;
     if let Ok(mut p) = app.progress.lock() {
@@ -240,6 +262,25 @@ fn start_archive(app: &mut App) {
         }
         Ok(parts.join("，"))
     }));
+}
+
+fn parse_limit(text: &str) -> Result<usize, String> {
+    let s = text.trim();
+    if s.is_empty() {
+        return Ok(0);
+    }
+    s.parse::<usize>()
+        .map_err(|_| format!("「本次上限」必须是非负整数或留空(当前:「{}」)。", s))
+}
+
+fn plan_matches_current(app: &App) -> bool {
+    let Some(inputs) = &app.archive_plan_inputs else {
+        return false;
+    };
+    let Ok(opts) = app.archive_ui.to_options() else {
+        return false;
+    };
+    inputs.cfg == app.cfg && inputs.opts == opts
 }
 
 /// 计划动作 → (颜色, 文案)。纯函数,可测。颜色复用 util::level_color 避免重复硬编码。
@@ -284,14 +325,22 @@ mod tests {
     #[test]
     fn limit_text_parses_to_options() {
         let mut st = ArchiveUiState::default();
-        assert_eq!(st.to_options().limit, 0, "空 = 不限");
+        assert_eq!(st.to_options().unwrap().limit, 0, "空 = 不限");
         st.limit_text = "5".into();
-        assert_eq!(st.to_options().limit, 5);
+        assert_eq!(st.to_options().unwrap().limit, 5);
         st.limit_text = "  abc ".into();
-        assert_eq!(st.to_options().limit, 0, "解析失败按不限");
+        assert!(st.to_options().is_err(), "解析失败应阻止执行,不能变成不限");
+        st.limit_text.clear();
         st.unsafe_no_hash = true;
         st.no_test_archives = true;
-        let o = st.to_options();
+        let o = st.to_options().unwrap();
         assert!(o.no_hash && o.no_test_archives && !o.dry_run);
+    }
+
+    #[test]
+    fn parse_limit_rejects_invalid_number() {
+        assert_eq!(parse_limit("").unwrap(), 0);
+        assert_eq!(parse_limit(" 2 ").unwrap(), 2);
+        assert!(parse_limit("1O").is_err());
     }
 }

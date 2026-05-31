@@ -20,6 +20,7 @@ pub struct InitUiState {
     pub custom_id: String,
     pub force: bool,
     pub confirm_force: bool,
+    pub result: Option<(bool, String)>,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -43,12 +44,19 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             for c in cands {
                 ui.horizontal(|ui| {
                     let head = format!("{}:  {} GB", c.letter, c.total_gb);
-                    if c.can_init {
+                    if candidate_selectable(c, app.init_ui.force, app.init_ui.confirm_force) {
                         let sel = app.init_ui.selected.as_deref() == Some(c.letter.as_str());
                         if ui.selectable_label(sel, head).clicked() {
                             chosen = Some(c.letter.clone());
                         }
-                        ui.weak("可初始化");
+                        if c.can_init {
+                            ui.weak("可初始化");
+                        } else {
+                            ui.colored_label(
+                                util::level_color(LogLevel::Warn),
+                                format!("强制可选：{}", candidate_block(c)),
+                            );
+                        }
                     } else {
                         ui.add_enabled(false, egui::Button::new(head));
                         ui.colored_label(util::level_color(LogLevel::Warn), candidate_block(c));
@@ -97,13 +105,25 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             "强制模式需勾选确认才能执行。",
         );
     }
+    if let Some((ok, msg)) = &app.init_ui.result {
+        let color = if *ok {
+            util::level_color(LogLevel::Ok)
+        } else {
+            util::level_color(LogLevel::Error)
+        };
+        ui.colored_label(color, msg);
+    }
 }
 
 fn rescan(app: &mut App) {
     match drive::init_candidates(&app.cfg) {
-        Ok(c) => app.init_ui.cache = Some(c),
+        Ok(c) => {
+            app.init_ui.result = Some((true, format!("已刷新候选盘：{} 个。", c.len())));
+            app.init_ui.cache = Some(c);
+        }
         Err(e) => {
             app.init_ui.cache = Some(Vec::new());
+            app.init_ui.result = Some((false, format!("枚举候选盘失败：{:#}", e)));
             app.logs
                 .push((LogLevel::Error, format!("枚举候选盘失败：{:#}", e)));
         }
@@ -135,6 +155,8 @@ fn do_init(app: &mut App) {
     }
     match result {
         Ok(()) => {
+            app.init_ui.result = Some((true, format!("已初始化 {}: 为备份盘。", letter)));
+            app.last_summary = Some(format!("已初始化 {}: 为备份盘。", letter));
             app.logs
                 .push((LogLevel::Ok, format!("已初始化 {}: 为备份盘。", letter)));
             // 刷新候选与盘列表缓存
@@ -143,9 +165,12 @@ fn do_init(app: &mut App) {
             app.init_ui.confirm_force = false;
             app.drives_cache = None;
         }
-        Err(e) => app
-            .logs
-            .push((LogLevel::Error, format!("初始化失败：{:#}", e))),
+        Err(e) => {
+            let msg = format!("初始化失败：{:#}", e);
+            app.init_ui.result = Some((false, msg.clone()));
+            app.last_summary = Some(msg.clone());
+            app.logs.push((LogLevel::Error, msg));
+        }
     }
 }
 
@@ -159,6 +184,10 @@ fn candidate_block(c: &InitCandidate) -> String {
 /// 强制模式必须二次确认才放行;非强制始终放行。纯函数,可测。
 fn init_allowed(force: bool, confirm: bool) -> bool {
     !force || confirm
+}
+
+fn candidate_selectable(c: &InitCandidate, force: bool, confirm: bool) -> bool {
+    c.can_init || (force && confirm)
 }
 
 #[cfg(test)]
@@ -190,5 +219,14 @@ mod tests {
         assert!(init_allowed(false, true));
         assert!(!init_allowed(true, false), "强制未确认 → 不放行");
         assert!(init_allowed(true, true), "强制 + 确认 → 放行");
+    }
+
+    #[test]
+    fn candidate_selectable_allows_blocked_only_after_force_confirm() {
+        let blocked = cand("X", false, Some("非空盘"));
+        assert!(!candidate_selectable(&blocked, false, false));
+        assert!(!candidate_selectable(&blocked, true, false));
+        assert!(candidate_selectable(&blocked, true, true));
+        assert!(candidate_selectable(&cand("Y", true, None), false, false));
     }
 }

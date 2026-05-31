@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::engine::archive_test::{self, Tester, TesterPaths};
@@ -21,7 +22,7 @@ use crate::engine::manifest::{self, ManifestOpts};
 use crate::engine::{cruft, durable, paths, safety, txn};
 use crate::reporter::Reporter;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Options {
     pub dry_run: bool,
     pub no_hash: bool,
@@ -47,6 +48,9 @@ pub struct ArchiveSummary {
 pub struct PlanItem {
     pub name: String,
     pub est_bytes: u64,
+    /// `plan()` 时目标目录是否已经存在。存在且未入索引通常表示上轮复制阶段中断留下的
+    /// 可续传半成品；`run_plan()` 允许继续它，但仍拒绝预览之后才出现的目标占用。
+    pub dest_existed_at_plan: bool,
     pub action: PlanAction,
 }
 
@@ -185,6 +189,16 @@ pub fn plan(cfg: &Config, opts: &Options, reporter: &dyn Reporter) -> Result<Arc
     };
     reporter.ok(&format!("当前备份盘: {} ({}:)", drive.id, drive.letter));
 
+    let warnings = safety::check_paths(
+        &cfg.ready_root,
+        &cfg.archived_root,
+        &cfg.system_root,
+        Some(&drive.root),
+    )?;
+    for w in warnings {
+        reporter.warn(&w);
+    }
+
     // 列出待归档项目(读不到/为空 → 空计划,友好提示)。
     let mut items = Vec::new();
     if !cfg.ready_root.is_dir() {
@@ -226,6 +240,7 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
             return PlanItem {
                 name: proj_path.display().to_string(),
                 est_bytes: 0,
+                dest_existed_at_plan: false,
                 action: PlanAction::Skip("无效的项目目录名".into()),
             }
         }
@@ -233,6 +248,7 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
     let skip = |est: u64, reason: String| PlanItem {
         name: name.clone(),
         est_bytes: est,
+        dest_existed_at_plan: false,
         action: PlanAction::Skip(reason),
     };
 
@@ -240,6 +256,24 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
     let st = safety::folder_stable(proj_path, cfg.stable_minutes);
     if !st.stable {
         return skip(0, format!("未稳定：{}", st.reason));
+    }
+    match source_bftool_part_files(proj_path) {
+        Ok(files) if !files.is_empty() => {
+            return skip(
+                0,
+                format!(
+                    "项目内含 bftool 内部临时后缀 .bftool-part 的文件({})，为避免静默漏备已跳过；请改名或人工核对。",
+                    files.join("、")
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return skip(
+                0,
+                format!("扫描 .bftool-part 文件失败({})→ 不归档,请先解决环境问题。", e),
+            )
+        }
     }
     // 统计 + 枚举/元数据错误(fail-closed)
     let stats = folder_stats(proj_path);
@@ -300,6 +334,7 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
     };
     // 余量(断点续传时仅按"还需写入"判断)→ 不足则封盘停本轮
     let dest = paths::drive_projects_dir(&drive.root).join(&dest_name);
+    let dest_existed_at_plan = dest.exists();
     // dest_have 可能含孤儿 .bftool-part 文件(copy_folder 开头会先删它,最终不影响完成大小)。
     // 此处轻微高估已有量导致 need 偏小,极端情况下可能多余地触发封盘;属已知可接受的精度损失。
     let dest_have = if dest.is_dir() {
@@ -318,12 +353,14 @@ fn decide(cfg: &Config, drive: &BackupDrive, proj_path: &Path) -> PlanItem {
         return PlanItem {
             name,
             est_bytes: size,
+            dest_existed_at_plan,
             action: PlanAction::SealAndStop(reason),
         };
     }
     PlanItem {
         name,
         est_bytes: size,
+        dest_existed_at_plan,
         action: if dup {
             PlanAction::RenameAndArchive { dest_name }
         } else {
@@ -383,14 +420,6 @@ pub fn run_plan(
     let opts = &plan.opts;
     // fail-closed(纵深:GUI 可能直接调 run_plan)
     guard_verify_enabled(cfg, opts)?;
-
-    // 准备系统目录
-    fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
-    fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
-    fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
-
-    // 启动自检：上次的事务标记是不是残留？
-    check_pending_txn(cfg, reporter)?;
 
     // 重验盘:预览→执行之间盘可能被拔/被封。按盘上实时状态(id 文件 + 封盘 marker)重读,
     // 不信 plan 里冻结的 sealed/在线态。任一变 → 整份计划过期(不写任何盘)。
@@ -456,6 +485,15 @@ pub fn run_plan(
         reporter.warn(&w);
     }
 
+    // 启动自检：上次的事务标记是不是残留？未解决时必须先停,避免新归档覆盖旧恢复证据。
+    check_pending_txn(cfg, reporter)?;
+
+    // 准备系统目录。必须在路径安全检查与事务自检之后,避免坏配置先污染 ready_root,
+    // 或未解决事务时产生新写入。
+    fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
+    fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
+    fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
+
     // tester detection:本轮只 detect 一次、只 warn 一次
     let mut tester_opt = detect_tester(cfg, opts, reporter)?;
 
@@ -482,7 +520,7 @@ pub fn run_plan(
         let proj_path = cfg.ready_root.join(&item.name);
         let forced = match &item.action {
             PlanAction::Archive { dest_name } | PlanAction::RenameAndArchive { dest_name } => {
-                Some(dest_name.as_str())
+                Some((dest_name.as_str(), item.dest_existed_at_plan))
             }
             PlanAction::Skip(_) | PlanAction::SealAndStop(_) => None,
         };
@@ -623,7 +661,7 @@ fn handle_one(
     proj_path: &Path,
     opts: &Options,
     tester_opt: Option<&(Tester, PathBuf)>,
-    forced_dest_name: Option<&str>,
+    forced_dest_name: Option<(&str, bool)>,
 ) -> Result<HandleOutcome> {
     let name = proj_path
         .file_name()
@@ -638,6 +676,29 @@ fn handle_one(
     if !st.stable {
         reporter.warn(&format!("跳过（未稳定）：{}", st.reason));
         return Ok(HandleOutcome::Skipped);
+    }
+
+    match source_bftool_part_files(proj_path) {
+        Ok(files) if !files.is_empty() => {
+            let msg = format!(
+                "项目内含 bftool 内部临时后缀 .bftool-part 的文件({})，为避免静默漏备已跳过。\
+                 请改名或人工核对后重试。",
+                files.join("、")
+            );
+            reporter.error(&msg);
+            note_manual(cfg, reporter, &name, &msg);
+            return Ok(HandleOutcome::Skipped);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!(
+                "扫描 .bftool-part 文件失败({})→ 不归档,请先解决环境问题。",
+                e
+            );
+            reporter.error(&msg);
+            note_manual(cfg, reporter, &name, &msg);
+            return Ok(HandleOutcome::Skipped);
+        }
     }
 
     // 体积 + 目标已存在量（断点续传时仅按"还需写入"判断）
@@ -693,23 +754,60 @@ fn handle_one(
     let dest_name = match forced_dest_name {
         // run_plan 路径:用冻结名,但**复验**它未被占用(预览→执行间可能有人占了它)。
         // 时间戳唯一名(重名场景)不会撞;普通名若现在已存在 → 计划已过期(StalePlan),不照旧误写。
-        Some(frozen) => {
+        Some((frozen, dest_existed_at_plan)) => {
             let drive_projects = paths::drive_projects_dir(&drive.root);
             let dest_phys = drive_projects.join(frozen);
             // 索引检查:frozen==name 时用 dup_in_drive;重命名场景重新查 catalog。
             // 额外 OR 物理路径检查:索引与磁盘不一致时(写索引前宕机等),磁盘上已有目录也算被占用。
-            let taken = if frozen == name {
-                dup_in_drive || dest_phys.exists()
+            let indexed = if frozen == name {
+                dup_in_drive
             } else {
-                catalog_has_project(&catalog, frozen).unwrap_or(false) || dest_phys.exists()
+                match catalog_has_project(&catalog, frozen) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        reporter.error(&format!(
+                            "读本盘索引失败({}):无法复验冻结目标名 → 跳过本项目,避免覆盖旧备份或重复写盘。请检查 {}",
+                            e,
+                            catalog.display()
+                        ));
+                        note_manual(
+                            cfg,
+                            reporter,
+                            &name,
+                            &format!(
+                                "本盘索引读取失败:{} —— 请人工检查/修复 {}",
+                                e,
+                                catalog.display()
+                            ),
+                        );
+                        return Ok(HandleOutcome::Skipped);
+                    }
+                }
             };
-            if taken {
+            let occupied_after_plan = dest_phys.exists() && !dest_existed_at_plan;
+            let taken = indexed || occupied_after_plan;
+            if indexed {
                 reporter.warn(&format!(
-                    "计划已过期：目标名『{}』在本盘索引或磁盘中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
+                    "计划已过期：目标名『{}』在本盘索引中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
                     frozen
                 ));
                 return Ok(HandleOutcome::StalePlan);
             }
+            if occupied_after_plan {
+                reporter.warn(&format!(
+                    "计划已过期：目标目录『{}』在预览后出现在磁盘上 → 跳过本项目,请重新规划。",
+                    frozen
+                ));
+                return Ok(HandleOutcome::StalePlan);
+            }
+            if taken {
+                // Defensive fallback if future conditions are added above.
+                reporter.warn(&format!(
+                    "计划已过期：目标名『{}』已被占用 → 跳过本项目,请重新规划。",
+                    frozen
+                ));
+                return Ok(HandleOutcome::StalePlan);
+            };
             frozen.to_string()
         }
         // 直调路径:自行裁决,重名时现算唯一时间戳名(旧行为)。
@@ -1153,7 +1251,8 @@ fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
     let Some(col) = headers.iter().position(|h| h == "ProjectName") else {
         return Ok(false);
     };
-    for rec in rdr.records().flatten() {
+    for rec in rdr.records() {
+        let rec = rec?;
         if rec.get(col).map(|v| v == project_name).unwrap_or(false) {
             return Ok(true);
         }
@@ -1207,7 +1306,10 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
                 e,
                 path.display()
             ));
-            return Ok(());
+            anyhow::bail!(
+                "发现未完成的事务标记但解析失败。为避免覆盖恢复证据,本轮归档已停止；请人工核对后删除：{}",
+                path.display()
+            );
         }
     };
     let pname = pending.project_dest_name.clone();
@@ -1229,7 +1331,19 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     };
     let moved = !parch.is_empty() && Path::new(&parch).exists();
     let global = paths::system_global_catalog(&cfg.system_root);
-    let indexed = global_has_folder(&global, &pname).unwrap_or(false);
+    let indexed = match global_has_folder(&global, &pname) {
+        Ok(v) => v,
+        Err(e) => {
+            reporter.error(&format!(
+                "→ 无法读取全局索引确认上次事务是否完成({})。标记保留：{}",
+                e,
+                path.display()
+            ));
+            anyhow::bail!(
+                "发现未完成的事务,且无法确认全局索引状态。为避免覆盖恢复证据,本轮归档已停止。"
+            );
+        }
+    };
 
     reporter.action(&format!("发现上次未完成的事务（项目：{}）。", pname));
     if in_ready {
@@ -1244,11 +1358,15 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
             "→ 源已移到『已备份』但全局索引可能漏写：数据应在备份盘 {}。请人工核对并在索引中补登；标记保留。",
             parch
         ));
+        anyhow::bail!(
+            "发现未完成的事务：源已移动但全局索引未确认。为避免覆盖恢复证据,本轮归档已停止。"
+        );
     } else {
         reporter.error(&format!(
             "→ 无法自动判定（源不在待备份、目标也未确认）。请人工核对事务标记后处理,标记保留：{}",
             path.display()
         ));
+        anyhow::bail!("发现未完成的事务且无法自动判定状态。为避免覆盖恢复证据,本轮归档已停止。");
     }
     Ok(())
 }
@@ -1262,7 +1380,8 @@ fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
     let Some(col) = headers.iter().position(|h| h == "文件夹名") else {
         return Ok(false);
     };
-    for rec in rdr.records().flatten() {
+    for rec in rdr.records() {
+        let rec = rec?;
         if rec.get(col).map(|v| v == folder_name).unwrap_or(false) {
             return Ok(true);
         }
@@ -1296,6 +1415,43 @@ fn folder_stats(p: &Path) -> FolderStats {
         }
     }
     s
+}
+
+fn source_bftool_part_files(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 || !e.file_type().is_dir() {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !cruft::is_cruft_dir(&name)
+        })
+    {
+        match entry {
+            Ok(e) if e.file_type().is_file() => {
+                let name = e.file_name().to_string_lossy();
+                if name.ends_with(".bftool-part") {
+                    let rel = e
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap_or(e.path())
+                        .to_string_lossy()
+                        .replace('/', "\\");
+                    files.push(rel);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("{} 个枚举错误:{}", errors.len(), errors.join("; "));
+    }
+    Ok(files)
 }
 
 /// 简单的递归复制；与 robocopy 比缺少 /Z 断点续传中段恢复，但小文件/中等大小够用。
@@ -1384,8 +1540,13 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
 fn discover_projects(ready_root: &Path, reporter: &dyn Reporter) -> Result<Vec<PathBuf>> {
     let mut projects = Vec::new();
     let mut linked = Vec::new();
-    for e in fs::read_dir(ready_root)?.filter_map(|e| e.ok()) {
-        let Ok(ft) = e.file_type() else { continue };
+    for e in fs::read_dir(ready_root)
+        .with_context(|| format!("读取待备份目录失败：{}", ready_root.display()))?
+    {
+        let e = e.with_context(|| format!("枚举待备份目录失败：{}", ready_root.display()))?;
+        let ft = e
+            .file_type()
+            .with_context(|| format!("读取待备份项目类型失败：{}", e.path().display()))?;
         // is_symlink() 在 Windows 上对 junction(mount point)同样为 true,且此时 is_dir()==false。
         if ft.is_symlink() {
             linked.push(e.file_name().to_string_lossy().into_owned());
@@ -1505,6 +1666,27 @@ mod tests {
             handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
         assert!(matches!(outcome, HandleOutcome::Skipped), "空源应 Skipped");
         assert!(proj.is_dir(), "空源不应被移走(应仍在 待备份)");
+    }
+
+    #[test]
+    fn handle_one_rejects_source_file_named_bftool_part() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("cover.jpg"), b"cover").unwrap();
+        fs::write(proj.join("session.bftool-part"), b"real user file").unwrap();
+
+        let outcome =
+            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+
+        assert!(matches!(outcome, HandleOutcome::Skipped));
+        assert!(proj.exists(), "source must remain for user action");
+        assert!(
+            !paths::drive_projects_dir(&drive.root)
+                .join("001proj")
+                .exists(),
+            ".bftool-part source files must not be silently omitted"
+        );
     }
 
     // ── happy-path:正常项目完整走通 复制→校验→提交→移源(覆盖 L-001 fsync 提交链路) ──
@@ -1671,6 +1853,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handle_one_malformed_drive_catalog_row_fails_closed() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        let cat = paths::drive_catalog_path(&drive.root);
+        if let Some(p) = cat.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(
+            &cat,
+            "ProjectNo,ProjectName,FileCount,TotalBytes,ArchivedUTC,VerifyStatus,Status,Notes\n\
+             001,001proj\n",
+        )
+        .unwrap();
+
+        let outcome =
+            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+
+        assert!(matches!(outcome, HandleOutcome::Skipped));
+        assert!(proj.is_dir(), "malformed catalog row should fail closed");
+        assert!(!paths::drive_projects_dir(&drive.root)
+            .join("001proj")
+            .exists());
+    }
+
     // ── L-018: 台账写失败不致命(note_manual 返回 () 不向上抛) ──
     #[test]
     fn note_manual_infallible_when_system_root_unwritable() {
@@ -1753,6 +1962,7 @@ mod tests {
             items: vec![PlanItem {
                 name: "001proj".into(),
                 est_bytes: 5,
+                dest_existed_at_plan: false,
                 action: PlanAction::Archive {
                     dest_name: "001proj".into(),
                 },
@@ -1772,6 +1982,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_plan_resumes_preexisting_unindexed_dest_from_plan() {
+        let (_d, cfg, drive) = temp_world();
+        let p1 = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        fs::write(p1.join("b.txt"), b"world").unwrap();
+
+        let dest = paths::drive_projects_dir(&drive.root).join("001proj");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("a.txt"), b"hello").unwrap();
+
+        let item = decide(&cfg, &drive, &p1);
+        assert!(
+            matches!(&item.action, PlanAction::Archive { dest_name } if dest_name == "001proj"),
+            "preexisting unindexed dest should still plan as resumable Archive, got {:?}",
+            item.action
+        );
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![item],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let s = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap();
+
+        assert_eq!(s.handled, 1, "preexisting dest should be resumed");
+        assert_eq!(s.failed, 0);
+        assert!(
+            !p1.exists(),
+            "source should move after resumed archive completes"
+        );
+        assert_eq!(fs::read(dest.join("b.txt")).unwrap(), b"world");
+        assert!(
+            paths::system_global_catalog(&cfg.system_root).is_file(),
+            "resumed archive should still write the global catalog"
+        );
+    }
+
     // ── Spec D §4.1: 预览后盘被封 → run_plan 重验判定"计划已过期",不写盘不移源 ──
     #[test]
     fn run_plan_stale_when_drive_sealed_after_plan() {
@@ -1784,6 +2033,7 @@ mod tests {
             items: vec![PlanItem {
                 name: "001proj".into(),
                 est_bytes: 5,
+                dest_existed_at_plan: false,
                 action: PlanAction::Archive {
                     dest_name: "001proj".into(),
                 },
@@ -1835,6 +2085,7 @@ mod tests {
             items: vec![PlanItem {
                 name: "001proj".into(),
                 est_bytes: 5,
+                dest_existed_at_plan: false,
                 action: PlanAction::Archive {
                     dest_name: "001proj".into(),
                 },
@@ -1851,6 +2102,31 @@ mod tests {
             log.contains("计划已过期"),
             "应提示计划已过期;日志:\n{}",
             log
+        );
+    }
+
+    #[test]
+    fn run_plan_checks_paths_before_creating_archived_root() {
+        let (_d, mut cfg, drive) = temp_world();
+        let unsafe_archived = cfg.ready_root.join("已备份");
+        cfg.archived_root = unsafe_archived.clone();
+        assert!(!unsafe_archived.exists());
+        let plan = ArchivePlan {
+            drive,
+            items: Vec::new(),
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let err = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap_err();
+
+        assert!(
+            format!("{:#}", err).contains("位于"),
+            "should fail on unsafe paths, got {err:#}"
+        );
+        assert!(
+            !unsafe_archived.exists(),
+            "safety check must run before creating archived_root inside ready_root"
         );
     }
 
@@ -1929,8 +2205,106 @@ mod tests {
             &arch.display().to_string(),
         );
         let marker = paths::system_pending_txn(&cfg.system_root);
-        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        assert!(
+            check_pending_txn(&cfg, &NoopReporter).is_err(),
+            "已移但索引漏写 → 应阻塞新归档,保留标记待人工"
+        );
         assert!(marker.exists(), "已移但索引漏写 → 保留标记待人工");
+    }
+
+    #[test]
+    fn run_plan_stops_when_pending_txn_unresolved() {
+        let (_d, cfg, drive) = temp_world();
+        let arch = cfg.archived_root.join("001proj");
+        fs::create_dir_all(&arch).unwrap();
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &cfg.ready_root.join("001proj").display().to_string(),
+            &arch.display().to_string(),
+        );
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        let marker_before = fs::read_to_string(&marker).unwrap();
+
+        let p2 = cfg.ready_root.join("002proj");
+        fs::create_dir_all(&p2).unwrap();
+        fs::write(p2.join("b.txt"), b"world").unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "002proj".into(),
+                est_bytes: 5,
+                dest_existed_at_plan: false,
+                action: PlanAction::Archive {
+                    dest_name: "002proj".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let err = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap_err();
+
+        assert!(
+            format!("{:#}", err).contains("未完成的事务"),
+            "should stop on unresolved pending txn, got {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            marker_before,
+            "new archive must not overwrite unresolved marker"
+        );
+        assert!(
+            p2.is_dir(),
+            "new source must not move while old txn unresolved"
+        );
+        assert!(
+            !paths::drive_projects_dir(&drive.root)
+                .join("002proj")
+                .exists(),
+            "new project must not be copied while old txn unresolved"
+        );
+    }
+
+    #[test]
+    fn run_plan_stops_when_pending_txn_parse_fails() {
+        let (_d, cfg, drive) = temp_world();
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&marker, "not = valid = toml").unwrap();
+        let marker_before = fs::read_to_string(&marker).unwrap();
+
+        let p1 = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "001proj".into(),
+                est_bytes: 5,
+                dest_existed_at_plan: false,
+                action: PlanAction::Archive {
+                    dest_name: "001proj".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let err = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap_err();
+
+        assert!(
+            format!("{:#}", err).contains("事务标记"),
+            "should stop on unreadable pending txn, got {err:#}"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), marker_before);
+        assert!(p1.is_dir(), "source must not move after parse failure");
+        assert!(!paths::drive_projects_dir(&drive.root)
+            .join("001proj")
+            .exists());
     }
 
     #[test]

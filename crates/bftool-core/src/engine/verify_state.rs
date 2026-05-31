@@ -25,7 +25,8 @@ pub fn record_verify(system_root: &Path, drive_id: &str, outcome: &VerifyOutcome
         return Ok(());
     }
     let path = paths::system_verify_log(system_root);
-    let mut rows = read_rows(&path).unwrap_or_default();
+    let mut rows =
+        read_rows(&path).with_context(|| format!("读取复查记录失败：{}", path.display()))?;
     rows.retain(|r| r.0 != drive_id);
     let (status, bad, extra) = encode(outcome);
     rows.push((
@@ -41,10 +42,7 @@ pub fn record_verify(system_root: &Path, drive_id: &str, outcome: &VerifyOutcome
 /// 读某盘最近复查记录(无记录 → None)。
 pub fn read_last_verify(system_root: &Path, drive_id: &str) -> Result<Option<LastVerify>> {
     let path = paths::system_verify_log(system_root);
-    let rows = match read_rows(&path) {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
+    let rows = read_rows(&path).with_context(|| format!("读取复查记录失败：{}", path.display()))?;
     Ok(rows
         .into_iter()
         .find(|r| r.0 == drive_id)
@@ -83,18 +81,28 @@ fn read_rows(path: &Path) -> Result<Vec<Row>> {
     }
     let mut rdr = csv::Reader::from_path(path)?;
     let mut out = Vec::new();
-    for rec in rdr.records().flatten() {
+    for (idx, rec) in rdr.records().enumerate() {
+        let rec = rec.with_context(|| format!("复查记录第 {} 行格式错误", idx + 2))?;
         let id = rec.get(0).unwrap_or("").to_string();
         if id.is_empty() {
             continue;
         }
         let when = rec.get(1).unwrap_or("").to_string();
         let status = rec.get(2).unwrap_or("").to_string();
-        let bad = rec.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let extra = rec.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let bad = parse_count(rec.get(3), "bad", idx + 2)?;
+        let extra = parse_count(rec.get(4), "extra", idx + 2)?;
         out.push((id, when, status, bad, extra));
     }
     Ok(out)
+}
+
+fn parse_count(raw: Option<&str>, field: &str, line: usize) -> Result<u64> {
+    let Some(raw) = raw else { return Ok(0) };
+    if raw.trim().is_empty() {
+        return Ok(0);
+    }
+    raw.parse::<u64>()
+        .with_context(|| format!("复查记录第 {} 行 {} 不是数字：{}", line, field, raw))
 }
 
 fn write_rows(path: &Path, rows: &[Row]) -> Result<()> {
@@ -149,5 +157,27 @@ mod tests {
         // Cancelled 不记
         record_verify(sr, "备份3", &VerifyOutcome::Cancelled).unwrap();
         assert!(read_last_verify(sr, "备份3").unwrap().is_none());
+    }
+
+    #[test]
+    fn record_verify_rejects_malformed_existing_log() {
+        let d = tempfile::tempdir().unwrap();
+        let sr = d.path();
+        std::fs::create_dir_all(sr).unwrap();
+        std::fs::write(
+            paths::system_verify_log(sr),
+            "drive_id,when,status,bad,extra\n\"unterminated",
+        )
+        .unwrap();
+
+        let err = record_verify(sr, "备份1", &VerifyOutcome::Clean).unwrap_err();
+        assert!(
+            err.to_string().contains("读取复查记录失败"),
+            "error should mention verify log read failure: {err}"
+        );
+        assert!(
+            read_last_verify(sr, "备份1").is_err(),
+            "corrupt verify log must not be displayed as missing history"
+        );
     }
 }

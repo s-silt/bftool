@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
@@ -181,10 +181,15 @@ fn verify_tree(
 ) -> Result<VerifyReport> {
     let mut report = VerifyReport::default();
 
-    let mut manifest_files: Vec<_> = fs::read_dir(mdir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".sha256.csv"))
-        .collect();
+    let mut manifest_files = Vec::new();
+    for e in
+        fs::read_dir(mdir).with_context(|| format!("读取校验清单目录失败：{}", mdir.display()))?
+    {
+        let e = e.with_context(|| format!("枚举校验清单目录失败：{}", mdir.display()))?;
+        if e.file_name().to_string_lossy().ends_with(".sha256.csv") {
+            manifest_files.push(e);
+        }
+    }
     manifest_files.sort_by_key(|e| e.file_name());
 
     for mf in &manifest_files {
@@ -206,7 +211,12 @@ fn verify_tree(
         let rows = match read_manifest_rows(&mf.path()) {
             Ok(r) => r,
             Err(e) => {
-                reporter.warn(&format!("跳过(清单有问题):{} —— {}", project_name, e));
+                reporter.error(&format!("跳过(清单有问题):{} —— {}", project_name, e));
+                report.push_issue(
+                    &project_name,
+                    &mf.file_name().to_string_lossy(),
+                    VerifyIssueKind::ReadError,
+                );
                 continue;
             }
         };
@@ -402,7 +412,10 @@ fn report_extras(
 fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>> {
     let mut rdr = csv::Reader::from_path(path)
         .with_context(|| format!("读校验清单失败：{}", path.display()))?;
-    let headers = rdr.headers()?.clone();
+    let headers = rdr
+        .headers()
+        .with_context(|| format!("读校验清单表头失败：{}", path.display()))?
+        .clone();
     let i_rel = headers.iter().position(|h| h == "Rel");
     let i_size = headers.iter().position(|h| h == "Size");
     let i_hash = headers.iter().position(|h| h == "Hash");
@@ -410,13 +423,16 @@ fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>>
         bail!("清单缺少 Rel 列：{}", path.display());
     };
     let mut out = Vec::new();
-    for rec in rdr.records().flatten() {
+    for (idx, rec) in rdr.records().enumerate() {
+        let rec =
+            rec.with_context(|| format!("校验清单第 {} 行格式错误：{}", idx + 2, path.display()))?;
         let rel = rec.get(i_rel).unwrap_or("").to_string();
         // 跳过空 Rel 行:proj_dir.join("") == proj_dir 本身,会把项目目录当文件校验
         // 而误报 Missing(目录不是 is_file())。空 Rel 是脏数据,直接丢弃。(V-09)
         if rel.is_empty() {
             continue;
         }
+        validate_manifest_rel(path, &rel)?;
         if cruft::rel_has_cruft_component(&rel) {
             continue;
         }
@@ -427,6 +443,42 @@ fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>>
         out.push((rel, size, hash));
     }
     Ok(out)
+}
+
+fn validate_manifest_rel(manifest_path: &Path, rel: &str) -> Result<()> {
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        bail!(
+            "清单 Rel 不能是绝对路径：{} ({})",
+            rel,
+            manifest_path.display()
+        );
+    }
+    for comp in p.components() {
+        match comp {
+            Component::Normal(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                bail!(
+                    "清单 Rel 含非法路径段,可能逃逸项目目录：{} ({})",
+                    rel,
+                    manifest_path.display()
+                );
+            }
+        }
+    }
+    for segment in rel.split(['\\', '/']) {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.contains(':') {
+            bail!(
+                "清单 Rel 含非法路径段,可能逃逸项目目录：{} ({})",
+                rel,
+                manifest_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 从用户选的路径定位:所在备份盘根 + 项目名 + (若选的是文件)项目内相对路径(None=整个项目文件夹)。
@@ -620,6 +672,79 @@ mod tests {
         fs::write(proj.join("z.txt"), b"whatever").unwrap();
         let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
         assert_eq!(r.bad, 1, "Size 不可解析 + 无 Hash 应判 bad(fail-closed)");
+    }
+
+    #[test]
+    fn verify_tree_malformed_manifest_row_is_bad() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        fs::write(
+            mdir.join("proj.sha256.csv"),
+            format!(
+                "Rel,Size,Hash\n\
+                 a.txt,5,{}\n\
+                 missing.bin,1\n",
+                sha_of(b"hello")
+            ),
+        )
+        .unwrap();
+
+        let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
+
+        assert_eq!(r.bad, 1, "malformed manifest rows must fail closed");
+        assert!(matches!(r.issues[0].kind, VerifyIssueKind::ReadError));
+        assert_eq!(r.issues[0].project, "proj");
+    }
+
+    #[test]
+    fn verify_tree_rejects_manifest_parent_traversal_rel() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let projects = d.path().join("p");
+        let proj = projects.join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(projects.join("outside.txt"), b"safe").unwrap();
+        fs::write(
+            mdir.join("proj.sha256.csv"),
+            format!("Rel,Size,Hash\n..\\outside.txt,4,{}\n", sha_of(b"safe")),
+        )
+        .unwrap();
+
+        let r = verify_tree(&mdir, &projects, &abool(), &NoopReporter).unwrap();
+
+        assert_eq!(r.bad, 1, "manifest Rel must not escape project dir");
+        assert!(matches!(r.issues[0].kind, VerifyIssueKind::ReadError));
+    }
+
+    #[test]
+    fn verify_tree_rejects_manifest_absolute_rel() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let projects = d.path().join("p");
+        let proj = projects.join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        let outside = d.path().join("outside.txt");
+        fs::write(&outside, b"safe").unwrap();
+        fs::write(
+            mdir.join("proj.sha256.csv"),
+            format!(
+                "Rel,Size,Hash\n{},4,{}\n",
+                outside.display(),
+                sha_of(b"safe")
+            ),
+        )
+        .unwrap();
+
+        let r = verify_tree(&mdir, &projects, &abool(), &NoopReporter).unwrap();
+
+        assert_eq!(r.bad, 1, "manifest Rel must not be absolute");
+        assert!(matches!(r.issues[0].kind, VerifyIssueKind::ReadError));
     }
 
     // ── V-08: 历史小写哈希应大小写不敏感比对,不误报 Corrupt ──

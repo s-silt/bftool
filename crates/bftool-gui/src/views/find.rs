@@ -7,6 +7,7 @@ use bftool_core::engine::find::{self, FindMatch, FindOutcome};
 use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
+use crate::task::BackgroundTask;
 use crate::views::util;
 
 /// 查找页跨帧状态。直接持有 core 返回的 `FindOutcome`,避免把命中/来源数/失败来源
@@ -37,10 +38,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             app.find_ui.error = None;
         }
         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            do_search = app.find_task.is_none();
+        }
+        if ui
+            .add_enabled(app.find_task.is_none(), egui::Button::new("查找"))
+            .clicked()
+        {
             do_search = true;
         }
-        if ui.button("查找").clicked() {
-            do_search = true;
+        if app.find_task.is_some() {
+            ui.spinner();
+            ui.label("查找中…");
         }
     });
     if do_search {
@@ -107,25 +115,39 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             }
         }
         None => {
-            ui.weak("输入关键词后回车 / 点「查找」。");
+            if app.find_task.is_none() {
+                ui.weak("输入关键词后回车 / 点「查找」。");
+            }
         }
     }
 }
 
 fn run_search(app: &mut App) {
-    let kw = app.find_ui.keyword.trim().to_string();
-    app.find_ui.error = None;
-    if kw.is_empty() {
-        app.find_ui.result = None;
-        app.find_ui.error = Some("请输入关键词。".to_string());
+    if app.find_task.is_some() {
         return;
     }
-    match find::search(&app.cfg, &kw) {
-        Ok(outcome) => app.find_ui.result = Some(outcome),
+    let kw = match normalize_keyword(&app.find_ui.keyword) {
+        Ok(kw) => kw,
         Err(e) => {
             app.find_ui.result = None;
-            app.find_ui.error = Some(format!("查找失败：{:#}", e));
+            app.find_ui.error = Some(e);
+            return;
         }
+    };
+    app.find_ui.error = None;
+    app.find_ui.result = None;
+    let cfg = app.cfg.clone();
+    app.find_task = Some(BackgroundTask::spawn(move |_cancel| {
+        find::search(&cfg, &kw)
+    }));
+}
+
+fn normalize_keyword(raw: &str) -> Result<String, String> {
+    let kw = raw.trim();
+    if kw.is_empty() {
+        Err("请输入关键词。".to_string())
+    } else {
+        Ok(kw.to_string())
     }
 }
 
@@ -169,5 +191,11 @@ mod tests {
         assert_eq!(r[2], "备份1");
         assert_eq!(r[3], "项目\\001p");
         assert_eq!(r[4], "SHA256-OK");
+    }
+
+    #[test]
+    fn normalize_keyword_rejects_empty() {
+        assert_eq!(normalize_keyword("  ").unwrap_err(), "请输入关键词。");
+        assert_eq!(normalize_keyword("  proj ").unwrap(), "proj");
     }
 }

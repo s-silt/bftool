@@ -322,15 +322,16 @@ fn root_is_empty(root: &Path) -> Result<bool> {
         "lost+found",
         ".Trashes",
     ];
-    let n = fs::read_dir(root)
-        .with_context(|| format!("读取 {} 根目录失败", root.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            !ignore.iter().any(|x| x.eq_ignore_ascii_case(&s))
-        })
-        .count();
+    let mut n = 0usize;
+    for e in fs::read_dir(root).with_context(|| format!("读取 {} 根目录失败", root.display()))?
+    {
+        let e = e.with_context(|| format!("枚举 {} 根目录失败", root.display()))?;
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        if !ignore.iter().any(|x| x.eq_ignore_ascii_case(&s)) {
+            n += 1;
+        }
+    }
     Ok(n == 0)
 }
 
@@ -414,15 +415,21 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
     }
     let gc = paths::system_global_catalog(&cfg.system_root);
     if gc.is_file() {
-        if let Ok(mut rdr) = csv::Reader::from_path(&gc) {
-            // 用动态 row：先读 headers 找「备份盘名」列
-            let headers = rdr.headers().cloned().unwrap_or_default();
-            if let Some(col) = headers.iter().position(|h| h == "备份盘名") {
-                for rec in rdr.records().flatten() {
-                    if let Some(v) = rec.get(col) {
-                        if let Some(n) = parse_drive_number(&cfg.name_prefix, v.trim()) {
-                            found.push(n);
-                        }
+        let mut rdr = csv::Reader::from_path(&gc)
+            .with_context(|| format!("读取全局索引失败：{}", gc.display()))?;
+        // 用动态 row：先读 headers 找「备份盘名」列
+        let headers = rdr
+            .headers()
+            .with_context(|| format!("读取全局索引表头失败：{}", gc.display()))?
+            .clone();
+        if let Some(col) = headers.iter().position(|h| h == "备份盘名") {
+            for (idx, rec) in rdr.records().enumerate() {
+                let rec = rec.with_context(|| {
+                    format!("全局索引第 {} 行格式错误：{}", idx + 2, gc.display())
+                })?;
+                if let Some(v) = rec.get(col) {
+                    if let Some(n) = parse_drive_number(&cfg.name_prefix, v.trim()) {
+                        found.push(n);
                     }
                 }
             }
@@ -457,16 +464,21 @@ pub fn seal(drive: &DriveInfo) -> Result<()> {
     let (cnt, bytes) = if cat.is_file() {
         let mut total_bytes = 0u64;
         let mut total = 0u32;
-        if let Ok(mut rdr) = csv::Reader::from_path(&cat) {
-            let headers = rdr.headers().cloned().unwrap_or_default();
-            let bcol = headers.iter().position(|h| h == "TotalBytes");
-            for r in rdr.records().flatten() {
-                total += 1;
-                if let Some(c) = bcol {
-                    if let Some(s) = r.get(c) {
-                        if let Ok(n) = s.parse::<u64>() {
-                            total_bytes += n
-                        }
+        let mut rdr = csv::Reader::from_path(&cat)
+            .with_context(|| format!("读取本盘索引失败：{}", cat.display()))?;
+        let headers = rdr
+            .headers()
+            .with_context(|| format!("读取本盘索引表头失败：{}", cat.display()))?
+            .clone();
+        let bcol = headers.iter().position(|h| h == "TotalBytes");
+        for (idx, r) in rdr.records().enumerate() {
+            let r =
+                r.with_context(|| format!("本盘索引第 {} 行格式错误：{}", idx + 2, cat.display()))?;
+            total += 1;
+            if let Some(c) = bcol {
+                if let Some(s) = r.get(c) {
+                    if let Ok(n) = s.parse::<u64>() {
+                        total_bytes += n
                     }
                 }
             }
@@ -667,5 +679,50 @@ mod tests {
         assert_eq!(parse_drive_number("备份", "备份"), None);
         assert_eq!(parse_drive_number("备份", "X3"), None);
         assert_eq!(parse_drive_number("备份", "备份0"), Some(0));
+    }
+
+    #[test]
+    fn next_drive_number_rejects_malformed_global_catalog() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            system_root: d.path().to_path_buf(),
+            ..Config::default()
+        };
+        std::fs::write(
+            paths::system_global_catalog(&cfg.system_root),
+            "备份盘名,Other\n备份1,ok,extra\n",
+        )
+        .unwrap();
+
+        assert!(
+            next_drive_number(&cfg).is_err(),
+            "bad global catalog must not be ignored when assigning the next drive id"
+        );
+    }
+
+    #[test]
+    fn seal_rejects_malformed_drive_catalog() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("drive");
+        std::fs::create_dir_all(paths::drive_info_dir(&root)).unwrap();
+        std::fs::write(
+            paths::drive_catalog_path(&root),
+            "ProjectName,TotalBytes\n\"unterminated",
+        )
+        .unwrap();
+        let drive = DriveInfo {
+            letter: "E".into(),
+            root: root.clone(),
+            id: "备份1".into(),
+            sealed: false,
+            free_bytes: 0,
+            total_bytes: 0,
+        };
+
+        assert!(
+            seal(&drive).is_err(),
+            "bad drive catalog must not produce an authoritative sealed summary"
+        );
+        assert!(!paths::drive_sealed_path(&root).exists());
     }
 }

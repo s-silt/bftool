@@ -13,7 +13,7 @@ default-members = ["crates/bftool-cli"]
 # 共享的发布元数据 + 依赖版本。子 crate 用 `.workspace = true` 引用，
 # 保证升级集中在一处，子 crate 之间不会版本漂移。
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 # MSRV 1.74：已审计代码所用 std API 均在 1.74 及以前稳定
 # (如 let-else 1.65、inline format args 1.58、Option::is_some_and 1.70)。

@@ -3,7 +3,7 @@
 //! core 提供结构化 `gather() -> StatusReport`(GUI 仪表盘直接消费),
 //! CLI `run` 负责把它渲染成一屏面板。GUI 不解析 reporter 文本。(Spec D §4.1 / L-031)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
@@ -36,9 +36,7 @@ pub struct StatusReport {
 pub fn gather(cfg: &Config) -> Result<StatusReport> {
     let mut drives = Vec::new();
     for d in drive::scan_mounted()? {
-        let last_verify = verify_state::read_last_verify(&cfg.system_root, &d.id)
-            .ok()
-            .flatten();
+        let last_verify = verify_state::read_last_verify(&cfg.system_root, &d.id)?;
         drives.push(DriveStatus {
             drive: d,
             last_verify,
@@ -52,7 +50,7 @@ pub fn gather(cfg: &Config) -> Result<StatusReport> {
         stable_minutes: cfg.stable_minutes,
         min_drive_gb: cfg.min_drive_gb,
         drives,
-        pending_count: count_subdirs(&cfg.ready_root),
+        pending_count: count_subdirs(&cfg.ready_root)?,
         txn_pending: paths::system_pending_txn(&cfg.system_root).is_file(),
     })
 }
@@ -143,15 +141,22 @@ fn display_root(p: &std::path::Path) -> String {
     }
 }
 
-fn count_subdirs(p: &std::path::Path) -> usize {
-    fs::read_dir(p)
-        .ok()
-        .map(|it| {
-            it.filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0)
+fn count_subdirs(p: &std::path::Path) -> Result<usize> {
+    if !p.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for e in fs::read_dir(p).with_context(|| format!("读取待备份目录失败：{}", p.display()))?
+    {
+        let e = e.with_context(|| format!("枚举待备份目录失败：{}", p.display()))?;
+        if e.file_type()
+            .with_context(|| format!("读取待备份项目类型失败：{}", e.path().display()))?
+            .is_dir()
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

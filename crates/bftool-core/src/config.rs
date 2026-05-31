@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// 待归档（源）目录：每个子文件夹 = 一个项目
     pub ready_root: PathBuf,
@@ -120,7 +121,12 @@ impl Config {
             // 找不到任何配置文件 → 用默认值；用户首次跑 `bftool` 会看到提示
             (Self::default(), ConfigSource::Default)
         };
-        config.validate()?;
+        match &source {
+            ConfigSource::Explicit(p) | ConfigSource::Candidate(p) => config
+                .validate()
+                .with_context(|| format!("配置文件校验失败：{}", p.display()))?,
+            ConfigSource::Default => config.validate().context("内置默认配置校验失败")?,
+        }
         Ok(LoadedConfig { config, source })
     }
 
@@ -169,8 +175,34 @@ impl Config {
 
     fn from_path(p: &Path) -> Result<Self> {
         let text = fs::read_to_string(p)?;
-        let cfg: Self = toml::from_str(&text).context("配置文件 TOML 解析失败")?;
+        let mut cfg: Self = toml::from_str(&text).context("配置文件 TOML 解析失败")?;
+        let base = config_base_dir(p);
+        cfg.ready_root = resolve_root(&base, cfg.ready_root);
+        cfg.archived_root = resolve_root(&base, cfg.archived_root);
+        cfg.system_root = resolve_root(&base, cfg.system_root);
         Ok(cfg)
+    }
+}
+
+fn config_base_dir(p: &Path) -> PathBuf {
+    let parent = p
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(parent))
+            .unwrap_or_else(|_| parent.to_path_buf())
+    }
+}
+
+fn resolve_root(base: &Path, p: PathBuf) -> PathBuf {
+    if p.is_absolute() {
+        p
+    } else {
+        base.join(p)
     }
 }
 
@@ -329,6 +361,68 @@ mod tests {
         let c = Config::from_path(&p).unwrap();
         assert!(c.extra_catalogs.is_empty());
         assert_eq!(c.name_prefix, "备份");
+    }
+
+    #[test]
+    fn rejects_unknown_config_field() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bftool.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"D:/r\"\n\
+             archived_root = \"D:/a\"\n\
+             system_root = \"D:/s\"\n\
+             reserve_gbb = 500\n",
+        )
+        .unwrap();
+
+        let err = Config::from_path(&p).unwrap_err();
+
+        assert!(
+            format!("{:#}", err).contains("reserve_gbb"),
+            "unknown field should be named in error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn from_path_resolves_relative_roots_against_config_file() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg_dir = d.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let p = cfg_dir.join("bftool.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"library/ready\"\n\
+             archived_root = \"library/archived\"\n\
+             system_root = \"library/system\"\n",
+        )
+        .unwrap();
+
+        let c = Config::from_path(&p).unwrap();
+
+        assert_eq!(c.ready_root, cfg_dir.join("library/ready"));
+        assert_eq!(c.archived_root, cfg_dir.join("library/archived"));
+        assert_eq!(c.system_root, cfg_dir.join("library/system"));
+    }
+
+    #[test]
+    fn load_explicit_validation_error_mentions_config_path() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bad.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"D:/r\"\n\
+             archived_root = \"D:/a\"\n\
+             system_root = \"D:/s\"\n\
+             extra_catalogs = [\"\"]\n",
+        )
+        .unwrap();
+
+        let err = Config::load_with_source(Some(&p)).unwrap_err();
+        let text = format!("{:#}", err);
+
+        assert!(text.contains("配置文件校验失败"));
+        assert!(text.contains("bad.toml"));
     }
 
     #[test]

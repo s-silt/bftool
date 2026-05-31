@@ -22,6 +22,14 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
 
     ui.separator();
+    if let Some((ok, msg)) = &app.drives_result {
+        let color = if *ok {
+            util::level_color(LogLevel::Ok)
+        } else {
+            util::level_color(LogLevel::Error)
+        };
+        ui.colored_label(color, msg);
+    }
     match &app.drives_cache {
         Some(drives) if !drives.is_empty() => {
             egui::Grid::new("drives_grid")
@@ -55,9 +63,13 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
 fn rescan(app: &mut App) {
     match drive::scan_mounted() {
-        Ok(ds) => app.drives_cache = Some(ds),
+        Ok(ds) => {
+            app.drives_result = Some((true, format!("已刷新：识别到 {} 块备份盘。", ds.len())));
+            app.drives_cache = Some(ds);
+        }
         Err(e) => {
             app.drives_cache = Some(Vec::new());
+            app.drives_result = Some((false, format!("扫描盘失败：{:#}", e)));
             app.logs
                 .push((LogLevel::Error, format!("扫描盘失败：{:#}", e)));
         }
