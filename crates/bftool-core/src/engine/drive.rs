@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::engine::paths;
+use crate::engine::{cruft, durable, paths};
 use crate::reporter::Reporter;
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,8 +254,9 @@ pub fn init(
     fs::create_dir_all(paths::drive_logs_dir(&root)).ok();
     fs::create_dir_all(paths::drive_manifest_dir(&root)).ok();
     fs::create_dir_all(paths::drive_projects_dir(&root)).ok();
-    fs::write(paths::drive_id_path(&root), &id).context("写本盘编号失败")?;
-    fs::write(info.join(paths::DRIVE_README_FILE), readme(&id))?;
+    // 原子写(tmp+fsync+rename):本盘编号是认盘依据,断电不能留 0 字节/半截坏文件。(review-r2 R4-4)
+    durable::write_synced(&paths::drive_id_path(&root), id.as_bytes()).context("写本盘编号失败")?;
+    durable::write_synced(&info.join(paths::DRIVE_README_FILE), readme(&id).as_bytes())?;
 
     // 序号文件追踪：保证下次取下一块的时候编号单调递增
     if let Some(n) = parse_drive_number(&cfg.name_prefix, &id) {
@@ -312,23 +313,22 @@ fn classify_for_init(cfg: &Config, letter: &str, root: &Path) -> Result<InitClas
     })
 }
 
-/// 根目录是否为空(忽略 Windows 系统目录)。
+/// 根目录是否为空(忽略系统目录与 OS 自动注入的杂文件)。
+/// 杂文件名单统一交给 cruft 判定(desktop.ini/Thumbs.db/$RECYCLE.BIN/System Volume Information…),
+/// 否则一块全新空盘只要有个 desktop.ini/Thumbs.db 就被误判非空、拒绝初始化。(review-r2 R4-3)
 fn root_is_empty(root: &Path) -> Result<bool> {
-    let ignore: &[&str] = &[
-        "System Volume Information",
-        "$RECYCLE.BIN",
-        "RECYCLER",
-        "found.000",
-        "lost+found",
-        ".Trashes",
-    ];
+    // RECYCLER 是旧版 Windows 回收站目录名,cruft 名单未含,这里额外忽略。
+    let extra_ignore: &[&str] = &["RECYCLER"];
     let mut n = 0usize;
     for e in fs::read_dir(root).with_context(|| format!("读取 {} 根目录失败", root.display()))?
     {
         let e = e.with_context(|| format!("枚举 {} 根目录失败", root.display()))?;
         let name = e.file_name();
         let s = name.to_string_lossy();
-        if !ignore.iter().any(|x| x.eq_ignore_ascii_case(&s)) {
+        let ignorable = extra_ignore.iter().any(|x| x.eq_ignore_ascii_case(&s))
+            || cruft::is_cruft_dir(&s)
+            || cruft::is_cruft_file(&s);
+        if !ignorable {
             n += 1;
         }
     }
@@ -453,7 +453,7 @@ fn bump_drive_seq(cfg: &Config, n: u32) -> Result<()> {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0);
     if n > cur {
-        fs::write(&seq_file, n.to_string())?;
+        durable::write_synced(&seq_file, n.to_string().as_bytes())?; // 原子写,断电不留半截序号(review-r2 R4-4)
     }
     Ok(())
 }
@@ -493,7 +493,8 @@ pub fn seal(drive: &DriveInfo) -> Result<()> {
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         cnt, bytes
     );
-    fs::write(paths::drive_sealed_path(&drive.root), text)
+    // 原子写 + fsync:封盘标记若断电丢失,本盘会被再次选为可写盘 → 误写已封盘的盘。(review-r2 R4-5)
+    durable::write_synced(&paths::drive_sealed_path(&drive.root), text.as_bytes())
         .with_context(|| format!("写封盘标记失败：{}", drive.root.display()))?;
     Ok(())
 }
@@ -571,6 +572,20 @@ mod tests {
             free_bytes: bytes,
             total_bytes: bytes,
         }
+    }
+
+    // ── review-r2 R4-3:root_is_empty 应忽略 OS 杂文件(desktop.ini/Thumbs.db),否则空盘被误判非空 ──
+    #[test]
+    fn root_is_empty_ignores_cruft_files() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("desktop.ini"), b"x").unwrap();
+        std::fs::write(d.path().join("Thumbs.db"), b"x").unwrap();
+        assert!(
+            root_is_empty(d.path()).unwrap(),
+            "只有 OS 自动生成的杂文件应视为空盘"
+        );
+        std::fs::write(d.path().join("real.txt"), b"x").unwrap();
+        assert!(!root_is_empty(d.path()).unwrap(), "有真实文件应判非空");
     }
 
     // ── Spec D §4.2 Finding #4: init_decision 真值表 ──

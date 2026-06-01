@@ -116,6 +116,9 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                 && !app.find_ui.keyword.trim().is_empty()
             {
+                // R4-7:跳转前清掉上次查找的旧结果/错误,避免查找页显示与当前关键词无关的过期结果。
+                app.find_ui.result = None;
+                app.find_ui.error = None;
                 app.view = View::Find;
             }
         });
