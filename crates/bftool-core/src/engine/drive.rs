@@ -243,10 +243,7 @@ pub fn init(
         }
     }
 
-    let id = match id {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
-        _ => format!("{}{}", cfg.name_prefix, next_drive_number(cfg)?),
-    };
+    let id = resolve_drive_id(&root, id, force, cfg)?;
 
     // 写盘内目录
     let info = paths::drive_info_dir(&root);
@@ -311,6 +308,37 @@ fn classify_for_init(cfg: &Config, letter: &str, root: &Path) -> Result<InitClas
         already_backup,
         non_empty,
     })
+}
+
+/// 决定本盘编号。R5-3:已是备份盘(盘上有 本盘编号.txt)时 **不指定 --id 必须复用现有编号、
+/// 绝不分配新号** —— 否则重初始化会静默改掉盘身份,让盘上已索引数据与新号脱节、find/恢复指向错误。
+/// 显式 --id 改成与现有不同的号(非 --force)直接拒绝;--force 才允许强改。
+fn resolve_drive_id(root: &Path, id: Option<&str>, force: bool, cfg: &Config) -> Result<String> {
+    let existing_id = fs::read_to_string(paths::drive_id_path(root))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match id {
+        Some(s) if !s.trim().is_empty() => {
+            let s = s.trim();
+            if let Some(ex) = &existing_id {
+                if ex != s && !force {
+                    bail!(
+                        "盘已是备份盘「{}」,拒绝改号为「{}」—— 会让盘上已归档数据与新编号脱节、\
+                         find/恢复指向错误。如确需改号,请先清空该盘再初始化,或加 --force 强改。",
+                        ex,
+                        s
+                    );
+                }
+            }
+            Ok(s.to_string())
+        }
+        // 未指定 --id:已是备份盘 → 复用现有编号;全新盘 → 取下一个「备份N」。
+        _ => match existing_id {
+            Some(ex) => Ok(ex),
+            None => Ok(format!("{}{}", cfg.name_prefix, next_drive_number(cfg)?)),
+        },
+    }
 }
 
 /// 根目录是否为空(忽略系统目录与 OS 自动注入的杂文件)。
@@ -572,6 +600,34 @@ mod tests {
             free_bytes: bytes,
             total_bytes: bytes,
         }
+    }
+
+    // ── review-r2 R5-3:re-init 已有数据备份盘:不指定 --id 复用现有编号、显式改号被拒(非 force)──
+    #[test]
+    fn resolve_drive_id_reuses_existing_and_rejects_renumber() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_path_buf();
+        let cfg = Config {
+            system_root: d.path().join("sys"),
+            name_prefix: "备份".into(),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(paths::drive_info_dir(&root)).unwrap();
+        std::fs::write(paths::drive_id_path(&root), "备份3").unwrap();
+        // 不指定 --id → 复用现有「备份3」,不分配新号
+        assert_eq!(resolve_drive_id(&root, None, false, &cfg).unwrap(), "备份3");
+        // 指定相同 --id → OK
+        assert_eq!(
+            resolve_drive_id(&root, Some("备份3"), false, &cfg).unwrap(),
+            "备份3"
+        );
+        // 指定不同 --id 且非 force → 拒绝改号
+        assert!(resolve_drive_id(&root, Some("备份9"), false, &cfg).is_err());
+        // --force 可改号
+        assert_eq!(
+            resolve_drive_id(&root, Some("备份9"), true, &cfg).unwrap(),
+            "备份9"
+        );
     }
 
     // ── review-r2 R4-3:root_is_empty 应忽略 OS 杂文件(desktop.ini/Thumbs.db),否则空盘被误判非空 ──

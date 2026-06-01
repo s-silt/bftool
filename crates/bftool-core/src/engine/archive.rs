@@ -146,9 +146,13 @@ pub fn run(
 ) -> Result<ArchiveSummary> {
     let plan = match plan(cfg, &opts, reporter) {
         Ok(p) => p,
-        // 选不出可写盘:友好提示已由 plan() 打过,这里按"无事可做"返回(退出码 0,行为不变)。
+        // 自动选盘选不出可写盘 = 无事可做(退出码 0,行为不变)。但**显式 --drive 指定了盘却不可写**
+        // (封盘/过小/不存在)是用户明确意图落空 → 作为错误上抛(非零退出码),不静默成 0。(review-r2 R5-5)
         Err(e) if e.downcast_ref::<NoWritableDrive>().is_some() => {
-            return Ok(ArchiveSummary::default())
+            if opts.drive_letter_override.is_some() {
+                return Err(e);
+            }
+            return Ok(ArchiveSummary::default());
         }
         Err(e) => return Err(e),
     };
@@ -1176,39 +1180,52 @@ fn handle_one(
     };
     pending.write(&txn_path)?;
 
-    // 写清单 + 本盘索引 + 全局索引(在 rename 之前写;失败则源仍在 待备份 可重做)
-    src.write_csv(&manifest_path)?;
-    append_drive_catalog(
-        &catalog,
-        &DriveCatalogRow {
-            project_no: proj_no,
-            project_name: dest_name.clone(),
-            file_count: src.count() as u64,
-            total_bytes: src_bytes,
-            archived_utc: utc.clone(),
-            verify_status: verify_status.token().to_string(),
-            status: "Complete".to_string(),
-            notes: if dup_in_drive {
-                format!("原名 {}", name)
-            } else {
-                String::new()
+    // 写清单 + 本盘索引 + 全局索引(在 rename 之前写)。R5-2:这三处写在**写标记之后**,任一失败必须
+    // 中止本轮(CommitInterrupted),否则 handle_one 返回普通 Err、run_plan 继续,下个项目的
+    // pending.write 会覆盖本项目残留的事务标记、抹掉崩溃恢复证据(与移源失败的 R3-3 守卫对称)。
+    let commit_writes = (|| -> Result<()> {
+        src.write_csv(&manifest_path)?;
+        append_drive_catalog(
+            &catalog,
+            &DriveCatalogRow {
+                project_no: proj_no,
+                project_name: dest_name.clone(),
+                file_count: src.count() as u64,
+                total_bytes: src_bytes,
+                archived_utc: utc.clone(),
+                verify_status: verify_status.token().to_string(),
+                status: "Complete".to_string(),
+                notes: if dup_in_drive {
+                    format!("原名 {}", name)
+                } else {
+                    String::new()
+                },
             },
-        },
-    )?;
-    append_global_catalog(
-        &paths::system_global_catalog(&cfg.system_root),
-        &GlobalCatalogRow {
-            folder_name: dest_name.clone(),
-            drive_name: drive.id.clone(),
-            archived_time: local_time.clone(),
-            project_no: leading_digits(&name),
-            in_drive_path: format!("项目\\{}", dest_name),
-            file_count: src.count() as u64,
-            size_gb: size_gbval,
-            verify: verify_status.token().to_string(),
-            manifest_path: rel_manifest,
-        },
-    )?;
+        )?;
+        append_global_catalog(
+            &paths::system_global_catalog(&cfg.system_root),
+            &GlobalCatalogRow {
+                folder_name: dest_name.clone(),
+                drive_name: drive.id.clone(),
+                archived_time: local_time.clone(),
+                project_no: leading_digits(&name),
+                in_drive_path: format!("项目\\{}", dest_name),
+                file_count: src.count() as u64,
+                size_gb: size_gbval,
+                verify: verify_status.token().to_string(),
+                manifest_path: rel_manifest,
+            },
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = commit_writes {
+        reporter.error(&format!("写索引失败(提交中断):{:#}", e));
+        reporter.action(
+            "事务标记已保留,下次启动会据此恢复;本轮就此中止,避免后续项目覆盖该标记。\
+             请解决写索引失败的原因(备份盘断开/写满/索引损坏等)后重跑 `bftool archive`。",
+        );
+        return Ok(HandleOutcome::CommitInterrupted);
+    }
 
     // 移动源（索引已落盘后再移）。失败 → 不清标记、**中止本轮**(CommitInterrupted),源留待备份下次重做。
     if let Err(e) = fs::rename(proj_path, &arch_dest) {
@@ -1330,82 +1347,6 @@ fn append_catalog_row<R: serde::Serialize>(path: &Path, row: &R) -> Result<()> {
     Ok(())
 }
 
-/// 从 CSV 索引删除「指定表头列 == value」的所有行,原子重写;无匹配/无该列/文件不存在 → 不动。
-/// 崩溃恢复(in_ready 重做)前清掉上次中断提交残留的孤儿索引行。(review-r2 R3-2)
-fn remove_catalog_rows(path: &Path, key_header: &str, value: &str) -> Result<()> {
-    if !path.is_file() {
-        return Ok(());
-    }
-    let bytes = fs::read(path).with_context(|| format!("读索引失败：{}", path.display()))?;
-    let mut rdr = csv::Reader::from_reader(std::io::Cursor::new(&bytes));
-    let headers = rdr.headers()?.clone();
-    let Some(col) = headers.iter().position(|h| h == key_header) else {
-        return Ok(()); // 没有该列 → 无可删
-    };
-    let mut wtr = csv::WriterBuilder::new()
-        .has_headers(false)
-        .from_writer(Vec::new());
-    wtr.write_record(&headers)?;
-    let mut removed = 0usize;
-    for rec in rdr.records() {
-        let rec = rec?;
-        if rec.get(col).map(|v| v == value).unwrap_or(false) {
-            removed += 1;
-            continue;
-        }
-        wtr.write_record(&rec)?;
-    }
-    if removed == 0 {
-        return Ok(()); // 无残留 → 不重写,避免无谓 IO
-    }
-    wtr.flush()?;
-    let out = wtr
-        .into_inner()
-        .map_err(|e| anyhow::anyhow!("序列化索引失败：{}", e))?;
-    durable::write_synced(path, &out)
-        .with_context(|| format!("重写索引失败：{}", path.display()))?;
-    Ok(())
-}
-
-/// 崩溃恢复(in_ready 重做)前,清掉上次中断提交残留的孤儿索引行(本机全局索引 + 备份盘本盘索引)。
-/// 否则重做时 catalog_has_project 命中残留行 → 误判重名 → RenameAndArchive 产生第二份副本 + 孤儿行。
-/// best-effort:盘可能已拔下/只读,清理失败只 warn、绝不阻断恢复(源始终在待备份,数据安全)。(review-r2 R3-2)
-fn cleanup_orphan_catalog_rows(cfg: &Config, pending: &txn::PendingTxn, reporter: &dyn Reporter) {
-    let name = &pending.project_dest_name;
-    let global = paths::system_global_catalog(&cfg.system_root);
-    if let Err(e) = remove_catalog_rows(&global, "文件夹名", name) {
-        reporter.warn(&format!("清理全局索引孤儿行失败(不阻断恢复):{}", e));
-    }
-    if !pending.drive_letter.is_empty() {
-        // 备份盘根由盘符派生(与生产 root_from_letter 一致);盘不在线时各项 is_file/is_dir 为假 → 跳过。
-        let drive_root = PathBuf::from(format!("{}:\\", pending.drive_letter));
-        cleanup_orphan_on_drive(&drive_root, name, reporter);
-    }
-}
-
-/// 清掉一块备份盘上本次中断事务残留的孤儿:本盘索引行 + 盘上副本目录 + 校验清单。
-/// dest_name 唯一标识本次事务的目标(重名时带时间戳),不会误删其它项目。best-effort:盘不在线/
-/// 只读时各项判空或删除报错只 warn、绝不阻断恢复(源始终在待备份,数据安全)。(review-r2 R3-2/R4-2)
-fn cleanup_orphan_on_drive(drive_root: &Path, dest_name: &str, reporter: &dyn Reporter) {
-    let drive_cat = paths::drive_catalog_path(drive_root);
-    if let Err(e) = remove_catalog_rows(&drive_cat, "ProjectName", dest_name) {
-        reporter.warn(&format!("清理本盘索引孤儿行失败(不阻断恢复):{}", e));
-    }
-    let orphan_dir = paths::drive_projects_dir(drive_root).join(dest_name);
-    if orphan_dir.is_dir() {
-        if let Err(e) = fs::remove_dir_all(&orphan_dir) {
-            reporter.warn(&format!("清理盘上孤儿副本目录失败(不阻断恢复):{}", e));
-        }
-    }
-    let orphan_manifest =
-        paths::drive_manifest_dir(drive_root).join(format!("{}.sha256.csv", dest_name));
-    if orphan_manifest.is_file() {
-        if let Err(e) = fs::remove_file(&orphan_manifest) {
-            reporter.warn(&format!("清理盘上孤儿校验清单失败(不阻断恢复):{}", e));
-        }
-    }
-}
-
 fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
     if !catalog.is_file() {
         return Ok(false);
@@ -1510,16 +1451,17 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     };
 
     reporter.action(&format!("发现上次未完成的事务（项目：{}）。", pname));
-    // R4-1:in_ready 必须加 !(moved && indexed) 守卫。否则「事务其实已完成(源已移、索引已写)、
-    // 仅 clear 标记前崩溃」叠加「用户在待备份重建了同名源」时,会误判为「移动尚未发生→需重做」,
-    // 进而 cleanup_orphan_catalog_rows 删掉那份**已完成备份**的索引行(甚至非重名场景下重做会
-    // 合并/覆盖旧备份物理数据)。已完成事务应走下面 moved&&indexed 分支,只清标记、不动索引。
+    // in_ready 加 !(moved && indexed) 守卫:「事务其实已完成(源已移、索引已写)、仅 clear 标记前崩溃」
+    // 叠加「用户在待备份重建了同名源」时,应判定为已完成(走下面 moved&&indexed 分支只清标记),
+    // 而非误判为需重做。(review-r2 R4-1)
     if in_ready && !(moved && indexed) {
-        reporter.action(
-            "→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。正在清理上次残留并清除旧标记…",
-        );
-        // R3-2:清掉本次中断提交残留的孤儿索引行 + 盘上孤儿副本,否则重做会被误判重名 → 第二份副本+孤儿行。
-        cleanup_orphan_catalog_rows(cfg, &pending, reporter);
+        reporter
+            .action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。正在清除旧标记…");
+        // 已知局限(review-r2 R3-2):若崩溃恰发生在「索引已写、移源未完成」的窄窗口,自动重做会在
+        // 备份盘上产生一份带时间戳的重复副本(源始终保留、数据不丢,与既有"保守重做"设计、
+        // crash_after_index_before_move_redo_is_idempotent 测试一致)。曾尝试在恢复路径清理孤儿
+        // (删索引行/盘上副本),但删除依赖易变盘符且无法充分测试,两轮 re-review 各暴露一个 P1
+        // 数据丢失风险(删错盘 / 删已完成备份),故撤回 —— **恢复路径绝不做任何删除**。
         clear_marker(&path, reporter);
     } else if moved && indexed {
         reporter.action("→ 已移动且索引中已有记录，判定为已完成（仅标记残留）。正在清除标记…");
@@ -2204,6 +2146,28 @@ mod tests {
         assert_eq!(n, 12, "Done 应携带实际归档字节(供 consumed 真实累计)");
     }
 
+    // ── review-r2 R5-2:提交段索引写失败(标记已写)→ CommitInterrupted,保留标记、中止本轮 ──
+    #[test]
+    fn handle_one_index_write_failure_is_commit_interrupted() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hi").unwrap();
+        // 把全局索引路径占成目录 → append_global_catalog 的 write_synced 必失败
+        let global = paths::system_global_catalog(&cfg.system_root);
+        fs::create_dir_all(&global).unwrap();
+        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None);
+        assert!(
+            matches!(outcome, Ok(HandleOutcome::CommitInterrupted)),
+            "提交段索引写失败应 CommitInterrupted(而非普通 Err)"
+        );
+        assert!(proj.exists(), "源应仍在待备份(提交中断)");
+        assert!(
+            paths::system_pending_txn(&cfg.system_root).is_file(),
+            "事务标记应保留以便恢复"
+        );
+    }
+
     // ── review-r2 R2-1:预览→执行间换盘(同盘符)→ 盘内编号变了 → 按"计划已过期"中止 ──
     #[test]
     fn run_plan_aborts_when_drive_id_differs_from_plan() {
@@ -2261,48 +2225,6 @@ mod tests {
         );
         let tmp = cat.with_file_name("本盘索引记录.csv.bftool-tmp");
         assert!(!tmp.exists(), "原子写不应遗留 .bftool-tmp");
-    }
-
-    // ── review-r2 R3-2:remove_catalog_rows 删指定列等值的行(崩溃恢复清孤儿索引行用)──
-    #[test]
-    fn remove_catalog_rows_filters_matching() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("cat.csv");
-        fs::write(&p, "ProjectName,X\n001A,a\n002B,b\n001A,c\n").unwrap();
-        remove_catalog_rows(&p, "ProjectName", "001A").unwrap();
-        let content = fs::read_to_string(&p).unwrap();
-        assert!(!content.contains("001A"), "匹配行应被删;实际:\n{content}");
-        assert!(content.contains("002B"), "不匹配行应保留");
-        assert!(content.starts_with("ProjectName,X"), "表头保留");
-        // 没有匹配项时不报错、内容不变
-        remove_catalog_rows(&p, "ProjectName", "不存在").unwrap();
-        assert!(fs::read_to_string(&p).unwrap().contains("002B"));
-        // 缺该列时不报错
-        remove_catalog_rows(&p, "无此列", "x").unwrap();
-    }
-
-    // ── review-r2 R4-2:清孤儿既删本盘索引行,也删盘上残留副本目录 + 校验清单(防泄漏)──
-    #[test]
-    fn cleanup_orphan_on_drive_removes_row_dir_and_manifest() {
-        let d = tempfile::tempdir().unwrap();
-        let drive_root = d.path().to_path_buf();
-        let cat = paths::drive_catalog_path(&drive_root);
-        fs::create_dir_all(cat.parent().unwrap()).unwrap();
-        fs::write(&cat, "ProjectName,X\n001A_ts,a\n002B,b\n").unwrap();
-        let orphan_dir = paths::drive_projects_dir(&drive_root).join("001A_ts");
-        fs::create_dir_all(&orphan_dir).unwrap();
-        fs::write(orphan_dir.join("leak"), b"x").unwrap();
-        let manifest = paths::drive_manifest_dir(&drive_root).join("001A_ts.sha256.csv");
-        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        fs::write(&manifest, b"m").unwrap();
-
-        cleanup_orphan_on_drive(&drive_root, "001A_ts", &NoopReporter);
-
-        let cat_after = fs::read_to_string(&cat).unwrap();
-        assert!(!cat_after.contains("001A_ts"), "孤儿索引行应删");
-        assert!(cat_after.contains("002B"), "其他行应保留");
-        assert!(!orphan_dir.exists(), "孤儿副本目录应删");
-        assert!(!manifest.exists(), "孤儿校验清单应删");
     }
 
     // ── review-r2 R3-1:良性 Skip(超单盘容量)即使台账写失败也应 Skipped,不升级为 Err/failed ──
@@ -2576,9 +2498,10 @@ mod tests {
         .unwrap();
     }
 
-    // ── review-r2 R3-2:in_ready 重做前清掉孤儿全局索引行(否则重做会被误判重名 → 第二份副本)──
+    // ── review-r2 R3-2(撤回后回归守卫):in_ready 重做分支**不得**删除任何索引行
+    // (曾尝试在恢复路径清孤儿,引入两个 P1 数据丢失风险,已撤回 → 恢复路径绝不删除)──
     #[test]
-    fn check_pending_txn_in_ready_cleans_global_orphan() {
+    fn check_pending_txn_in_ready_does_not_delete_index() {
         let (_d, cfg, _drive) = temp_world();
         let src = cfg.ready_root.join("001A");
         fs::create_dir_all(&src).unwrap(); // 源仍在待备份 → in_ready=true
@@ -2590,7 +2513,7 @@ mod tests {
              001A,备份1,t,001,项目\\001A,1,0.0,SHA256-OK,x\n",
         )
         .unwrap();
-        // move_to 指向不存在路径 → moved=false
+        // move_to 指向不存在路径 → moved=false → 走 in_ready 重做分支
         write_marker(
             &cfg,
             "001A",
@@ -2601,10 +2524,9 @@ mod tests {
         check_pending_txn(&cfg, &NoopReporter).unwrap();
         let content = fs::read_to_string(&global).unwrap();
         assert!(
-            !content.contains("001A"),
-            "in_ready 重做前应清掉孤儿全局行;实际:\n{content}"
+            content.contains("001A"),
+            "in_ready 重做不得删除任何索引行(恢复路径绝不删除);实际:\n{content}"
         );
-        assert!(content.contains("文件夹名"), "表头应保留");
         assert!(
             !paths::system_pending_txn(&cfg.system_root).is_file(),
             "标记应已清除"

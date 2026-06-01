@@ -37,11 +37,13 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             app.find_ui.result = None; // 关键词改变立即清空旧结果
             app.find_ui.error = None;
         }
+        // R5-7:用 !is_busy()(含 backup/verify 的 app.task、plan_task、其它 find_task),
+        // 否则查找可与备份/复查并发跑。
         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            do_search = app.find_task.is_none();
+            do_search = !app.is_busy();
         }
         if ui
-            .add_enabled(app.find_task.is_none(), egui::Button::new("查找"))
+            .add_enabled(!app.is_busy(), egui::Button::new("查找"))
             .clicked()
         {
             do_search = true;
@@ -123,8 +125,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn run_search(app: &mut App) {
-    if app.find_task.is_some() {
-        return;
+    if app.is_busy() {
+        return; // R5-7:任何任务进行中(备份/复查/计划/查找)都不重入
     }
     let kw = match normalize_keyword(&app.find_ui.keyword) {
         Ok(kw) => kw,

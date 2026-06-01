@@ -264,6 +264,10 @@ fn empty_result_message(outcome: &FindOutcome) -> String {
 }
 
 pub fn run(cfg: &Config, keyword: &str) -> Result<()> {
+    // 空/纯空白关键词会 contains-匹配所有行(等于"列全部"),且与 GUI(已拒空)行为不一致 → 拒掉。(review-r2 R5-4)
+    if keyword.trim().is_empty() {
+        anyhow::bail!("请输入查找关键词(项目名或编号片段);留空不会列出全部项目。");
+    }
     let outcome = search(cfg, keyword)?;
     if outcome.sources_searched == 0 {
         println!("{}", empty_result_message(&outcome));
@@ -321,6 +325,16 @@ mod tests {
             system_root: sysroot,
             ..Config::default()
         }
+    }
+
+    // ── review-r2 R5-4:CLI find 空/纯空白关键词被拒(不列出全部) ──
+    #[test]
+    fn run_rejects_empty_keyword() {
+        assert!(run(&Config::default(), "").is_err(), "空关键词应被拒");
+        assert!(
+            run(&Config::default(), "   ").is_err(),
+            "纯空白关键词应被拒"
+        );
     }
 
     // ── review-r2 R4-6:本机索引读失败(被占用/损坏)不能误报为"尚未归档" ──
