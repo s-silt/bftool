@@ -79,11 +79,28 @@ pub fn check_paths(
 }
 
 fn canon(p: &Path) -> PathBuf {
-    let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let c = strip_verbatim(&c);
-    // 统一分隔符为 `\`:canonicalize 失败回退原样时会保留用户在 toml 里写的 `/`,而
-    // is_inside/eq_ci 用字符串前缀比较,`/` 与 `\` 混用会让嵌套/同盘判定漏判(toml 写
-    // ready="D:/lib"、archived="D:/lib/done" 时安全闸被绕过)。仅用于比较,不动真实路径。(review-r2 R3-4)
+    // canonicalize 对**存在**路径给规范长名(展开 8.3 短名、去 verbatim);对**不存在**路径会失败、
+    // 退回原样(可能含 8.3 短名或用户写的 `/`)。直接混用会让"存在的父"与"不存在的子"前缀不一致,
+    // is_inside/eq_ci 漏判(本地无 8.3 看不出,但 CI runner 的 RUNNER~1 短名 temp 路径会触发)。
+    // 解决:不存在时锚定到**最长存在的祖先**——canonicalize 该祖先,再把其余尾段拼回,
+    // 保证存在/不存在路径共享同一规范前缀。(review-r2 #1/#4 + R3-4)
+    let c = if let Ok(c) = p.canonicalize() {
+        strip_verbatim(&c)
+    } else {
+        let mut anchored = None;
+        for anc in p.ancestors() {
+            if let Ok(c) = anc.canonicalize() {
+                let mut base = strip_verbatim(&c);
+                if let Ok(rest) = p.strip_prefix(anc) {
+                    base.push(rest);
+                }
+                anchored = Some(base);
+                break;
+            }
+        }
+        anchored.unwrap_or_else(|| p.to_path_buf())
+    };
+    // 统一分隔符为 `\`(toml 里写 `/` 也能正确比较嵌套/同盘)。仅用于比较,不动真实路径。
     PathBuf::from(c.to_string_lossy().replace('/', "\\"))
 }
 
@@ -316,6 +333,19 @@ mod tests {
         .unwrap();
         // 同分区、互不嵌套 → Ok,且无"不同分区"警告
         assert!(r.is_empty(), "同分区互不嵌套应无警告,实际:{:?}", r);
+    }
+
+    // ── review-r2:canon 对不存在的子目录须锚定到存在父的规范名(防 8.3 短名/verbatim 漏判)──
+    #[test]
+    fn canon_anchors_nonexistent_to_existing_ancestor() {
+        let d = tempfile::tempdir().unwrap();
+        let parent = d.path().join("p");
+        std::fs::create_dir_all(&parent).unwrap();
+        let child = parent.join("不存在子");
+        let cp = canon(&parent);
+        let cc = canon(&child);
+        assert_eq!(cc, cp.join("不存在子"), "不存在子应锚定到存在父的规范名");
+        assert!(is_inside(&cc, &cp), "不存在子应被判在父内");
     }
 
     // ── review-r2 R3-4:toml 里用正斜杠写的嵌套路径,安全闸不得漏判 ──
