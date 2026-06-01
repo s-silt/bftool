@@ -229,18 +229,48 @@ pub fn search(cfg: &Config, keyword: &str) -> Result<FindOutcome> {
     Ok(out)
 }
 
+/// sources_searched==0 时的提示文案。纯函数,可测。
+/// 关键区分:本机索引**存在但读失败**(被 Excel 占用/损坏)≠ 尚未归档 —— 否则把"读不出"
+/// 误报成"没有",用户以为备份记录丢了。(review-r2 R4-6)
+fn empty_result_message(outcome: &FindOutcome) -> String {
+    let local_failed = outcome.sources_failed.iter().any(|s| s == LOCAL_SOURCE);
+    if local_failed {
+        let others: Vec<&str> = outcome
+            .sources_failed
+            .iter()
+            .filter(|s| s.as_str() != LOCAL_SOURCE)
+            .map(String::as_str)
+            .collect();
+        let mut msg =
+            "本机索引存在但读取失败(可能被 Excel 等程序占用,或文件损坏)——请关闭占用程序/修复后重试。"
+                .to_string();
+        if !others.is_empty() {
+            msg.push_str(&format!(
+                " 另有 {} 个额外索引来源读取失败:{}",
+                others.len(),
+                others.join("、")
+            ));
+        }
+        msg
+    } else if outcome.sources_failed.is_empty() {
+        "还没有任何可检索的索引 —— 尚未归档过任何项目，也没有配置额外索引来源。".to_string()
+    } else {
+        format!(
+            "没有可检索的索引：本机尚未归档，且 {} 个额外索引来源都读取失败：{}",
+            outcome.sources_failed.len(),
+            outcome.sources_failed.join("、")
+        )
+    }
+}
+
 pub fn run(cfg: &Config, keyword: &str) -> Result<()> {
+    // 空/纯空白关键词会 contains-匹配所有行(等于"列全部"),且与 GUI(已拒空)行为不一致 → 拒掉。(review-r2 R5-4)
+    if keyword.trim().is_empty() {
+        anyhow::bail!("请输入查找关键词(项目名或编号片段);留空不会列出全部项目。");
+    }
     let outcome = search(cfg, keyword)?;
     if outcome.sources_searched == 0 {
-        if outcome.sources_failed.is_empty() {
-            println!("还没有任何可检索的索引 —— 尚未归档过任何项目，也没有配置额外索引来源。");
-        } else {
-            println!(
-                "没有可检索的索引：本机尚未归档，且 {} 个额外索引来源都读取失败：{}",
-                outcome.sources_failed.len(),
-                outcome.sources_failed.join("、")
-            );
-        }
+        println!("{}", empty_result_message(&outcome));
         return Ok(());
     }
     println!(
@@ -295,6 +325,36 @@ mod tests {
             system_root: sysroot,
             ..Config::default()
         }
+    }
+
+    // ── review-r2 R5-4:CLI find 空/纯空白关键词被拒(不列出全部) ──
+    #[test]
+    fn run_rejects_empty_keyword() {
+        assert!(run(&Config::default(), "").is_err(), "空关键词应被拒");
+        assert!(
+            run(&Config::default(), "   ").is_err(),
+            "纯空白关键词应被拒"
+        );
+    }
+
+    // ── review-r2 R4-6:本机索引读失败(被占用/损坏)不能误报为"尚未归档" ──
+    #[test]
+    fn empty_result_message_distinguishes_local_read_failure() {
+        // 本机索引存在但读失败 → sources_failed 含 LOCAL_SOURCE
+        let mut o = FindOutcome::default();
+        o.sources_failed.push(LOCAL_SOURCE.to_string());
+        let msg = empty_result_message(&o);
+        assert!(
+            msg.contains("读取失败"),
+            "应提示读取失败而非尚未归档;实际:{msg}"
+        );
+        assert!(
+            !msg.contains("尚未归档过任何项目"),
+            "不应误报尚未归档;实际:{msg}"
+        );
+        // 真正尚未归档(无失败来源)→ 仍提示尚未归档
+        let empty = FindOutcome::default();
+        assert!(empty_result_message(&empty).contains("尚未归档过任何项目"));
     }
 
     #[test]

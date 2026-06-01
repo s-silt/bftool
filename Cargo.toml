@@ -42,4 +42,8 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 strip         = true
-panic         = "abort"
+# panic = "unwind"(非 abort):GUI 用后台线程跑备份/复查,worker 线程 panic 需能被
+# BackgroundTask::take_outcome 的 join()->Err 捕获、降级为 TaskOutcome::Failed 让界面存活
+# (见 task.rs 与测试 task_panic_maps_to_failed)。panic="abort" 会让单个任务 panic 直接杀掉
+# 整个 GUI 进程,使该恢复逻辑在 release 成为死代码、且界面失去韧性。(review-r2 R5-8)
+panic         = "unwind"

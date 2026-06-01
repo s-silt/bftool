@@ -47,10 +47,13 @@ impl Manifest {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // 先序列化到内存,再用 durable::write_synced 原子落盘(同目录 tmp + fsync + rename)。
+        // 校验清单是恢复/复查的唯一依据,提交序「写清单 → 移源」中它先落盘;旧实现 from_path
+        // 直接在原位截断后写,崩溃/断电恰发生在「已截断、未写完」之间会留下半截清单(与 SEC-006 同源)。
+        // 原子 rename 保证读者只看到旧清单或完整新清单,绝不半截。fsync 仍在(write_synced 内)。(review-r2 #3 / L-001)
         let mut wtr = csv::WriterBuilder::new()
             .has_headers(true)
-            .from_path(path)
-            .with_context(|| format!("写校验清单失败：{}", path.display()))?;
+            .from_writer(Vec::new());
         // 只写 Rel/Size/Hash 三列以保持简洁；Mtime 内部用，不入清单
         #[derive(Serialize)]
         struct Row<'a> {
@@ -69,12 +72,11 @@ impl Manifest {
             })?;
         }
         wtr.flush()?;
-        // fsync:校验清单是恢复/复查的依据,必须先于"删事务标记"真正落盘。(ledger L-001)
-        let file = wtr
+        let bytes = wtr
             .into_inner()
-            .map_err(|e| anyhow::anyhow!("刷新校验清单缓冲失败：{}", e))?;
-        crate::engine::durable::sync_file(&file)
-            .with_context(|| format!("校验清单刷盘失败：{}", path.display()))?;
+            .map_err(|e| anyhow::anyhow!("序列化校验清单失败：{}", e))?;
+        crate::engine::durable::write_synced(path, &bytes)
+            .with_context(|| format!("写校验清单失败：{}", path.display()))?;
         Ok(())
     }
 }
@@ -350,6 +352,29 @@ mod tests {
             },
             mtime: mtime.into(),
         }
+    }
+
+    // ── review-r2 #3:write_csv 内容正确 + 原子落盘(不遗留 .bftool-tmp);崩溃原子性靠 durable::write_synced ──
+    #[test]
+    fn write_csv_writes_rel_size_hash_atomically() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("sub").join("001proj.sha256.csv"); // 父目录不存在 → 应自动建
+        let m = Manifest {
+            entries: vec![
+                e("a.txt", 5, "ABC", "2026-05-29T00:00:00Z"),
+                e("sub\\b.bin", 7, "DEF", "2026-05-29T00:00:00Z"),
+            ],
+        };
+        m.write_csv(&p).unwrap();
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            content.starts_with("Rel,Size,Hash"),
+            "表头三列;实际:{content}"
+        );
+        assert!(content.contains("a.txt,5,ABC"));
+        assert!(content.contains("sub\\b.bin,7,DEF"));
+        let tmp = p.with_file_name("001proj.sha256.csv.bftool-tmp");
+        assert!(!tmp.exists(), "原子写不应遗留临时文件");
     }
 
     // ── L-004: no_hash 复核不能被"不可读 mtime"绕过 ──

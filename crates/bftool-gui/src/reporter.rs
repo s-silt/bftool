@@ -87,6 +87,16 @@ impl ProgressHandle for GuiProgress {
     }
 }
 
+impl Drop for GuiProgress {
+    // R6-5:即便 finish 未被调用(后台任务 panic / 句柄提前 drop),也复位 active,
+    // 否则 UI 进度条会永久卡在"进行中"。与 finish 复位 active 幂等。
+    fn drop(&mut self) {
+        if let Ok(mut p) = self.progress.lock() {
+            p.active = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +134,23 @@ mod tests {
         let p = prog.lock().unwrap();
         assert!(!p.active);
         assert_eq!(p.current, 100, "finish 把进度推满");
+    }
+
+    // ── review-r2 R6-5:即便没调 finish(后台任务 panic / 提前 drop),Drop 也要复位 active ──
+    #[test]
+    fn progress_handle_drop_resets_active() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let prog = Arc::new(Mutex::new(ProgressState::default()));
+        let rep = GuiReporter::new(tx, Arc::clone(&prog));
+        {
+            let mut h = rep.progress_bytes("X", 100);
+            h.inc(10);
+            assert!(prog.lock().unwrap().active, "进行中 active=true");
+        } // h 在此 drop,但未调用 finish
+        assert!(
+            !prog.lock().unwrap().active,
+            "drop 应复位 active,否则进度条永久卡住"
+        );
     }
 
     #[test]

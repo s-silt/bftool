@@ -144,6 +144,8 @@ impl Config {
                 p
             );
         }
+        // 三个根目录不能为空/纯空白(详见 check_roots_nonempty)。
+        self.check_roots_nonempty()?;
         // extra_catalogs:GUI parse_form 已过滤空白项,但 CLI 直接编辑 toml 可能塞进空串/纯空白。
         // 空路径会被 find 当成"不存在的来源"静默记为失败,徒增噪音;直接在加载期拒掉。(F4)
         for (i, c) in self.extra_catalogs.iter().enumerate() {
@@ -176,11 +178,30 @@ impl Config {
     fn from_path(p: &Path) -> Result<Self> {
         let text = fs::read_to_string(p)?;
         let mut cfg: Self = toml::from_str(&text).context("配置文件 TOML 解析失败")?;
+        // 必须在 resolve_root **之前**拒掉空/纯空白根目录:否则 resolve_root 会把空路径
+        // 悄悄变成配置文件所在目录(base.join("")),用户得到一个意外的源/索引位置,而
+        // 解析后的 validate 看到的已是非空的 base 路径、检查不到。(review-r2 R2-5)
+        cfg.check_roots_nonempty()?;
         let base = config_base_dir(p);
         cfg.ready_root = resolve_root(&base, cfg.ready_root);
         cfg.archived_root = resolve_root(&base, cfg.archived_root);
         cfg.system_root = resolve_root(&base, cfg.system_root);
         Ok(cfg)
+    }
+
+    /// 三个根目录不能为空/纯空白。空 root 会让 resolve_root(base.join(""))退化成配置目录、
+    /// system_root="" 让全局索引落到意外位置。GUI parse_form 已校验,但 CLI 直接编辑 toml 可绕过。(review-r2 R2-5)
+    fn check_roots_nonempty(&self) -> Result<()> {
+        for (name, p) in [
+            ("ready_root（待备份）", &self.ready_root),
+            ("archived_root（已备份）", &self.archived_root),
+            ("system_root（备份系统）", &self.system_root),
+        ] {
+            if p.as_os_str().to_string_lossy().trim().is_empty() {
+                anyhow::bail!("配置 {} 不能为空/纯空白;请填一个有效的目录路径。", name);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -276,6 +297,49 @@ mod tests {
     #[test]
     fn validate_accepts_default() {
         assert!(Config::default().validate().is_ok());
+    }
+
+    // ── review-r2 R2-5:三根目录不能为空/纯空白(CLI/TOML 绕过 GUI 校验)──
+    #[test]
+    fn validate_rejects_empty_or_blank_root() {
+        let empty_ready = Config {
+            ready_root: PathBuf::from(""),
+            ..Config::default()
+        };
+        assert!(empty_ready.validate().is_err(), "空 ready_root 应被拒");
+        let blank_system = Config {
+            system_root: PathBuf::from("   "),
+            ..Config::default()
+        };
+        assert!(
+            blank_system.validate().is_err(),
+            "纯空白 system_root 应被拒"
+        );
+        let empty_archived = Config {
+            archived_root: PathBuf::from(""),
+            ..Config::default()
+        };
+        assert!(
+            empty_archived.validate().is_err(),
+            "空 archived_root 应被拒"
+        );
+    }
+
+    // ── review-r2 R2-5:TOML 里空根目录必须在 resolve_root **之前**被拒,
+    // 否则会被 base.join("") 悄悄解析成配置文件所在目录而绕过 validate ──
+    #[test]
+    fn from_path_rejects_empty_root_before_resolve() {
+        let d = tempfile::tempdir().unwrap();
+        let toml_path = d.path().join("bftool.toml");
+        std::fs::write(
+            &toml_path,
+            "ready_root = \"\"\narchived_root = \"D:/a\"\nsystem_root = \"D:/s\"\n",
+        )
+        .unwrap();
+        assert!(
+            Config::load(Some(&toml_path)).is_err(),
+            "TOML 空 ready_root 应在加载期被拒(不得解析成配置目录)"
+        );
     }
 
     // ── Spec D §4.3: LoadedConfig::save ──
