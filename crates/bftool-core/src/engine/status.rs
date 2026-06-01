@@ -32,11 +32,22 @@ pub struct StatusReport {
     pub txn_pending: bool,
 }
 
+/// 读某盘最近复查记录,**读失败退化为 None**(=未知,UI 显示「上次复查: 未知」)。
+/// 单块盘的损坏复查记录不应让 `?` 拖垮整个状态收集 —— 否则无参 `bftool` 直接报错、
+/// GUI 仪表盘整屏失效,而待归档数 / 事务残留 / 其余盘本与这条损坏记录无关。
+/// 恢复路径:对该盘重跑 `bftool verify` 会重写记录。(review-r2 #5)
+fn tolerant_last_verify(
+    system_root: &std::path::Path,
+    drive_id: &str,
+) -> Option<verify_state::LastVerify> {
+    verify_state::read_last_verify(system_root, drive_id).unwrap_or(None)
+}
+
 /// 收集状态(扫描在线盘 + 各盘最近复查 + 待归档数 + 事务残留)。
 pub fn gather(cfg: &Config) -> Result<StatusReport> {
     let mut drives = Vec::new();
     for d in drive::scan_mounted()? {
-        let last_verify = verify_state::read_last_verify(&cfg.system_root, &d.id)?;
+        let last_verify = tolerant_last_verify(&cfg.system_root, &d.id);
         drives.push(DriveStatus {
             drive: d,
             last_verify,
@@ -182,5 +193,25 @@ mod tests {
         // 造一个事务残留
         std::fs::write(paths::system_pending_txn(&sys), "x").unwrap();
         assert!(gather(&cfg).unwrap().txn_pending);
+    }
+
+    // ── review-r2 #5:单块盘复查记录损坏不应使整个状态面板崩 ──
+    #[test]
+    fn tolerant_last_verify_degrades_on_corrupt_log() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = d.path().join("sys");
+        std::fs::create_dir_all(&sys).unwrap();
+        // 损坏的复查日志:数字列非法 → read_rows 解析失败 → read_last_verify 返回 Err。
+        std::fs::write(
+            paths::system_verify_log(&sys),
+            "DriveId,When,Status,Bad,Extra\n备份1,2026-05-29T00:00:00Z,IssuesFound,notanum,0\n",
+        )
+        .unwrap();
+        assert!(
+            verify_state::read_last_verify(&sys, "备份1").is_err(),
+            "前提:损坏日志确实让 read_last_verify 失败"
+        );
+        // 容错包装退化为 None(=未知),不 panic、不 Err,不拖垮整个 gather。
+        assert!(tolerant_last_verify(&sys, "备份1").is_none());
     }
 }

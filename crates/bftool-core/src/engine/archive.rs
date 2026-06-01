@@ -221,14 +221,34 @@ pub fn plan(cfg: &Config, opts: &Options, reporter: &dyn Reporter) -> Result<Arc
             projects.len()
         ));
     }
-    for proj in &projects {
-        items.push(decide(cfg, &drive, proj));
-    }
+    items = plan_items(cfg, &drive, &projects);
     Ok(ArchivePlan {
         drive,
         items,
         opts: opts.clone(),
     })
+}
+
+/// 对一组项目算计划:跨项目**递减剩余容量**。每裁决一个 Archive/RenameAndArchive 就从
+/// running_free 扣掉它的占用(est_bytes),使后续项目看到「前面项目占用后」的剩余。
+/// 否则每个项目都对同一份冻结 free_bytes 独立判断 → 多个项目各自放得下、累计放不下时
+/// 不会触发封盘,预览高估、执行才在磁盘满时失败。(review-r2 #2)
+fn plan_items(cfg: &Config, drive: &BackupDrive, projects: &[PathBuf]) -> Vec<PlanItem> {
+    let mut items = Vec::with_capacity(projects.len());
+    let mut running_free = drive.free_bytes;
+    for proj in projects {
+        let mut drive_now = drive.clone();
+        drive_now.free_bytes = running_free;
+        let item = decide(cfg, &drive_now, proj);
+        if matches!(
+            item.action,
+            PlanAction::Archive { .. } | PlanAction::RenameAndArchive { .. }
+        ) {
+            running_free = running_free.saturating_sub(item.est_bytes);
+        }
+        items.push(item);
+    }
+    items
 }
 
 /// 对单个项目算计划动作——**只读**(folder_stats + 读本盘索引,不 build manifest、不写盘)。
@@ -498,6 +518,10 @@ pub fn run_plan(
     let mut tester_opt = detect_tester(cfg, opts, reporter)?;
 
     let mut summary = ArchiveSummary::default();
+    // review-r2 #2:已归档项目累计占用。每完成一个就累加其占用,让后续项目的容量/封盘判定
+    // (handle_one 内的余量检查)看到「前面项目占用后」的剩余 —— 否则每个项目都对冻结的
+    // plan.drive.free_bytes 独立判断,累计超额时不会优雅封盘,而是一路写到磁盘满才复制失败。
+    let mut consumed: u64 = 0;
     for item in &plan.items {
         if opts.limit > 0 && summary.handled >= opts.limit {
             reporter.action(&format!(
@@ -524,16 +548,22 @@ pub fn run_plan(
             }
             PlanAction::Skip(_) | PlanAction::SealAndStop(_) => None,
         };
+        // 把"冻结剩余 - 已归档占用"作为本项目可见剩余传给 handle_one(见上方 consumed 注释)。
+        let mut drive_now = drive.clone();
+        drive_now.free_bytes = drive.free_bytes.saturating_sub(consumed);
         match handle_one(
             cfg,
             reporter,
-            drive,
+            &drive_now,
             &proj_path,
             opts,
             tester_opt.as_ref(),
             forced,
         ) {
-            Ok(HandleOutcome::Done) => summary.handled += 1,
+            Ok(HandleOutcome::Done) => {
+                summary.handled += 1;
+                consumed = consumed.saturating_add(item.est_bytes);
+            }
             Ok(HandleOutcome::Skipped) => {}
             Ok(HandleOutcome::StalePlan) => {} // 已在 handle_one 内打"计划已过期",不计 failed
             Ok(HandleOutcome::DriveSealed) => {
@@ -1947,6 +1977,32 @@ mod tests {
             matches!(it3.action, PlanAction::SealAndStop(_)),
             "余量不足应 SealAndStop,得到 {:?}",
             it3.action
+        );
+    }
+
+    // ── review-r2 #2:plan_items 跨项目递减剩余 —— 两个项目各自放得下但累计放不下时,
+    // 须在第二个处 SealAndStop,而非因每个单独都够就全标 Archive(冻结 free_bytes 高估 bug) ──
+    #[test]
+    fn plan_items_seals_on_cumulative_overcommit() {
+        let (_d, cfg, mut drive) = temp_world();
+        let p1 = cfg.ready_root.join("001a");
+        let p2 = cfg.ready_root.join("002b");
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+        fs::write(p1.join("f"), vec![0u8; 4096]).unwrap();
+        fs::write(p2.join("f"), vec![0u8; 4096]).unwrap();
+        // reserve_gb=0(temp_world);free 够一个 4096、不够两个 8192。
+        drive.free_bytes = 4096 + 2048;
+        let items = plan_items(&cfg, &drive, &[p1.clone(), p2.clone()]);
+        assert!(
+            matches!(items[0].action, PlanAction::Archive { .. }),
+            "首个应归档,实际:{:?}",
+            items[0].action
+        );
+        assert!(
+            matches!(items[1].action, PlanAction::SealAndStop(_)),
+            "次个累计超容量应封盘,实际:{:?}",
+            items[1].action
         );
     }
 
