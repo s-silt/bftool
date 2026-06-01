@@ -149,7 +149,12 @@ pub struct StableCheck {
 
 /// 文件夹是否稳定：所有文件最近修改时间须早于 N 分钟前，且不被占用。
 pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
-    let cutoff = SystemTime::now() - Duration::from_secs(minutes * 60);
+    // minutes 用户可控(bftool.toml / --stable-minutes):saturating_mul 防溢出 panic,
+    // checked_sub 防 SystemTime 下溢;极端值退化到 UNIX_EPOCH → 任何文件都比 cutoff 新 →
+    // 保守判「未稳定」不归档(fail-closed),而非崩溃。(review-r2 R2-6)
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(minutes.saturating_mul(60)))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     for entry in cruft::walk(root) {
         // 稳定性检测对 walkdir 错误**保持原 swallow 语义**：
         // 真实枚举错误会在后续 manifest::real_files 阶段被收集并 bail。
@@ -307,5 +312,15 @@ mod tests {
         .unwrap();
         // 同分区、互不嵌套 → Ok,且无"不同分区"警告
         assert!(r.is_empty(), "同分区互不嵌套应无警告,实际:{:?}", r);
+    }
+
+    // ── review-r2 R2-6:folder_stable 的 minutes*60 不得溢出 panic(stable_minutes 用户可控)──
+    #[test]
+    fn folder_stable_huge_minutes_does_not_overflow() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("f"), b"x").unwrap();
+        // 极大稳定期:旧实现 minutes*60 在 debug 下 panic;修复后 cutoff 退化到 epoch → 文件比 cutoff 新 → 未稳定。
+        let r = folder_stable(d.path(), u64::MAX);
+        assert!(!r.stable, "极大稳定期应保守判未稳定,而非 panic");
     }
 }

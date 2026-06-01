@@ -444,12 +444,36 @@ pub fn run_plan(
     // 重验盘:预览→执行之间盘可能被拔/被封。按盘上实时状态(id 文件 + 封盘 marker)重读,
     // 不信 plan 里冻结的 sealed/在线态。任一变 → 整份计划过期(不写任何盘)。
     let drive = &plan.drive;
-    if !paths::drive_id_path(&drive.root).is_file() {
+    let id_path = paths::drive_id_path(&drive.root);
+    if !id_path.is_file() {
         reporter.error(&format!(
             "计划已过期：备份盘 {} ({}:) 已不在线或未初始化 → 本轮不执行,请重新规划(bftool archive)。",
             drive.id, drive.letter
         ));
         return Ok(ArchiveSummary::default());
+    }
+    // R2-1:不仅查 id 文件**存在**,还要比对**内容**(盘内编号)。预览→执行之间若换上另一块
+    // 备份盘且 Windows 复用了同一盘符,只查存在会通过 → 数据写到实际盘却记成计划盘的 id。
+    // 「认盘靠盘内编号不靠盘符」(drive.rs)—— 编号不符即计划过期,中止本轮、不写任何盘。
+    match fs::read_to_string(&id_path) {
+        Ok(on_disk) if on_disk.trim() == drive.id.trim() => {}
+        Ok(on_disk) => {
+            reporter.error(&format!(
+                "计划已过期：盘符 {}: 上现在是「{}」,而本轮计划针对的是「{}」(预览后换过盘?)\
+                 → 本轮不执行,请重新规划(bftool archive)。",
+                drive.letter,
+                on_disk.trim(),
+                drive.id
+            ));
+            return Ok(ArchiveSummary::default());
+        }
+        Err(e) => {
+            reporter.error(&format!(
+                "计划已过期:无法读取盘 {}: 的盘内编号确认身份({})→ 本轮不执行,请重新规划。",
+                drive.letter, e
+            ));
+            return Ok(ArchiveSummary::default());
+        }
     }
     if paths::drive_sealed_path(&drive.root).is_file() {
         reporter.error(&format!(
@@ -560,9 +584,11 @@ pub fn run_plan(
             tester_opt.as_ref(),
             forced,
         ) {
-            Ok(HandleOutcome::Done) => {
+            Ok(HandleOutcome::Done(bytes)) => {
                 summary.handled += 1;
-                consumed = consumed.saturating_add(item.est_bytes);
+                // R2-2:用 handle_one 返回的**实际**归档字节累计,而非 plan 期 est_bytes ——
+                // Skip(est=0)/SealAndStop 项在 plan→run 间翻转为 Done 时,est 与真实写入不一致。
+                consumed = consumed.saturating_add(bytes);
             }
             Ok(HandleOutcome::Skipped) => {}
             Ok(HandleOutcome::StalePlan) => {} // 已在 handle_one 内打"计划已过期",不计 failed
@@ -670,7 +696,8 @@ fn detect_tester(
 }
 
 enum HandleOutcome {
-    Done,
+    /// 归档成功;携带**实际归档的源字节数**,供 run_plan 用真实占用累计 consumed。(review-r2 R2-2)
+    Done(u64),
     Skipped,
     /// 冻结的目标名在执行时已被占用(预览→执行间状态变了)——不写盘,不计 failed。(Spec D §4.1)
     StalePlan,
@@ -899,7 +926,7 @@ fn handle_one(
             "[演练] 将归档 {} ({} 个文件, {:.2}GB) → {}",
             name, stats.files, size_gb, drive.id
         ));
-        return Ok(HandleOutcome::Done);
+        return Ok(HandleOutcome::Done(0)); // 演练不写盘 → 0 字节
     }
 
     // Spec B 源压缩包测试 —— 在 dry_run check 之后,在生成 manifest 之前
@@ -1177,7 +1204,7 @@ fn handle_one(
         "✓ {} 归档+校验成功 → {}\\项目\\{}；SSD 源已移到 已备份（未删除）。",
         name, drive.id, dest_name
     ));
-    Ok(HandleOutcome::Done)
+    Ok(HandleOutcome::Done(src_bytes))
 }
 
 #[derive(Debug, Serialize)]
@@ -1223,52 +1250,43 @@ struct GlobalCatalogRow {
 }
 
 fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
-    // AR-10: 「文件是否已存在」(决定要不要写 CSV header) 与下面 OpenOptions::create 之间存在
-    // TOCTOU 窗口。此 race 可接受：归档是单进程串行执行(一次只处理一个项目，没有并发写同一索引)，
-    // 不会有第二个写者在这两步之间创建该文件。若将来引入并发归档，需改用「打开后 seek 到 0 探测
-    // 是否已有 header 行」之类的更稳健判断。
-    let file_existed = path.is_file();
-    if let Some(p) = path.parent() {
-        fs::create_dir_all(p).ok();
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let mut wtr = csv::WriterBuilder::new()
-        .has_headers(!file_existed)
-        .from_writer(file);
-    wtr.serialize(row)?;
-    wtr.flush()?;
-    // fsync:索引必须先于"删事务标记"真正落盘,否则断电后会出现"标记已删、索引未落"。(ledger L-001)
-    let f = wtr
-        .into_inner()
-        .map_err(|e| anyhow::anyhow!("刷新索引缓冲失败：{}", e))?;
-    durable::sync_file(&f).with_context(|| format!("索引刷盘失败：{}", path.display()))?;
-    Ok(())
+    append_catalog_row(path, row)
 }
 
 fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
-    // AR-10: 同 append_drive_catalog —— file_existed 探测与 OpenOptions::create 之间的
-    // TOCTOU 在单进程串行归档下可接受(无并发写者)。详见 append_drive_catalog 注释。
-    let file_existed = path.is_file();
+    append_catalog_row(path, row)
+}
+
+/// 把一行追加进 CSV 索引并**原子落盘**:读现有内容到内存 → 追加序列化的新行(文件不存在时
+/// 连表头一起)→ durable::write_synced(同目录 tmp + fsync + rename)整体替换。
+///
+/// 旧实现用 `OpenOptions::append` + fsync,断电恰发生在"扇区已分配、字节未写完"时会在 CSV 末尾
+/// 留下半行,让后续 catalog_has_project / global_has_folder / next_drive_number / seal 的解析
+/// fail-closed(跳过项目/恢复 bail/选号失败),需用户手动修 CSV。原子 rename 保证读者只看到
+/// 旧索引或完整新索引,绝不半行 —— 与 manifest/事务标记的原子写一致。(review-r2 R2-4 / L-001)
+///
+/// AR-10:`file_existed` 探测与写入之间的 TOCTOU 在单进程串行归档下可接受(无并发写者)。
+fn append_catalog_row<R: serde::Serialize>(path: &Path, row: &R) -> Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).ok();
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let existed = path.is_file();
+    let mut content = if existed {
+        fs::read(path).with_context(|| format!("读索引失败：{}", path.display()))?
+    } else {
+        Vec::new()
+    };
     let mut wtr = csv::WriterBuilder::new()
-        .has_headers(!file_existed)
-        .from_writer(file);
+        .has_headers(!existed) // 文件不存在时连表头一起写
+        .from_writer(Vec::new());
     wtr.serialize(row)?;
     wtr.flush()?;
-    // fsync:索引必须先于"删事务标记"真正落盘,否则断电后会出现"标记已删、索引未落"。(ledger L-001)
-    let f = wtr
+    let row_bytes = wtr
         .into_inner()
-        .map_err(|e| anyhow::anyhow!("刷新索引缓冲失败：{}", e))?;
-    durable::sync_file(&f).with_context(|| format!("索引刷盘失败：{}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("序列化索引行失败：{}", e))?;
+    content.extend_from_slice(&row_bytes);
+    durable::write_synced(path, &content)
+        .with_context(|| format!("写索引失败：{}", path.display()))?;
     Ok(())
 }
 
@@ -1378,11 +1396,11 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     reporter.action(&format!("发现上次未完成的事务（项目：{}）。", pname));
     if in_ready {
         reporter
-            .action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。已清除旧标记。");
-        let _ = fs::remove_file(&path);
+            .action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。正在清除旧标记…");
+        clear_marker(&path, reporter);
     } else if moved && indexed {
-        reporter.action("→ 已移动且索引中已有记录，判定为已完成（仅标记残留）。已自动清除标记。");
-        let _ = fs::remove_file(&path);
+        reporter.action("→ 已移动且索引中已有记录，判定为已完成（仅标记残留）。正在清除标记…");
+        clear_marker(&path, reporter);
     } else if moved && !indexed {
         reporter.error(&format!(
             "→ 源已移到『已备份』但全局索引可能漏写：数据应在备份盘 {}。请人工核对并在索引中补登；标记保留。",
@@ -1399,6 +1417,18 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
         anyhow::bail!("发现未完成的事务且无法自动判定状态。为避免覆盖恢复证据,本轮归档已停止。");
     }
     Ok(())
+}
+
+/// 清除事务标记。删除失败(AV 占用/只读/权限)时 warn 而非静默 —— 否则下轮启动会对一个
+/// 已正确处理的事务重复触发恢复,且"已清除标记"的提示与磁盘实际状态(标记仍在)不符。(review-r2 R2-3)
+fn clear_marker(path: &Path, reporter: &dyn Reporter) {
+    if let Err(e) = fs::remove_file(path) {
+        reporter.warn(&format!(
+            "清除事务标记失败({}):{} —— 标记仍在,下次启动可能再次提示此事务;如反复出现请手动删除该文件。",
+            e,
+            path.display()
+        ));
+    }
 }
 
 fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
@@ -1731,7 +1761,7 @@ mod tests {
         let outcome = handle_one(&cfg, &rep, &drive, &proj, &test_opts(), None, None).unwrap();
         let log = rep.0.lock().unwrap().join("\n");
         assert!(
-            matches!(outcome, HandleOutcome::Done),
+            matches!(outcome, HandleOutcome::Done(_)),
             "正常项目应 Done;日志:\n{}",
             log
         );
@@ -2004,6 +2034,110 @@ mod tests {
             "次个累计超容量应封盘,实际:{:?}",
             items[1].action
         );
+    }
+
+    // ── review-r2 R2-3:清事务标记失败不静默 —— 否则下轮重复触发恢复、提示与实际不符 ──
+    #[test]
+    fn clear_marker_warns_when_remove_fails() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("marker_is_dir");
+        fs::create_dir(&p).unwrap(); // 目录:remove_file 必失败
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        clear_marker(&p, &rep);
+        let logs = rep.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("Warn") && l.contains("清除事务标记失败")),
+            "删除失败应 warn 而非静默,实际:{:?}",
+            logs
+        );
+    }
+
+    #[test]
+    fn clear_marker_silent_on_success() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("marker");
+        fs::write(&p, "x").unwrap();
+        let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
+        clear_marker(&p, &rep);
+        assert!(!p.exists(), "成功应已删除标记");
+        assert!(rep.0.lock().unwrap().is_empty(), "成功路径不应有日志");
+    }
+
+    // ── review-r2 R2-2:Done 携带实际归档字节(供 run_plan 用真实占用累计 consumed)──
+    #[test]
+    fn handle_one_done_carries_real_bytes() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap(); // 5
+        fs::write(proj.join("b.bin"), b"world!!").unwrap(); // 7
+        let outcome =
+            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        let n = match outcome {
+            HandleOutcome::Done(n) => n,
+            _ => panic!("正常项目应 Done"),
+        };
+        assert_eq!(n, 12, "Done 应携带实际归档字节(供 consumed 真实累计)");
+    }
+
+    // ── review-r2 R2-1:预览→执行间换盘(同盘符)→ 盘内编号变了 → 按"计划已过期"中止 ──
+    #[test]
+    fn run_plan_aborts_when_drive_id_differs_from_plan() {
+        let (_d, cfg, mut drive) = temp_world();
+        // 盘上 id 文件是「备份1」(temp_world 写的),让 plan 冻结的 id 是「备份3」(模拟换过盘)。
+        drive.id = "备份3".into();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hi").unwrap();
+        let plan = ArchivePlan {
+            drive,
+            items: vec![PlanItem {
+                name: "001proj".into(),
+                est_bytes: 2,
+                dest_existed_at_plan: false,
+                action: PlanAction::Archive {
+                    dest_name: "001proj".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let summary = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap();
+        assert_eq!(summary.handled, 0, "盘内编号不符应中止,不归档任何项目");
+        assert!(!cfg.archived_root.join("001proj").exists(), "源不应被移动");
+    }
+
+    // ── review-r2 R2-4:catalog append 原子落盘 —— 两次追加都在、表头一次、不遗留 tmp ──
+    #[test]
+    fn append_drive_catalog_atomic_appends_and_no_tmp() {
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("本盘信息").join("本盘索引记录.csv");
+        let mk = |no: &str, name: &str| DriveCatalogRow {
+            project_no: no.into(),
+            project_name: name.into(),
+            file_count: 1,
+            total_bytes: 10,
+            archived_utc: "2026-05-30T00:00:00Z".into(),
+            verify_status: "SHA256-OK".into(),
+            status: "OK".into(),
+            notes: String::new(),
+        };
+        append_drive_catalog(&cat, &mk("001", "projA")).unwrap();
+        append_drive_catalog(&cat, &mk("002", "projB")).unwrap();
+        assert!(
+            catalog_has_project(&cat, "projA").unwrap(),
+            "首行仍在(追加非覆盖)"
+        );
+        assert!(catalog_has_project(&cat, "projB").unwrap(), "次行也在");
+        let content = std::fs::read_to_string(&cat).unwrap();
+        assert_eq!(
+            content.matches("ProjectName").count(),
+            1,
+            "表头只一行;实际:\n{content}"
+        );
+        let tmp = cat.with_file_name("本盘索引记录.csv.bftool-tmp");
+        assert!(!tmp.exists(), "原子写不应遗留 .bftool-tmp");
     }
 
     // ── Spec D §4.1: run_plan 执行冻结目标名 → 归档 + 移源 ──
@@ -2379,7 +2513,10 @@ mod tests {
         fs::write(proj.join("a.txt"), b"hello").unwrap();
         // 重做:本盘索引已有 001proj → 走重名 → 改时间戳唯一名。
         let out = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
-        assert!(matches!(out, HandleOutcome::Done), "重做应成功(改名归档)");
+        assert!(
+            matches!(out, HandleOutcome::Done(_)),
+            "重做应成功(改名归档)"
+        );
         assert!(!proj.exists(), "重做后源被移走,不丢失");
         let proj_dir = paths::drive_projects_dir(&drive.root);
         assert!(proj_dir.join("001proj").is_dir(), "原副本未被覆盖");
