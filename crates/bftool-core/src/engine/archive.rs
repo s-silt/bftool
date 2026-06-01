@@ -432,6 +432,44 @@ fn render_dry_run(plan: &ArchivePlan, reporter: &dyn Reporter) -> ArchiveSummary
     }
 }
 
+/// 进程级归档锁:一个独占创建的锁文件,防多个 bftool 实例并发归档(并发会破坏事务标记/索引)。
+/// Drop 时删锁(正常返回与 panic 展开都触发;release 用 panic=unwind 见 R5-8)。(review-r2 R6-4)
+struct ArchiveLock {
+    path: PathBuf,
+}
+impl ArchiveLock {
+    fn acquire(system_root: &Path) -> Result<Self> {
+        let path = system_root.join(".bftool-archive.lock");
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "pid={} started_at={}",
+                    std::process::id(),
+                    Local::now().format("%Y-%m-%d %H:%M:%S")
+                );
+                Ok(ArchiveLock { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
+                "另一个 bftool 归档可能正在运行(锁文件存在:{})。请等它完成;若确认没有其它实例在跑\
+                 (上次异常退出残留),手动删除该文件后重试。",
+                path.display()
+            ),
+            Err(e) => Err(e).context(format!("创建归档锁失败:{}", path.display())),
+        }
+    }
+}
+impl Drop for ArchiveLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// 执行计划:**冻"意图"(目标名/选盘)、不冻"安全判断"**。每项执行前重验受外部状态影响的安全前置——
 /// 盘仍在且未封盘(本函数开头按盘上 marker 实时重读)、源仍稳定、容量仍够、目标名仍不冲突——
 /// 任一已变 → 该项"计划已过期"跳过,绝不照旧 plan 误归档/误封盘。(Spec D §4.1)
@@ -542,6 +580,10 @@ pub fn run_plan(
     fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
     fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
 
+    // R6-4:进程级归档锁,防两个 bftool 实例(CLI+CLI / CLI+GUI)并发归档同一套配置/盘 → 破坏事务。
+    // RAII:_archive_lock 在 run_plan 返回(含 panic 展开,release 已用 panic=unwind,见 R5-8)时 Drop 删锁。
+    let _archive_lock = ArchiveLock::acquire(&cfg.system_root)?;
+
     // tester detection:本轮只 detect 一次、只 warn 一次
     let mut tester_opt = detect_tester(cfg, opts, reporter)?;
 
@@ -576,9 +618,18 @@ pub fn run_plan(
             }
             PlanAction::Skip(_) | PlanAction::SealAndStop(_) => None,
         };
-        // 把"冻结剩余 - 已归档占用"作为本项目可见剩余传给 handle_one(见上方 consumed 注释)。
+        // 把可见剩余传给 handle_one。R6-1:取 min(投影剩余, 实时剩余):consumed 处理本工具自身
+        // 串行占用;但 plan→run 之间若有外部进程往备份盘写入,实时剩余会更低 —— 实时重查校正,
+        // 查询失败(盘离线等)则退回投影值(保守:不放大可用量)。
         let mut drive_now = drive.clone();
-        drive_now.free_bytes = drive.free_bytes.saturating_sub(consumed);
+        let projected = drive.free_bytes.saturating_sub(consumed);
+        let live_free = drive::info_by_letter(&drive.letter)
+            .ok()
+            .map(|d| d.free_bytes);
+        drive_now.free_bytes = match live_free {
+            Some(live) => projected.min(live),
+            None => projected,
+        };
         match handle_one(
             cfg,
             reporter,
@@ -925,11 +976,20 @@ fn handle_one(
             "盘 {} 余量不足以放下 {}（还需约 {:.2}GB + 余量；当前剩余 {:.2}GB）。封盘并请换下一块盘后重跑。",
             drive.id, name, need_gb, free_gb
         ));
-        drive::seal(drive).context("封盘失败")?;
-        reporter.action(&format!(
-            "已封盘 {}。取下本盘、插上下一块空盘(NTFS)后，运行 `bftool init <盘符>` 初始化再继续。",
-            drive.id
-        ));
+        // R6-2:封盘标记写失败(盘只读/被占用/掉线)不应退化成逐项目 Err 重试(余量仍不足,
+        // 每个后续项目都会再来一次)。无论标记是否写成功,余量不足都按 DriveSealed 终止本轮。
+        if let Err(e) = drive::seal(drive) {
+            reporter.error(&format!(
+                "封盘标记写入失败({}):盘 {} 余量已不足、本轮就此停止。请取下本盘换下一块空盘;\
+                 如该盘还要继续用,请手工在盘根 本盘信息\\ 下创建 已封盘.txt 或排查占用后重跑。",
+                e, drive.id
+            ));
+        } else {
+            reporter.action(&format!(
+                "已封盘 {}。取下本盘、插上下一块空盘(NTFS)后，运行 `bftool init <盘符>` 初始化再继续。",
+                drive.id
+            ));
+        }
         return Ok(HandleOutcome::DriveSealed);
     }
 
@@ -1256,7 +1316,10 @@ fn handle_one(
         return Ok(HandleOutcome::CommitInterrupted);
     }
 
-    txn::PendingTxn::clear(&txn_path)?;
+    // R6-3:此刻事务在数据层面已完整完成(源已移、三处索引已落盘),只剩删一个无意义的残留标记。
+    // 删标记失败(AV 占用/只读/瞬时 IO)不应把成功归档误报成 failed/非零退出 —— 用 warn-only 的
+    // clear_marker(与恢复路径一致),标记残留无害、下次 check_pending_txn 的 moved&&indexed 分支自愈。
+    clear_marker(&txn_path, reporter);
     reporter.ok(&format!(
         "✓ {} 归档+校验成功 → {}\\项目\\{}；SSD 源已移到 已备份（未删除）。",
         name, drive.id, dest_name
@@ -2144,6 +2207,42 @@ mod tests {
             _ => panic!("正常项目应 Done"),
         };
         assert_eq!(n, 12, "Done 应携带实际归档字节(供 consumed 真实累计)");
+    }
+
+    // ── review-r2 R6-4:已有归档锁(另一实例在跑)时 run_plan 应拒绝、不删别人的锁 ──
+    #[test]
+    fn run_plan_refuses_when_archive_lock_present() {
+        let (_d, cfg, drive) = temp_world();
+        fs::create_dir_all(&cfg.system_root).unwrap();
+        let lock = cfg.system_root.join(".bftool-archive.lock");
+        fs::write(&lock, "pid=999").unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let r = run_plan(&cfg, &plan, &cancel, &NoopReporter);
+        assert!(r.is_err(), "已有归档锁时应拒绝运行");
+        assert!(lock.is_file(), "拒绝时不应删除别人的锁");
+    }
+
+    // ── review-r2 R6-2:封盘标记写失败也应终止本轮(DriveSealed),不退化成逐项目 Err 重试 ──
+    #[test]
+    fn handle_one_seal_failure_still_terminates_round() {
+        let (_d, cfg, mut drive) = temp_world();
+        drive.free_bytes = 1; // 余量不足 → 触发封盘
+                              // 把封盘标记路径占成目录 → drive::seal 的 write_synced 失败
+        let sealed = paths::drive_sealed_path(&drive.root);
+        fs::create_dir_all(&sealed).unwrap();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("f"), vec![0u8; 4096]).unwrap();
+        let outcome = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None);
+        assert!(
+            matches!(outcome, Ok(HandleOutcome::DriveSealed)),
+            "封盘标记写失败也应 DriveSealed(终止本轮),而非 Err 逐项目重试"
+        );
     }
 
     // ── review-r2 R5-2:提交段索引写失败(标记已写)→ CommitInterrupted,保留标记、中止本轮 ──
