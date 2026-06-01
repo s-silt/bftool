@@ -153,7 +153,9 @@ fn display_root(p: &std::path::Path) -> String {
 }
 
 fn count_subdirs(p: &std::path::Path) -> Result<usize> {
-    if !p.exists() {
+    // 非目录(不存在 / 是文件 / 是链接)→ 0,不让 read_dir 的 Err 经 ? 拖垮整个 gather
+    // (与 tolerant_last_verify 同精神:某项坏掉不应使整个状态面板失效)。(review-r2 R3-5)
+    if !p.is_dir() {
         return Ok(0);
     }
     let mut count = 0usize;
@@ -193,6 +195,15 @@ mod tests {
         // 造一个事务残留
         std::fs::write(paths::system_pending_txn(&sys), "x").unwrap();
         assert!(gather(&cfg).unwrap().txn_pending);
+    }
+
+    // ── review-r2 R3-5:ready_root 是文件(非目录)时 count_subdirs 返回 0,不 Err 拖垮 gather ──
+    #[test]
+    fn count_subdirs_tolerates_non_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("not_a_dir");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(count_subdirs(&f).unwrap(), 0, "非目录应返回 0 而非 Err");
     }
 
     // ── review-r2 #5:单块盘复查记录损坏不应使整个状态面板崩 ──

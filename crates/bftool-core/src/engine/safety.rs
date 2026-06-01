@@ -80,7 +80,11 @@ pub fn check_paths(
 
 fn canon(p: &Path) -> PathBuf {
     let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    strip_verbatim(&c)
+    let c = strip_verbatim(&c);
+    // 统一分隔符为 `\`:canonicalize 失败回退原样时会保留用户在 toml 里写的 `/`,而
+    // is_inside/eq_ci 用字符串前缀比较,`/` 与 `\` 混用会让嵌套/同盘判定漏判(toml 写
+    // ready="D:/lib"、archived="D:/lib/done" 时安全闸被绕过)。仅用于比较,不动真实路径。(review-r2 R3-4)
+    PathBuf::from(c.to_string_lossy().replace('/', "\\"))
 }
 
 /// 去掉 Windows `canonicalize()` 对**存在**路径加的 `\\?\`(及 `\\?\UNC\`)verbatim 前缀。
@@ -312,6 +316,18 @@ mod tests {
         .unwrap();
         // 同分区、互不嵌套 → Ok,且无"不同分区"警告
         assert!(r.is_empty(), "同分区互不嵌套应无警告,实际:{:?}", r);
+    }
+
+    // ── review-r2 R3-4:toml 里用正斜杠写的嵌套路径,安全闸不得漏判 ──
+    #[test]
+    fn check_paths_detects_nesting_with_forward_slashes() {
+        let r = check_paths(
+            Path::new("D:/lib/ready"),
+            Path::new("D:/lib/ready/done"), // 已备份 在 待备份 内(正斜杠)
+            Path::new("D:/lib/sys"),
+            None,
+        );
+        assert!(r.is_err(), "正斜杠嵌套(已备份在待备份内)应被拒");
     }
 
     // ── review-r2 R2-6:folder_stable 的 minutes*60 不得溢出 panic(stable_minutes 用户可控)──
