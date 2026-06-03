@@ -42,8 +42,17 @@ pub struct ExtraFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {
     Clean,
-    IssuesFound { bad: u64 },
-    ExtraOnly { extra: u64 },
+    IssuesFound {
+        bad: u64,
+    },
+    ExtraOnly {
+        extra: u64,
+    },
+    /// 无损坏/无多余,但有文件仅按大小校验、未验证内容(清单无哈希)。不是「完好」——
+    /// 持久化此态,避免事后仪表盘/CLI 把『内容从未被 SHA256 校验过』的盘绿标为完好。(review-r3 round5)
+    CleanButSizeOnly {
+        size_only: u64,
+    },
     Cancelled,
 }
 
@@ -94,6 +103,11 @@ impl VerifyReport {
             VerifyOutcome::IssuesFound { bad: self.bad }
         } else if self.extra > 0 {
             VerifyOutcome::ExtraOnly { extra: self.extra }
+        } else if self.size_only > 0 {
+            // 无损坏/多余,但有「仅大小校验」文件 → 不是 Clean,持久化为可区分态。(review-r3 round5)
+            VerifyOutcome::CleanButSizeOnly {
+                size_only: self.size_only,
+            }
         } else {
             VerifyOutcome::Clean
         }

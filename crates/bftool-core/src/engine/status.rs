@@ -149,6 +149,7 @@ fn outcome_label(o: &crate::engine::verify::VerifyOutcome) -> &'static str {
         VerifyOutcome::Clean => "完好",
         VerifyOutcome::IssuesFound { .. } => "发现损坏!",
         VerifyOutcome::ExtraOnly { .. } => "有多余文件",
+        VerifyOutcome::CleanButSizeOnly { .. } => "仅大小校验·未验证内容",
         VerifyOutcome::Cancelled => "上次取消",
     }
 }

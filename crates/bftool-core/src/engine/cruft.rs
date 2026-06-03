@@ -161,15 +161,26 @@ pub fn warn_excluded_real_content(root: &Path, reporter: &dyn Reporter) {
             continue;
         }
         if e.file_type().is_dir() {
-            // 只对**非空**的具名 cruft 目录告警(空的系统目录无所谓)。
+            // 只对**含真实内容**的具名 cruft 目录告警。仅含 cruft 子项(如 found.000 里只有 Thumbs.db)
+            // 不算真实数据,否则误报假阳告警。判据:存在「非 cruft 文件」或「非 cruft 子目录」即视为有真实内容。
+            // read_dir / 子项类型读失败时 fail-loud:保守判有、照常告警(安全网宁多报不沉默)。(review-r3 round5)
             if is_cruft_dir(&name) {
-                // 读不出目录内容(权限/瞬断)时 fail-loud:按「可能非空」处理并照常告警,而非静默当空 ——
-                // 安全网在 io 失败时应偏向多报而非沉默。(review-r3 round3)
-                let non_empty = match std::fs::read_dir(path) {
-                    Ok(mut it) => it.next().is_some(),
-                    Err(_) => true,
+                let has_real = match std::fs::read_dir(path) {
+                    Ok(mut rd) => rd.any(|child| match child {
+                        Ok(c) => {
+                            let cn = c.file_name();
+                            let cn = cn.to_string_lossy();
+                            match c.file_type() {
+                                Ok(ft) if ft.is_dir() => !is_cruft_dir(&cn),
+                                Ok(_) => !is_cruft_file(&cn),
+                                Err(_) => true, // 子项类型读不出 → 保守判有
+                            }
+                        }
+                        Err(_) => true, // 子项枚举出错 → 保守判有
+                    }),
+                    Err(_) => true, // read_dir 失败 → 保守判有
                 };
-                if non_empty {
+                if has_real {
                     reporter.warn(&format!(
                         "已按系统杂文件名单跳过目录「{}」及其内容(未纳入备份/校验)。若这是你的真实数据,请改名后重跑:{}",
                         name,
@@ -382,6 +393,23 @@ mod tests {
         assert!(
             !joined.contains("recovered.bin"),
             "cruft 目录内的文件由目录那条覆盖,不单独提示:{joined}"
+        );
+    }
+
+    // ── review-r3 round5:仅含 cruft 子项的具名 cruft 目录(如 found.000 里只有 Thumbs.db)
+    // 不是真实数据,不应误报假阳告警 ──
+    #[test]
+    fn warn_excluded_skips_cruft_dir_with_only_cruft_children() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("found.000")).unwrap();
+        std::fs::write(root.join("found.000").join("Thumbs.db"), b"x").unwrap();
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        warn_excluded_real_content(root, &rep);
+        let joined = rep.0.lock().unwrap().join("\n");
+        assert!(
+            !joined.contains("found.000"),
+            "仅含 cruft 子项的目录不应误报为真实数据;实际:{joined}"
         );
     }
 }

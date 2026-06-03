@@ -681,6 +681,14 @@ pub fn run_plan(
                      请检查配置的测试器路径是否正确、exe 是否被 AV 拦截。",
                 );
                 tester_opt = None;
+                // 触发该分支的本项目在 handle_one 的压缩包测试阶段已提前返回、**本轮未归档**(只是关掉了
+                // 后续项目的压缩包测试)。计 failed,使 CLI 退出非零、自动化/计划任务能感知「有项目未成功」,
+                // 与 L-007『批量归档里有失败要 exit 非零』一致。(review-r3 round5)
+                summary.failed += 1;
+                reporter.warn(&format!(
+                    "项目 {} 因测试器失效本轮未归档、已计为失败;修复测试器或加 --no-test-archives 后重跑。",
+                    item.name
+                ));
             }
             Err(e) => {
                 reporter.error(&format!(
@@ -1423,8 +1431,14 @@ fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
     }
     let mut rdr = csv::Reader::from_path(catalog)?;
     let headers = rdr.headers()?.clone();
+    // 文件存在且能作为 CSV 打开,但缺 ProjectName 列 → 索引不可信(损坏/被改格式),不能当作「空索引/未登记」
+    // 静默返回 Ok(false)(那会让恢复判定把『已索引』误判为『未索引』→ 重做产生重复副本/漏判重名)。
+    // 与 CSV 解析失败的 fail-closed 一致:bail,让调用方走既有 skip+note_manual / 上抛路径。(review-r3 round5)
     let Some(col) = headers.iter().position(|h| h == "ProjectName") else {
-        return Ok(false);
+        anyhow::bail!(
+            "本盘索引缺少 ProjectName 列,索引不可信(可能损坏或被改格式):{}",
+            catalog.display()
+        );
     };
     for rec in rdr.records() {
         let rec = rec?;
@@ -1594,8 +1608,13 @@ fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
     }
     let mut rdr = csv::Reader::from_path(global)?;
     let headers = rdr.headers()?.clone();
+    // 同 catalog_has_project:缺『文件夹名』列 = 索引不可信,bail 而非静默 Ok(false),避免把损坏全局索引
+    // 当成空索引导致恢复判定把『已索引』误判为『未索引』。(review-r3 round5)
     let Some(col) = headers.iter().position(|h| h == "文件夹名") else {
-        return Ok(false);
+        anyhow::bail!(
+            "全局索引缺少『文件夹名』列,索引不可信(可能损坏或被改格式):{}",
+            global.display()
+        );
     };
     for rec in rdr.records() {
         let rec = rec?;

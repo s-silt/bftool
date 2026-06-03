@@ -213,6 +213,8 @@ fn outcome_label(o: &VerifyOutcome) -> (&'static str, Color32) {
         VerifyOutcome::Clean => ("完好", theme::OK),
         VerifyOutcome::IssuesFound { .. } => ("发现损坏", theme::DANGER),
         VerifyOutcome::ExtraOnly { .. } => ("有多余文件", theme::WARN),
+        // 仅大小校验(清单无哈希)未验证内容 → WARN 色,不绿标完好。(review-r3 round5)
+        VerifyOutcome::CleanButSizeOnly { .. } => ("仅大小校验·未验证内容", theme::WARN),
         VerifyOutcome::Cancelled => ("上次取消", theme::TEXT_BODY),
     }
 }
@@ -356,6 +358,12 @@ mod tests {
             outcome_label(&VerifyOutcome::ExtraOnly { extra: 1 }).0,
             "有多余文件"
         );
+        let (lbl, color) = outcome_label(&VerifyOutcome::CleanButSizeOnly { size_only: 3 });
+        assert!(
+            lbl.contains("仅大小校验") && !lbl.contains("完好"),
+            "size-only 不应标完好"
+        );
+        assert_eq!(color, theme::WARN, "size-only 应为 WARN 色,非绿色 OK");
         assert_eq!(outcome_label(&VerifyOutcome::Cancelled).0, "上次取消");
     }
 }
