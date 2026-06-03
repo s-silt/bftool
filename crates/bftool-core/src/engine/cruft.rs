@@ -4,6 +4,8 @@
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::reporter::Reporter;
+
 /// 文件名精确匹配（不分大小写）。
 ///
 /// **不变量:这些条目必须全为 ASCII。** 匹配走 [`str::eq_ignore_ascii_case`](is_cruft_file),
@@ -107,6 +109,94 @@ pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::Result<DirEntry>> {
                 !is_cruft_file(&name)
             }
         })
+}
+
+/// 扫描 `root`,对「按系统杂文件名单(CRUFT_DIRS / CRUFT_FILES)被排除、但其实含真实内容」的
+/// 条目发可见 `warn`,把静默排除变可见 —— 防止用户真实数据(如恢复产物目录 `found.000`、或被
+/// 命名成 `Thumbs.db` 的业务文件)被无声漏备。
+///
+/// **不**改变 [`walk`] 的对称过滤本身(那是 manifest/复制/verify 共用、必须对称,否则 verify 会
+/// 误报 extra/missing);本函数只做一次只读侦测 + 告警。只针对**具名** cruft,刻意不含 `._` 前缀与
+/// `.bftool-part`(那是真·临时/系统产物,告警反成噪音)。为防刷屏,最多提示前 `MAX_WARN` 条。(review-r3 round2)
+pub fn warn_excluded_real_content(root: &Path, reporter: &dyn Reporter) {
+    const MAX_WARN: usize = 20;
+    let mut warned = 0usize;
+    for entry in WalkDir::new(root).follow_links(false) {
+        if warned >= MAX_WARN {
+            break;
+        }
+        // WalkDir 枚举错误(权限/网络盘瞬断/路径过长)不静默跳过 —— 不可读子树里若有被排除的真实数据
+        // 就漏报了,这正是本安全网最该报警的时刻。fail-loud:warn 一次而非裸 continue。(review-r3 round3)
+        let e = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                reporter.warn(&format!(
+                    "侦测被排除内容时枚举失败(可能漏报被静默排除的真实数据):{}",
+                    err
+                ));
+                warned += 1;
+                continue;
+            }
+        };
+        if e.depth() == 0 {
+            continue;
+        }
+        let path = e.path();
+        let name = e.file_name().to_string_lossy();
+        // 已位于某个 cruft 目录之内(父链含 cruft 目录段)→ 由该目录那条提示覆盖,不重复告警。
+        let inside_cruft_dir = path
+            .strip_prefix(root)
+            .ok()
+            .map(|rel| {
+                let segs: Vec<String> = rel
+                    .to_string_lossy()
+                    .split(['\\', '/'])
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                segs.len() > 1 && segs[..segs.len() - 1].iter().any(|s| is_cruft_dir(s))
+            })
+            .unwrap_or(false);
+        if inside_cruft_dir {
+            continue;
+        }
+        if e.file_type().is_dir() {
+            // 只对**非空**的具名 cruft 目录告警(空的系统目录无所谓)。
+            if is_cruft_dir(&name) {
+                // 读不出目录内容(权限/瞬断)时 fail-loud:按「可能非空」处理并照常告警,而非静默当空 ——
+                // 安全网在 io 失败时应偏向多报而非沉默。(review-r3 round3)
+                let non_empty = match std::fs::read_dir(path) {
+                    Ok(mut it) => it.next().is_some(),
+                    Err(_) => true,
+                };
+                if non_empty {
+                    reporter.warn(&format!(
+                        "已按系统杂文件名单跳过目录「{}」及其内容(未纳入备份/校验)。若这是你的真实数据,请改名后重跑:{}",
+                        name,
+                        path.display()
+                    ));
+                    warned += 1;
+                }
+            }
+        } else if e.file_type().is_file()
+            && CRUFT_FILES.iter().any(|c| c.eq_ignore_ascii_case(&name))
+        {
+            // 只对具名 cruft 文件(Thumbs.db 等)且**非零字节**告警;`._`/`.bftool-part` 不在此列。
+            // 读不出大小时 fail-loud:按「可能含内容」处理并告警,而非静默当空。(review-r3 round3)
+            let non_empty = match e.metadata() {
+                Ok(m) => m.len() > 0,
+                Err(_) => true,
+            };
+            if non_empty {
+                reporter.warn(&format!(
+                    "已按系统杂文件名单跳过文件「{}」(未纳入备份/校验)。若这是你的真实数据,请改名后重跑:{}",
+                    name,
+                    path.display()
+                ));
+                warned += 1;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +326,62 @@ mod tests {
     #[test]
     fn rel_has_cruft_component_empty() {
         assert!(!rel_has_cruft_component(""));
+    }
+
+    // ── review-r3 round2:被系统杂文件名单静默排除、但含真实内容的条目应发可见 warn ──
+    struct RecReporter(std::sync::Mutex<Vec<String>>);
+    impl Reporter for RecReporter {
+        fn log(&self, _level: crate::reporter::LogLevel, _msg: &str) {}
+        fn warn(&self, msg: &str) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
+        fn progress_bytes(
+            &self,
+            _label: &str,
+            _total: u64,
+        ) -> Box<dyn crate::reporter::ProgressHandle> {
+            Box::new(NoopProg)
+        }
+    }
+    struct NoopProg;
+    impl crate::reporter::ProgressHandle for NoopProg {
+        fn inc(&mut self, _delta: u64) {}
+        fn finish(&mut self) {}
+    }
+
+    #[test]
+    fn warn_excluded_flags_named_cruft_with_real_content() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        // 非空的具名 cruft 目录(恢复产物场景)
+        std::fs::create_dir_all(root.join("found.000")).unwrap();
+        std::fs::write(root.join("found.000").join("recovered.bin"), b"data").unwrap();
+        // 具名 cruft 文件(非零字节)
+        std::fs::write(root.join("Thumbs.db"), b"x").unwrap();
+        // 普通文件 + 真·临时产物:都不应告警
+        std::fs::write(root.join("real.txt"), b"hi").unwrap();
+        std::fs::write(root.join("a.bftool-part"), b"tmp").unwrap();
+
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        warn_excluded_real_content(root, &rep);
+        let joined = rep.0.lock().unwrap().join("\n");
+
+        assert!(
+            joined.contains("found.000"),
+            "应提示被排除的非空 found.000:{joined}"
+        );
+        assert!(
+            joined.contains("Thumbs.db"),
+            "应提示被排除的 Thumbs.db:{joined}"
+        );
+        assert!(!joined.contains("real.txt"), "普通文件不应被提示:{joined}");
+        assert!(
+            !joined.contains("bftool-part"),
+            ".bftool-part 是真·临时产物,不应提示:{joined}"
+        );
+        assert!(
+            !joined.contains("recovered.bin"),
+            "cruft 目录内的文件由目录那条覆盖,不单独提示:{joined}"
+        );
     }
 }

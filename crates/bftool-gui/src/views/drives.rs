@@ -62,7 +62,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn rescan(app: &mut App) {
-    match drive::scan_mounted() {
+    match drive::scan_mounted(None) {
         Ok(ds) => {
             app.drives_result = Some((true, format!("已刷新：识别到 {} 块备份盘。", ds.len())));
             app.drives_cache = Some(ds);

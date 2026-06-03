@@ -434,11 +434,13 @@ fn render_dry_run(plan: &ArchivePlan, reporter: &dyn Reporter) -> ArchiveSummary
 
 /// 进程级归档锁:一个独占创建的锁文件,防多个 bftool 实例并发归档(并发会破坏事务标记/索引)。
 /// Drop 时删锁(正常返回与 panic 展开都触发;release 用 panic=unwind 见 R5-8)。(review-r2 R6-4)
-struct ArchiveLock {
+/// 系统级跨进程互斥锁(锁文件在 system_root)。归档(run_plan)与初始化(drive::init)共用,
+/// 把所有会改动 system_root 状态(事务标记 / 盘号 seq / 全局索引)的操作串行化。(review-r3 round4)
+pub(crate) struct ArchiveLock {
     path: PathBuf,
 }
 impl ArchiveLock {
-    fn acquire(system_root: &Path) -> Result<Self> {
+    pub(crate) fn acquire(system_root: &Path) -> Result<Self> {
         let path = system_root.join(".bftool-archive.lock");
         match std::fs::OpenOptions::new()
             .create_new(true)
@@ -456,11 +458,11 @@ impl ArchiveLock {
                 Ok(ArchiveLock { path })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
-                "另一个 bftool 归档可能正在运行(锁文件存在:{})。请等它完成;若确认没有其它实例在跑\
-                 (上次异常退出残留),手动删除该文件后重试。",
+                "另一个 bftool 操作(归档/初始化)可能正在运行(锁文件存在:{})。请等它完成;\
+                 若确认没有其它实例在跑(上次异常退出残留),手动删除该文件后重试。",
                 path.display()
             ),
-            Err(e) => Err(e).context(format!("创建归档锁失败:{}", path.display())),
+            Err(e) => Err(e).context(format!("创建系统锁失败:{}", path.display())),
         }
     }
 }
@@ -517,9 +519,9 @@ pub fn run_plan(
             return Ok(ArchiveSummary::default());
         }
     }
-    if paths::drive_sealed_path(&drive.root).is_file() {
+    if drive::drive_is_sealed(&drive.root) {
         reporter.error(&format!(
-            "计划已过期：盘 {} ({}:) 在预览后被封盘 → 本轮不执行,请换未封盘的盘重新规划。",
+            "计划已过期：盘 {} ({}:) 在预览后被封盘(或封盘态读取失败,保守停止)→ 本轮不执行,请换未封盘的盘重新规划。",
             drive.id, drive.letter
         ));
         return Ok(ArchiveSummary {
@@ -571,18 +573,23 @@ pub fn run_plan(
         reporter.warn(&w);
     }
 
-    // 启动自检：上次的事务标记是不是残留？未解决时必须先停,避免新归档覆盖旧恢复证据。
-    check_pending_txn(cfg, reporter)?;
-
-    // 准备系统目录。必须在路径安全检查与事务自检之后,避免坏配置先污染 ready_root,
-    // 或未解决事务时产生新写入。
+    // 先建 system_root(锁文件与事务标记都在此),再取进程级归档锁 —— 必须在路径安全检查之后建,
+    // 避免坏配置先污染。R6-4:锁防两个 bftool 实例(CLI+CLI / CLI+GUI)并发归档同一套配置/盘。
     fs::create_dir_all(&cfg.system_root).context("创建 备份系统 目录失败")?;
+    // RAII:_archive_lock 在 run_plan 返回(含 panic 展开,release 已用 panic=unwind,见 R5-8)时 Drop 删锁。
+    // review-r3 round4:锁必须**先于** check_pending_txn 获取 —— 后者会在恢复分支主动 clear_marker
+    // 删除事务标记,这属于受锁保护的恢复状态变更。若放在锁外,并发实例可在持锁实例提交途中删掉其活动
+    // 标记。把锁上移使「读取/清除/重做事务标记」整体处于跨进程互斥内。
+    let _archive_lock = ArchiveLock::acquire(&cfg.system_root)?;
+
+    // 启动自检(已在锁内):上次的事务标记是不是残留？未解决时必须先停,避免新归档覆盖旧恢复证据。
+    // 传入本轮目标盘 id(上面 L497-519 已实时复验过盘内编号):若残留事务写在另一块盘上,
+    // 重做前会 fail-closed,避免抹掉原盘那份中断副本的恢复证据。(review-r3 #2)
+    check_pending_txn(cfg, reporter, &drive.id)?;
+
+    // 其余系统/归档目录:在事务自检之后建,避免未解决事务时就对归档目标区产生新写入。
     fs::create_dir_all(paths::system_logs_dir(&cfg.system_root)).ok();
     fs::create_dir_all(&cfg.archived_root).context("创建 已备份 目录失败")?;
-
-    // R6-4:进程级归档锁,防两个 bftool 实例(CLI+CLI / CLI+GUI)并发归档同一套配置/盘 → 破坏事务。
-    // RAII:_archive_lock 在 run_plan 返回(含 panic 展开,release 已用 panic=unwind,见 R5-8)时 Drop 删锁。
-    let _archive_lock = ArchiveLock::acquire(&cfg.system_root)?;
 
     // tester detection:本轮只 detect 一次、只 warn 一次
     let mut tester_opt = detect_tester(cfg, opts, reporter)?;
@@ -1460,7 +1467,7 @@ fn append_manual(cfg: &Config, name: &str, why: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
+fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter, redo_drive_id: &str) -> Result<()> {
     let path = paths::system_pending_txn(&cfg.system_root);
     if !path.is_file() {
         return Ok(());
@@ -1518,6 +1525,28 @@ fn check_pending_txn(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     // 叠加「用户在待备份重建了同名源」时,应判定为已完成(走下面 moved&&indexed 分支只清标记),
     // 而非误判为需重做。(review-r2 R4-1)
     if in_ready && !(moved && indexed) {
+        // review-r3 #2:重做并清标记前,确认本次重做的目标盘就是当时写入的那块盘。进入本分支意味着
+        // 「副本已写到原备份盘且通过 SHA256、源未移走」—— 原盘上必有一份已校验的孤儿副本+清单。
+        // 若本次重做要落到另一块盘(用户换了盘 / 原盘离线),清掉标记会抹掉指向原盘那份孤儿的唯一
+        // 恢复证据。改为 fail-closed:保留标记、不重做,提示用户插回原盘核对/清理。绝不删除任何东西
+        // (与「恢复路径不删除」一致)。redo_drive_id 来自 run_plan 已实时复验过盘内编号的目标盘。
+        // 标记无 drive_id(极旧标记缺该字段)时跳过此校验,维持原有重做行为。
+        if !pending.drive_id.trim().is_empty() && pending.drive_id.trim() != redo_drive_id.trim() {
+            reporter.error(&format!(
+                "→ 上次中断的副本写在备份盘「{}」上(盘上可能残留一份已校验的项目副本+校验清单),\
+                 而本轮将写入「{}」。为不丢失对原盘那份副本的恢复证据,本轮归档已停止、标记保留。\
+                 请插回备份盘「{}」核对/清理后再归档,或确认无误后手动删除标记：{}",
+                pending.drive_id.trim(),
+                redo_drive_id.trim(),
+                pending.drive_id.trim(),
+                path.display()
+            ));
+            anyhow::bail!(
+                "未完成的事务写在备份盘「{}」上,而本轮目标盘是「{}」—— 为避免丢失原盘上中断副本的恢复证据,本轮归档已停止(标记保留)。",
+                pending.drive_id.trim(),
+                redo_drive_id.trim()
+            );
+        }
         reporter
             .action("→ 源仍在『待备份』，说明移动尚未发生；本次会自动重做该项目。正在清除旧标记…");
         // 已知局限(review-r2 R3-2):若崩溃恰发生在「索引已写、移源未完成」的窄窗口,自动重做会在
@@ -1654,6 +1683,10 @@ fn source_bftool_part_files(root: &Path) -> Result<Vec<String>> {
 /// SHA256 diff(manifest::diff，非 no_hash 时逐文件比哈希)，内容不一致的文件在那一步被发现、
 /// 移入隔离目录，下次运行补传重校。即「大小跳过」是性能优化，「SHA256 diff」是正确性兜底。
 fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
+    // 把「按系统杂文件名单静默排除、但其实含真实内容」的源条目变为可见 warn —— 防止用户真实数据
+    // 恰好命名为 cruft(如恢复产物目录 found.000、或被命名为 Thumbs.db 的业务文件)在归档『成功』、
+    // 源被 MOVE 走之后才发现备份里少了东西。只告警不改过滤(过滤须对称,否则 verify 误报)。(review-r3 round2)
+    cruft::warn_excluded_real_content(src, reporter);
     fs::create_dir_all(dst).ok();
     let mut errors: Vec<String> = Vec::new();
     for entry in cruft::walk(src) {
@@ -1668,7 +1701,14 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
         let rel = path.strip_prefix(src)?;
         let target = dst.join(rel);
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&target).ok();
+            // 空目录也要 fail-closed:若 create_dir_all 失败(权限/超长路径/同名文件占用),
+            // 旧的 .ok() 会静默吞掉 → 该空目录漏备,而 manifest/diff/verify 都只枚举 is_file()、
+            // 永远发现不了缺失的空目录 → 形成「校验通过却漏了目录结构」。收进 errors 让本项目跳过、
+            // 下次重做(与下面文件复制失败同一兜底)。非空目录的失败原本也会在子文件复制时上抛,
+            // 这里提前归因更清晰。(review-r3 #3)
+            if let Err(e) = fs::create_dir_all(&target) {
+                errors.push(format!("建目录失败 {}：{}", target.display(), e));
+            }
         } else if entry.file_type().is_file() {
             // 原子复制的临时名;先清理可能残留的孤儿 .part(上次中断留下),避免在备份盘累积。(Phase 4 F-3)
             let part = {
@@ -1922,6 +1962,24 @@ mod tests {
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(fs::read(dst.join("sub").join("b.bin")).unwrap(), b"xyz");
         assert!(!dst.join("a.txt.bftool-part").exists(), "不应遗留 .part");
+    }
+
+    // ── review-r3 #3:空目录建立失败不再 .ok() 静默吞,本项目 fail-closed(返回 Err、不移源)──
+    #[test]
+    fn copy_folder_dir_create_failure_is_fail_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("t");
+        // 源含一个空目录 sub_empty(只有它,无文件,故只走目录创建分支)。
+        fs::create_dir_all(src.join("sub_empty")).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        // 在 dst 下预置一个与该空目录同名的**文件**,使 create_dir_all(dst/sub_empty) 失败。
+        fs::write(dst.join("sub_empty"), b"x").unwrap();
+        let r = copy_folder(&src, &dst, &NoopReporter);
+        assert!(
+            r.is_err(),
+            "空目录建立失败应 fail-closed(不静默吞),返回 Err"
+        );
     }
 
     // ── L-01(VulnGym 审计):符号链接/junction 不静默丢弃,复制阶段 warn 告知;不跟随(防逃逸) ──
@@ -2620,7 +2678,7 @@ mod tests {
             &src.display().to_string(),
             "Z:/nope/001A",
         );
-        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        check_pending_txn(&cfg, &NoopReporter, "备份1").unwrap();
         let content = fs::read_to_string(&global).unwrap();
         assert!(
             content.contains("001A"),
@@ -2655,7 +2713,7 @@ mod tests {
             &cfg.ready_root.join("001A").display().to_string(),
             &moved_dest.display().to_string(),
         );
-        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        check_pending_txn(&cfg, &NoopReporter, "备份1").unwrap();
         let content = fs::read_to_string(&global).unwrap();
         assert!(
             content.contains("001A"),
@@ -2682,8 +2740,33 @@ mod tests {
         );
         let marker = paths::system_pending_txn(&cfg.system_root);
         assert!(marker.is_file());
-        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        check_pending_txn(&cfg, &NoopReporter, "备份1").unwrap();
         assert!(!marker.exists(), "源仍在待备份 → 清标记自动重做");
+    }
+
+    // ── review-r3 #2:in_ready 重做但本轮目标盘 ≠ 标记里的盘(用户换了盘/原盘离线)
+    // → fail-closed,保留标记、不重做、不删除,保护原盘上中断副本的恢复证据 ──
+    #[test]
+    fn check_pending_txn_in_ready_different_drive_keeps_marker() {
+        let (_d, cfg, _drive) = temp_world();
+        let src = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&src).unwrap(); // 源仍在待备份 → in_ready=true
+        write_marker(
+            &cfg,
+            "001proj",
+            "001proj",
+            &src.display().to_string(),
+            &cfg.archived_root.join("001proj").display().to_string(),
+        ); // 标记里 drive_id = "备份1"
+        let marker = paths::system_pending_txn(&cfg.system_root);
+        // 本轮目标盘是「备份2」—— 与标记的「备份1」不符 → 应 fail-closed。
+        let r = check_pending_txn(&cfg, &NoopReporter, "备份2");
+        assert!(
+            r.is_err(),
+            "重做目标盘与标记盘不符应 fail-closed,保护原盘孤儿副本的恢复证据"
+        );
+        assert!(marker.is_file(), "fail-closed 必须保留标记(不清、不删)");
+        assert!(src.is_dir(), "源不得被动到");
     }
 
     #[test]
@@ -2705,7 +2788,7 @@ mod tests {
             &arch.display().to_string(),
         );
         let marker = paths::system_pending_txn(&cfg.system_root);
-        check_pending_txn(&cfg, &NoopReporter).unwrap();
+        check_pending_txn(&cfg, &NoopReporter, "备份1").unwrap();
         assert!(!marker.exists(), "已移+已索引 → 判定完成,清标记");
     }
 
@@ -2725,7 +2808,7 @@ mod tests {
         );
         let marker = paths::system_pending_txn(&cfg.system_root);
         assert!(
-            check_pending_txn(&cfg, &NoopReporter).is_err(),
+            check_pending_txn(&cfg, &NoopReporter, "备份1").is_err(),
             "已移但索引漏写 → 应阻塞新归档,保留标记待人工"
         );
         assert!(marker.exists(), "已移但索引漏写 → 保留标记待人工");

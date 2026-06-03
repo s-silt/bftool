@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -184,6 +184,30 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
             hash_errors.len()
         );
     }
+
+    // 重复 rel 检测(fail-closed)。path_relative 用 to_string_lossy 把非法 UTF-16 文件名折叠成
+    // U+FFFD,两个仅在非法字节序列上不同的文件可能映射到同一 rel。而 diff/source_changed 都用
+    // HashMap<rel,&Entry> 索引,collect 遇重复 key 只保留最后一条、静默丢弃前一条 → 另一文件的
+    // 损坏/缺失逃过逐项比对,形成「校验通过」假象。这里在源头拒绝:发现重复即判清单不可信,
+    // 本项目跳过、下次重做,杜绝 diff/source_changed 的静默折叠。(review-r3)
+    {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+        let dups: Vec<&str> = entries
+            .iter()
+            .filter(|e| !seen.insert(e.rel.as_str()))
+            .map(|e| e.rel.as_str())
+            .collect();
+        if !dups.is_empty() {
+            for r in &dups {
+                reporter.error(&format!("清单出现重复相对路径：{}", r));
+            }
+            anyhow::bail!(
+                "本项目清单出现 {} 个重复相对路径(可能含非法文件名)→ 清单不可信,本项目跳过,下次重做。",
+                dups.len()
+            );
+        }
+    }
+
     Ok(Manifest { entries })
 }
 

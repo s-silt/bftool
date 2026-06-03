@@ -18,6 +18,10 @@ pub struct BackgroundTask<T> {
     cancel: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     result: Arc<Mutex<Option<TaskOutcome<T>>>>,
+    /// Drop 时是否允许 detach(不 join)。默认 false = 写任务(archive run)必须 join 保数据不变量;
+    /// 只读任务(plan 预览 / find 查询,不写盘)置 true,使关窗时不被慢速/掉线网络盘的阻塞读拖住 UI。
+    /// (review-r3 round3)
+    detach_on_drop: bool,
 }
 
 impl<T: Send + 'static> BackgroundTask<T> {
@@ -44,7 +48,17 @@ impl<T: Send + 'static> BackgroundTask<T> {
             cancel,
             handle: Some(handle),
             result,
+            detach_on_drop: false,
         }
+    }
+
+    /// 标记为「只读任务」:Drop 时允许 detach(不 join)。仅用于 plan 预览 / find 查询这类
+    /// **绝不写盘**的任务 —— 它们卡在慢速/掉线网络盘的阻塞读时,关窗不应让 UI 线程陪着 join 挂死;
+    /// 线程随进程退出被回收,且只持有 cfg 克隆与 mpsc 发送端(通道关闭时 send 静默失败),detach 安全。
+    /// **绝不可**用于 archive run 等写任务(那必须 join,见 Drop 注释的 AR-01 不变量)。(review-r3 round3)
+    pub fn detachable(mut self) -> Self {
+        self.detach_on_drop = true;
+        self
     }
 
     /// 请求取消(置位标志;core 在项目边界读到后安全收尾)。
@@ -79,17 +93,23 @@ impl<T: Send + 'static> BackgroundTask<T> {
     }
 }
 
-/// Drop 时**先置取消、再 join**(不 detach)。
-/// 为什么 join 而非 detach:与 core 的 AR-01 不变式一致——绝不让后台线程在进程/视图撤销后
+/// Drop 时**先置取消**;写任务再 **join**(不 detach),只读任务可 detach。
+/// 为什么写任务 join 而非 detach:与 core 的 AR-01 不变式一致——绝不让后台线程在进程/视图撤销后
 /// 还继续改动半移动状态的归档(否则可能在退出后写坏盘/索引)。数据完整性 > 即时关闭。
 /// 已知代价:若正在跑一个大项目,取消在**项目边界**才生效,join 会阻塞到下一个边界,
 /// 关窗时窗口可能短暂"无响应"(几秒)。这是有意权衡,可接受。
+/// 例外(detach_on_drop=true):plan 预览 / find 查询是**只读、不写盘**任务,卡在慢速/掉线网络盘的
+/// 阻塞读时若也 join,会让关窗挂死数十秒~分钟级。这类任务 Drop 时 detach(丢弃 JoinHandle、不 join):
+/// 线程随进程退出回收,只持有 cfg 克隆与 mpsc 发送端(通道已关时 send 静默失败),不写坏任何状态。(review-r3 round3)
 impl<T> Drop for BackgroundTask<T> {
     fn drop(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            if !self.detach_on_drop {
+                let _ = h.join();
+            }
+            // detach_on_drop=true:不 join,h 在此 drop → 线程 detach,不阻塞关窗。
         }
     }
 }
@@ -135,6 +155,22 @@ mod tests {
         let outcome = drain::<String>(t);
         std::panic::set_hook(prev);
         assert!(matches!(outcome, TaskOutcome::Failed(_)));
+    }
+
+    // ── review-r3 round3:只读任务 detachable() 后 Drop 不得 join 阻塞(否则关窗挂死)──
+    #[test]
+    fn detachable_task_drop_does_not_join() {
+        // 任务阻塞等待一个永不到来的信号(模拟卡在慢速网络盘的阻塞读),且忽略 cancel。
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = BackgroundTask::spawn(move |_cancel| {
+            let _ = rx.recv(); // 阻塞,直到 tx 被 drop 才返回 Err
+            Ok("done".to_string())
+        })
+        .detachable();
+        // 若 Drop 仍 join,这里会永久阻塞(测试挂死);detachable → 立即返回。
+        drop(t);
+        // 能走到这里即证明 Drop 未 join 阻塞。释放 tx 让被 detach 的线程收尾。
+        drop(tx);
     }
 
     #[test]

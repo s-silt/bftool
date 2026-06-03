@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 
 use crate::config::Config;
@@ -36,8 +37,10 @@ pub struct FindOutcome {
     pub matches: Vec<FindMatch>,
     /// 实际成功检索到的索引来源数(本机 + 可读的额外来源)。
     pub sources_searched: usize,
-    /// 读取失败的来源标签(额外来源不存在、或任何来源读取/解析失败)；本机索引**不存在**不算失败(=尚未归档)，但本机索引存在却读取失败会计入此列表。
-    pub sources_failed: Vec<String>,
+    /// 读取失败的来源:`(标签, 失败原因摘要)`。额外来源不存在、或任何来源读取/解析失败都计入;
+    /// 本机索引**不存在**不算失败(=尚未归档),但本机索引存在却读取失败会计入。保留具体原因(过大/
+    /// 损坏/选错文件/被占用)而非只记标签,供 CLI/GUI 给出可诊断提示。(review-r3 round3)
+    pub sources_failed: Vec<(String, String)>,
     /// 跨所有成功读取来源累加的「格式错误被跳过」行数。>0 说明部分行未解析进结果,应提示用户。(CSV-2)
     pub malformed_rows: usize,
 }
@@ -92,19 +95,22 @@ fn read_catalog(
     seen: &mut HashSet<RowKey>,
     max_bytes: u64,
 ) -> Result<usize> {
-    // CSV-1:全量 fs::read 前先按大小上限拦截,避免超大/畸形他机索引撑爆内存。
-    let len = fs::metadata(path)
-        .with_context(|| format!("读索引元数据失败：{}", path.display()))?
-        .len();
-    if len > max_bytes {
+    // CSV-1:流式硬上限读取,消除「metadata 快照 → fs::read」之间的 TOCTOU —— metadata 取值后
+    // 文件可能被写大(半信任的他机索引可能在网络盘上),fs::read 会按当前真实大小全量载入绕过闸。
+    // take(max_bytes+1) 把载入内存的字节硬性封顶:读到 >max_bytes 即判过大。(review-r3 #13)
+    let f = fs::File::open(path).with_context(|| format!("读索引失败：{}", path.display()))?;
+    let mut bytes = Vec::new();
+    let read = f
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("读索引失败：{}", path.display()))?;
+    if read as u64 > max_bytes {
         anyhow::bail!(
-            "索引文件过大（{} 字节 > 上限 {} 字节），已跳过：{}",
-            len,
+            "索引文件过大（超过上限 {} 字节），已跳过：{}",
             max_bytes,
             path.display()
         );
     }
-    let bytes = fs::read(path).with_context(|| format!("读索引失败：{}", path.display()))?;
     let mut rdr = csv::Reader::from_reader(std::io::Cursor::new(bytes));
     let headers = rdr
         .headers()
@@ -131,9 +137,13 @@ fn read_catalog(
     };
 
     let mut malformed = 0usize;
+    let mut valid = 0usize;
     for result in rdr.records() {
         let rec = match result {
-            Ok(r) => r,
+            Ok(r) => {
+                valid += 1;
+                r
+            }
             // CSV-2:坏行(列数不符等)不再被 flatten() 静默吞,计数后跳过,供调用方提示用户。
             Err(_) => {
                 malformed += 1;
@@ -166,6 +176,16 @@ fn read_catalog(
             out.push(m);
         }
     }
+    // CSV-3:表头可识别但正文有数据行且**全部**解析失败(valid==0 && malformed>0)→ 整份索引
+    // 不可用,报错让 read_source 计入 sources_failed,而非伪装成"成功检索 1 个来源"误导用户
+    // 误判"查不到=没备份"。空表(0 数据行)仍视为成功来源,不误报。(review-r3 #14)
+    if valid == 0 && malformed > 0 {
+        anyhow::bail!(
+            "索引正文整体无法解析（{} 行全部格式错误,可能损坏或分隔符错误）：{}",
+            malformed,
+            path.display()
+        );
+    }
     Ok(malformed)
 }
 
@@ -183,7 +203,8 @@ fn read_source(
 ) {
     if !path.is_file() {
         if !is_main {
-            out.sources_failed.push(label.to_string());
+            out.sources_failed
+                .push((label.to_string(), "文件不存在或不是普通文件".to_string()));
         }
         return;
     }
@@ -192,8 +213,21 @@ fn read_source(
             out.sources_searched += 1;
             out.malformed_rows += bad;
         }
-        Err(_) => out.sources_failed.push(label.to_string()),
+        // 保留 read_catalog 精心构造的具体错误链(过大/格式无法识别/表头读失败/整体坏行/被占用),
+        // 不再用 Err(_) 整条丢弃 → CLI/GUI 才能告诉用户失败的真正原因。(review-r3 round3)
+        Err(e) => out
+            .sources_failed
+            .push((label.to_string(), format!("{e:#}"))),
     }
+}
+
+/// 把失败来源渲染成「标签:原因」串,供 CLI/GUI 统一展示。
+pub fn render_failed_sources(failed: &[(String, String)]) -> String {
+    failed
+        .iter()
+        .map(|(label, reason)| format!("{label}:{reason}"))
+        .collect::<Vec<_>>()
+        .join("、")
 }
 
 /// 在「本机总索引 + 配置的额外索引」里按关键词(文件夹名或编号 contains)查项目。
@@ -233,13 +267,16 @@ pub fn search(cfg: &Config, keyword: &str) -> Result<FindOutcome> {
 /// 关键区分:本机索引**存在但读失败**(被 Excel 占用/损坏)≠ 尚未归档 —— 否则把"读不出"
 /// 误报成"没有",用户以为备份记录丢了。(review-r2 R4-6)
 fn empty_result_message(outcome: &FindOutcome) -> String {
-    let local_failed = outcome.sources_failed.iter().any(|s| s == LOCAL_SOURCE);
+    let local_failed = outcome
+        .sources_failed
+        .iter()
+        .any(|(label, _)| label == LOCAL_SOURCE);
     if local_failed {
-        let others: Vec<&str> = outcome
+        let others: Vec<(String, String)> = outcome
             .sources_failed
             .iter()
-            .filter(|s| s.as_str() != LOCAL_SOURCE)
-            .map(String::as_str)
+            .filter(|(label, _)| label != LOCAL_SOURCE)
+            .cloned()
             .collect();
         let mut msg =
             "本机索引存在但读取失败(可能被 Excel 等程序占用,或文件损坏)——请关闭占用程序/修复后重试。"
@@ -248,7 +285,7 @@ fn empty_result_message(outcome: &FindOutcome) -> String {
             msg.push_str(&format!(
                 " 另有 {} 个额外索引来源读取失败:{}",
                 others.len(),
-                others.join("、")
+                render_failed_sources(&others)
             ));
         }
         msg
@@ -258,7 +295,7 @@ fn empty_result_message(outcome: &FindOutcome) -> String {
         format!(
             "没有可检索的索引：本机尚未归档，且 {} 个额外索引来源都读取失败：{}",
             outcome.sources_failed.len(),
-            outcome.sources_failed.join("、")
+            render_failed_sources(&outcome.sources_failed)
         )
     }
 }
@@ -298,9 +335,9 @@ pub fn run(cfg: &Config, keyword: &str) -> Result<()> {
     );
     if !outcome.sources_failed.is_empty() {
         println!(
-            "注意：{} 个额外索引来源读取失败，已跳过：{}",
+            "注意：{} 个索引来源读取失败，已跳过：{}",
             outcome.sources_failed.len(),
-            outcome.sources_failed.join("、")
+            render_failed_sources(&outcome.sources_failed)
         );
     }
     if outcome.malformed_rows > 0 {
@@ -342,7 +379,8 @@ mod tests {
     fn empty_result_message_distinguishes_local_read_failure() {
         // 本机索引存在但读失败 → sources_failed 含 LOCAL_SOURCE
         let mut o = FindOutcome::default();
-        o.sources_failed.push(LOCAL_SOURCE.to_string());
+        o.sources_failed
+            .push((LOCAL_SOURCE.to_string(), "读取失败".to_string()));
         let msg = empty_result_message(&o);
         assert!(
             msg.contains("读取失败"),
@@ -447,7 +485,7 @@ mod tests {
         assert_eq!(r.matches.len(), 1, "本机仍能查到");
         assert_eq!(r.sources_searched, 1);
         assert_eq!(r.sources_failed.len(), 1, "缺失的额外来源记为失败");
-        assert_eq!(r.sources_failed[0], "没有");
+        assert_eq!(r.sources_failed[0].0, "没有", "失败来源标签");
     }
 
     #[test]
@@ -509,7 +547,13 @@ mod tests {
         let r = search(&cfg, "proj").unwrap();
         assert_eq!(r.matches.len(), 1, "本机仍查到");
         assert_eq!(r.sources_searched, 1, "无法识别的来源不计入已检索");
-        assert_eq!(r.sources_failed, vec!["wrong".to_string()], "记为失败来源");
+        assert_eq!(r.sources_failed.len(), 1, "记为失败来源");
+        assert_eq!(r.sources_failed[0].0, "wrong", "失败来源标签");
+        assert!(
+            r.sources_failed[0].1.contains("无法识别"),
+            "失败原因应保留 read_catalog 的具体错误(不再 Err(_) 丢弃),实际:{}",
+            r.sources_failed[0].1
+        );
     }
 
     // ── CSV-2(VulnGym 审计):坏行不再被 flatten() 静默吞,而是计数 ──
@@ -531,6 +575,40 @@ mod tests {
             read_catalog(&p, "src", "proj", &mut out, &mut seen, MAX_CATALOG_BYTES).unwrap();
         assert_eq!(out.len(), 1, "好行仍命中");
         assert_eq!(malformed, 1, "坏行被计数而非静默吞");
+    }
+
+    // ── review-r3 #14:表头可识别但正文有数据行且全部解析失败 → 整份不可用(Err),
+    // 而非伪装成"成功检索 1 个来源" ──
+    #[test]
+    fn read_catalog_all_rows_malformed_is_err() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.csv");
+        // 表头 6 列;两条数据行列数都不符 → 全部解析失败,valid==0。
+        std::fs::write(
+            &p,
+            "文件夹名,备份盘名,备份时间,编号,盘内路径,校验方式\n\
+             bad1,只有两列\n\
+             bad2,也两列\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let r = read_catalog(&p, "src", "proj", &mut out, &mut seen, MAX_CATALOG_BYTES);
+        assert!(r.is_err(), "正文全为坏行的索引应判失败(不可用),不应 Ok");
+    }
+
+    // ── review-r3 #14:空表(仅表头、无数据行)仍视为成功来源,不误判失败 ──
+    #[test]
+    fn read_catalog_empty_table_is_ok() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.csv");
+        std::fs::write(&p, "文件夹名,备份盘名,备份时间,编号,盘内路径,校验方式\n").unwrap();
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let malformed =
+            read_catalog(&p, "src", "proj", &mut out, &mut seen, MAX_CATALOG_BYTES).unwrap();
+        assert_eq!(malformed, 0, "空表无坏行");
+        assert!(out.is_empty(), "空表无命中");
     }
 
     // ── CSV-1(VulnGym 审计):超过大小上限的索引文件直接判失败,不全量载入内存 ──

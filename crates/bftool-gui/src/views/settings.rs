@@ -378,6 +378,20 @@ mod tests {
         assert_eq!(c.name_prefix, "备份");
     }
 
+    // ── review-r3 round3:GUI 保存走 parse_form,须保留**原始**(可相对)根目录字符串、不绝对化 ——
+    // 锁定 Config::from_path 的「绝对化仅供消费、持久化用原始值」不变量,防止未来回归把相对语义吞掉 ──
+    #[test]
+    fn parse_form_preserves_relative_root_for_save() {
+        let mut s = filled();
+        s.ready_root = "library/ready".into(); // 相对路径
+        let c = parse_form(&s).unwrap();
+        assert_eq!(
+            c.ready_root,
+            PathBuf::from("library/ready"),
+            "保存路径须保留用户输入的相对根,不得像 from_path 那样锚定绝对化"
+        );
+    }
+
     #[test]
     fn parse_form_collects_extra_catalogs_dropping_blanks() {
         let mut s = filled();

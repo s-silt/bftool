@@ -65,6 +65,11 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     &mut app.archive_ui.confirm_unsafe,
                     "我明白这会漏掉静默损坏,仅用于可再生素材",
                 );
+            } else {
+                // 取消「跳过 SHA256」时复位二次确认,使每次重新启用危险开关都必须重新确认 ——
+                // 否则陈旧的 confirm_unsafe=true 会静默满足守卫、绕过确认摩擦。与 init.rs 复位
+                // confirm_force 的做法一致。(review-r3 round3)
+                app.archive_ui.confirm_unsafe = false;
             }
         });
     });
@@ -207,10 +212,14 @@ fn refresh_plan(app: &mut App) {
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
     app.rx = Some(rx);
     let cfg = app.cfg.clone();
-    app.plan_task = Some(BackgroundTask::spawn(move |_cancel| {
-        // plan 只读、不可中途取消(folder_stats 无 cancel 钩子);返回结构化计划。
-        archive::plan(&cfg, &opts, &reporter)
-    }));
+    app.plan_task = Some(
+        BackgroundTask::spawn(move |_cancel| {
+            // plan 只读、不可中途取消(folder_stats 无 cancel 钩子);返回结构化计划。
+            archive::plan(&cfg, &opts, &reporter)
+        })
+        // 只读不写盘:关窗时 detach 而非 join,避免卡在慢速/掉线网络盘的 folder_stats 上挂死 UI。(review-r3 round3)
+        .detachable(),
+    );
 }
 
 /// 把当前 plan 交给后台线程跑 run_plan(GuiReporter 推日志/进度,cancel 项目边界)。

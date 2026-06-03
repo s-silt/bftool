@@ -54,6 +54,9 @@ pub struct VerifyReport {
     pub checked: u64,
     pub bad: u64,
     pub extra: u64,
+    /// 仅按**大小**校验、未验证内容(SHA256)的文件数 —— 清单该行 Hash 为空(no_hash 归档 /
+    /// 缺 Hash 列 / 单元格被裁空)。>0 说明本次复查无法检测等长内容篡改,不能笼统呈现为「完好」。(review-r3 round4)
+    pub size_only: u64,
     pub issues: Vec<VerifyIssue>,
     pub extras: Vec<ExtraFile>,
     pub cancelled: bool,
@@ -103,7 +106,7 @@ pub fn run(
     drive_letter: Option<&str>,
     cancel: &AtomicBool,
 ) -> Result<VerifyReport> {
-    let drives = drive::scan_mounted()?;
+    let drives = drive::scan_mounted(Some(reporter))?;
     if drives.is_empty() {
         bail!("未发现已初始化的备份盘。");
     }
@@ -154,15 +157,23 @@ pub fn run(
     }
 
     let summary = format!(
-        "复查完成：检查 {} 个文件，损坏/缺失/大小/枚举问题 {} 个,清单外多余 {} 个。",
-        report.checked, report.bad, report.extra
+        "复查完成：检查 {} 个文件，损坏/缺失/大小/枚举问题 {} 个,清单外多余 {} 个,仅大小校验(未验证内容) {} 个。",
+        report.checked, report.bad, report.extra, report.size_only
     );
     if report.bad > 0 {
         reporter.error(&summary);
-    } else if report.extra > 0 {
+    } else if report.extra > 0 || report.size_only > 0 {
+        // size-only(无哈希)不是「完好」:降级为 warn,避免绿色「完好」掩盖「未验证内容」。(review-r3 round4)
         reporter.warn(&summary);
     } else {
         reporter.ok(&summary);
+    }
+    if report.size_only > 0 {
+        reporter.warn(&format!(
+            "注意:{} 个文件只校验了大小、未验证内容(清单无哈希,如 --unsafe-no-hash 归档)——\
+             等长内容篡改/比特腐烂无法被本次复查发现。",
+            report.size_only
+        ));
     }
     if report.extra > 0 {
         reporter.info("（多余文件不会自动删除；如确认无用可人工清理。）");
@@ -208,7 +219,7 @@ fn verify_tree(
         let proj_dir = projects_dir.join(&project_name);
 
         // 一个坏清单(读不出/缺 Rel 列)只跳过该项目(warn),不中断整盘复查。
-        let rows = match read_manifest_rows(&mf.path()) {
+        let rows = match read_manifest_rows(&mf.path(), reporter) {
             Ok(r) => r,
             Err(e) => {
                 reporter.error(&format!("跳过(清单有问题):{} —— {}", project_name, e));
@@ -222,7 +233,7 @@ fn verify_tree(
         };
         let mut expected: HashSet<String> = HashSet::new();
         for (rel, size, hash) in &rows {
-            expected.insert(rel.clone());
+            expected.insert(extras_key(rel));
             check_one_file(
                 &proj_dir,
                 &project_name,
@@ -259,7 +270,7 @@ pub fn verify_one(
         );
     }
     let proj_dir = paths::drive_projects_dir(&root).join(&project);
-    let rows = read_manifest_rows(&manifest)?;
+    let rows = read_manifest_rows(&manifest, reporter)?;
 
     match rel {
         // 整个项目文件夹:逐清单项校验 + 报告多余文件。
@@ -272,7 +283,7 @@ pub fn verify_one(
                     reporter.warn("复查已取消。");
                     return Ok(report);
                 }
-                expected.insert(r.clone());
+                expected.insert(extras_key(r));
                 check_one_file(&proj_dir, &project, r, *size, hash, reporter, &mut report);
             }
             report_extras(&proj_dir, &project, &expected, reporter, &mut report);
@@ -280,7 +291,11 @@ pub fn verify_one(
         // 单个文件:在清单里找它的期望值再比对;清单里没有 → 多余(无法比对哈希)。
         Some(rel) => {
             reporter.info(&format!("复查文件「{}\\{}」…", project, rel));
-            match rows.iter().find(|(r, _, _)| r == &rel) {
+            // 用 extras_key 归一化匹配(Windows 大小写折叠),与 verify_tree/report_extras 同口径 ——
+            // 否则磁盘呈现 a.txt、清单登记 A.txt 的同一文件会查不到 → 跳过 SHA256 重算、误报『清单外多余』,
+            // 在最常见的 Windows 平台对单文件抽查漏检损坏。(review-r3 round5)
+            let key = extras_key(&rel);
+            match rows.iter().find(|(r, _, _)| extras_key(r) == key) {
                 Some((r, size, hash)) => {
                     check_one_file(&proj_dir, &project, r, *size, hash, reporter, &mut report);
                 }
@@ -296,15 +311,18 @@ pub fn verify_one(
     }
 
     let summary = format!(
-        "单目标复查完成:检查 {} 个文件,损坏/缺失/大小问题 {} 个,清单外 {} 个。",
-        report.checked, report.bad, report.extra
+        "单目标复查完成:检查 {} 个文件,损坏/缺失/大小问题 {} 个,清单外 {} 个,仅大小校验 {} 个。",
+        report.checked, report.bad, report.extra, report.size_only
     );
     if report.bad > 0 {
         reporter.error(&summary);
-    } else if report.extra > 0 {
+    } else if report.extra > 0 || report.size_only > 0 {
         reporter.warn(&summary);
     } else {
         reporter.ok(&summary);
+    }
+    if report.size_only > 0 {
+        reporter.warn("注意:含未验证内容(仅大小校验)的文件——清单无哈希,等长篡改无法被发现。");
     }
     Ok(report)
 }
@@ -322,19 +340,32 @@ fn check_one_file(
 ) {
     let f = proj_dir.join(rel);
     report.checked += 1;
-    if !f.is_file() {
-        reporter.error(&format!("  缺失: {}", rel));
-        report.push_issue(project_name, rel, VerifyIssueKind::Missing);
-        return;
-    }
-    let meta = match fs::metadata(&f) {
+    // 与归档侧 follow_links(false) 对齐:用 symlink_metadata 看路径**本身**、不跟随链接。归档时清单只登记
+    // 真实文件(cruft::walk follow_links=false),若备份盘上某登记文件事后被替换成符号链接/junction(可指向
+    // 项目外/盘外),绝不能顺链接读目标内容、用恰好一致的大小/哈希判「完好」——那已不是当初备份的真实数据。
+    // 视为损坏/已被替换,与归档「绝不跟随链接」口径一致。(review-r3 round3)
+    let meta = match fs::symlink_metadata(&f) {
         Ok(m) => m,
-        Err(e) => {
-            reporter.error(&format!("  无法读元数据 {}: {}", rel, e));
-            report.push_issue(project_name, rel, VerifyIssueKind::ReadError);
+        Err(_) => {
+            reporter.error(&format!("  缺失: {}", rel));
+            report.push_issue(project_name, rel, VerifyIssueKind::Missing);
             return;
         }
     };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        reporter.error(&format!(
+            "  已被替换为链接、非当初备份的真实文件(不跟随): {}",
+            rel
+        ));
+        report.push_issue(project_name, rel, VerifyIssueKind::Corrupt);
+        return;
+    }
+    if !ft.is_file() {
+        reporter.error(&format!("  缺失(该路径已不是普通文件): {}", rel));
+        report.push_issue(project_name, rel, VerifyIssueKind::Missing);
+        return;
+    }
     // 既无 Size 也无 Hash → 无任何可校验属性 → fail-closed。(Phase 4 F-01/F-6)
     // 注意条件是「两者皆缺」:no_hash 归档模式(有 Size、Hash="")**不**触发 Unverifiable,
     // 因为还能靠 Size 精确比对(下面 if let Some(sz) 分支),不算不可校验。(V-04)
@@ -366,6 +397,22 @@ fn check_one_file(
                 report.push_issue(project_name, rel, VerifyIssueKind::ReadError);
             }
         }
+    } else {
+        // 走到这里:Size 校验已通过(或无 Size 但有……不可能,因上面 fail-closed 已拦两者皆缺),
+        // 但 Hash 为空 → 本文件**只做了大小校验、未验证内容**。计数以便整盘结论不笼统标「完好」。(review-r3 round4)
+        report.size_only += 1;
+    }
+}
+
+/// extras 比对用的归一化 key。Windows 文件系统大小写不敏感:折叠大小写,避免
+/// 「清单登记 A.txt、磁盘实为 a.txt」时同一文件既被 check_one_file 校验通过、
+/// 又被 report_extras 误报为多余的自相矛盾。非 Windows(大小写敏感)保持原样,
+/// 以免把本应区分的 A.txt / a.txt 误并。(review-r3)
+fn extras_key(rel: &str) -> String {
+    if cfg!(windows) {
+        rel.to_lowercase()
+    } else {
+        rel.to_string()
     }
 }
 
@@ -392,7 +439,24 @@ fn report_extras(
                 continue;
             }
         };
-        if !entry.file_type().is_file() {
+        let ft = entry.file_type();
+        if ft.is_symlink() {
+            // 与归档侧一致:不跟随链接;但不静默 —— 备份盘里出现链接值得提示。登记文件被替换成链接的情形
+            // 已由 check_one_file 报损坏,此处只对**清单外**的链接告警,避免与之重复。(review-r3 round3)
+            let rel = entry
+                .path()
+                .strip_prefix(proj_dir)
+                .map(|p| p.to_string_lossy().replace('/', "\\"))
+                .unwrap_or_default();
+            if !expected.contains(&extras_key(&rel)) {
+                reporter.warn(&format!(
+                    "  发现符号链接/junction(不跟随、未纳入校验): {}",
+                    rel
+                ));
+            }
+            continue;
+        }
+        if !ft.is_file() {
             continue;
         }
         let rel = entry
@@ -400,7 +464,7 @@ fn report_extras(
             .strip_prefix(proj_dir)
             .map(|p| p.to_string_lossy().replace('/', "\\"))
             .unwrap_or_default();
-        if !expected.contains(&rel) {
+        if !expected.contains(&extras_key(&rel)) {
             reporter.warn(&format!("  多余(清单外): {}", rel));
             report.push_extra(project_name, &rel);
         }
@@ -409,7 +473,10 @@ fn report_extras(
 
 /// 读清单为 (Rel, Size?, Hash) 行;跳过 cruft 段;缺 Rel 列/读失败 → Err(由调用方决定跳过还是报错)。
 /// size 为 Option:列缺失/不可解析 = 未知(不校验大小);存在(含 0)就精确比对。(ledger L-013)
-fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>> {
+fn read_manifest_rows(
+    path: &Path,
+    reporter: &dyn Reporter,
+) -> Result<Vec<(String, Option<u64>, String)>> {
     let mut rdr = csv::Reader::from_path(path)
         .with_context(|| format!("读校验清单失败：{}", path.display()))?;
     let headers = rdr
@@ -440,7 +507,19 @@ fn read_manifest_rows(path: &Path) -> Result<Vec<(String, Option<u64>, String)>>
             .and_then(|c| rec.get(c))
             .and_then(|s| s.parse::<u64>().ok());
         let hash = i_hash.and_then(|c| rec.get(c)).unwrap_or("").to_string();
-        out.push((rel, size, hash));
+        // 归一化分隔符为 `\`,与 report_extras 产出的 rel 及 check_one_file 的 join 口径一致;
+        // 否则正斜杠清单(旧版/外部工具写的 "sub/a.txt")会让已登记且已校验的文件被
+        // report_extras 误报为「清单外多余」。本工具自写清单已是 `\`,此处只兜底外来清单。(review-r3)
+        out.push((rel.replace('/', "\\"), size, hash));
+    }
+    // 出现「无哈希」条目就告警(覆盖三种来源:缺 Hash 列 / no_hash 归档写出的空单元格 / 外部裁空)。
+    // 旧实现只在「整列缺失(i_hash.is_none())」时 warn,漏掉了本工具 --unsafe-no-hash 自产清单
+    // (Hash 列在、单元格全空)这一最常见情形 → 那种情况下整盘 size-only 校验却零提示。(review-r3 round4)
+    if out.iter().any(|(_, _, h)| h.is_empty()) {
+        reporter.warn(&format!(
+            "清单有未含哈希的条目,这些文件仅按大小校验、无法检测等长内容篡改:{}",
+            path.display()
+        ));
     }
     Ok(out)
 }
@@ -660,6 +739,23 @@ mod tests {
         assert_eq!(r.bad, 0, "真实 0 字节文件应通过");
     }
 
+    // ── review-r3 round4:无哈希(no_hash 归档 / 缺 Hash 列 / 单元格被裁空)的行只做大小校验,
+    // 计入 size_only,不报损坏,但整盘结论不应笼统当「完好」(由 size_only>0 体现)──
+    #[test]
+    fn verify_tree_counts_size_only_when_hash_empty() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        // Hash 字段为空(模拟 --unsafe-no-hash 自产清单 / 被裁空单元格),Size 仍在。
+        let (mdir, pdir) = setup(d.path(), &[("a.txt", 5, "")], &[("a.txt", content)]);
+        let r = verify_tree(&mdir, &pdir, &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "大小一致、无哈希 → 不报损坏");
+        assert_eq!(r.checked, 1);
+        assert_eq!(
+            r.size_only, 1,
+            "无哈希行应计入 size_only(仅大小校验、未验证内容)"
+        );
+    }
+
     // ── Phase 4 F-01/F-6: 清单缺 Size 且缺 Hash → fail-closed ──
     #[test]
     fn verify_tree_unverifiable_row_is_bad() {
@@ -793,6 +889,70 @@ mod tests {
         assert_eq!(r.extra, 1);
     }
 
+    // ── review-r3 #5:正斜杠清单(旧版/外部工具)不得把已登记文件误报为「清单外多余」──
+    #[cfg(windows)]
+    #[test]
+    fn verify_tree_forward_slash_manifest_no_false_extra() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        // 清单 Rel 用正斜杠 "sub/a.txt";文件铺在 sub\a.txt(同一文件)。
+        let (mdir, pdir) = setup(
+            d.path(),
+            &[("sub/a.txt", 5, &sha_of(content))],
+            &[("sub\\a.txt", content)],
+        );
+        let r = verify_tree(&mdir, &pdir, &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "正斜杠清单项应被正确校验(分隔符归一化)");
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.extra, 0, "已登记的正斜杠文件不得被误报为多余");
+    }
+
+    // ── review-r3 #6:Windows 大小写不敏感 —— 清单与磁盘大小写不同的同一文件不得误报多余 ──
+    #[cfg(windows)]
+    #[test]
+    fn verify_tree_case_insensitive_no_false_extra() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        // 清单登记 "A.txt",磁盘实际 "a.txt"(同一文件,Windows 大小写折叠)。
+        let (mdir, pdir) = setup(
+            d.path(),
+            &[("A.txt", 5, &sha_of(content))],
+            &[("a.txt", content)],
+        );
+        let r = verify_tree(&mdir, &pdir, &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "大小写不同的同一文件应被校验通过");
+        assert_eq!(r.extra, 0, "同一文件不得既校验通过又被报多余(大小写折叠)");
+    }
+
+    // ── review-r3 round3:登记文件事后被替换成符号链接(指向外部同内容文件)→ 不跟随、判 bad,
+    // 而非顺链接读目标判「完好」(与归档侧 follow_links=false 对齐)──
+    #[test]
+    fn verify_tree_flags_listed_file_replaced_by_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        // 清单登记 a.txt,但**不**铺真实文件,改为放一个指向外部同内容文件的链接。
+        let (mdir, pdir) = setup(d.path(), &[("a.txt", 5, &sha_of(content))], &[]);
+        let target = d.path().join("outside.txt");
+        std::fs::write(&target, content).unwrap();
+        let link = pdir.join("proj").join("a.txt");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+        if !made {
+            eprintln!(
+                "跳过 verify_tree_flags_listed_file_replaced_by_symlink:本环境无法创建符号链接"
+            );
+            return;
+        }
+        let r = verify_tree(&mdir, &pdir, &abool(), &NoopReporter).unwrap();
+        assert!(
+            r.bad >= 1,
+            "登记文件被替换成链接应判 bad(不跟随链接读目标判完好)"
+        );
+        assert!(r.has_corruption(), "链接替换应计为完整性问题");
+    }
+
     // ── Spec D §4.1 Finding #3: issue 带项目上下文 + kind ──
     #[test]
     fn verify_tree_issue_carries_project_and_kind() {
@@ -883,6 +1043,30 @@ mod tests {
         assert_eq!(r.bad, 1);
         assert_eq!(r.issues[0].kind, VerifyIssueKind::Corrupt);
         assert_eq!(r.issues[0].rel, "a.txt");
+    }
+
+    // ── review-r3 round5:单文件抽查对大小写漂移(清单 A.txt / 磁盘 a.txt)应命中清单并重算 SHA256,
+    // 而非误报「清单外多余」(与 verify_tree 的 extras_key 同口径)──
+    #[cfg(windows)]
+    #[test]
+    fn verify_one_single_file_case_insensitive() {
+        let d = tempfile::tempdir().unwrap();
+        let content = b"hello";
+        // 清单登记 A.txt,磁盘实为 a.txt(同一文件)。
+        setup_drive(
+            d.path(),
+            &[("A.txt", 5, &sha_of(content))],
+            &[("a.txt", content)],
+        );
+        let target = d
+            .path()
+            .join(paths::DRIVE_PROJECTS_DIR)
+            .join("proj")
+            .join("a.txt");
+        let r = verify_one(&Config::default(), &NoopReporter, &target, &abool()).unwrap();
+        assert_eq!(r.checked, 1, "应命中清单并重算 SHA256(而非误报多余)");
+        assert_eq!(r.bad, 0, "内容一致应通过");
+        assert_eq!(r.extra, 0, "大小写漂移的同一文件不得被报『清单外多余』");
     }
 
     // ── 单目标复查:清单外的文件 → extra,不算损坏 ──

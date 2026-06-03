@@ -438,6 +438,14 @@ impl eframe::App for App {
             View::Verify => crate::views::verify::ui(self, ui),
             View::Settings => crate::views::settings::ui(self, ui),
         });
+
+        // review-r3 #4:帧末兜底重绘。后台任务是在上面 CentralPanel 的 view ui() 里(按钮点击时)spawn 的,
+        // 而 pump() 在本帧更早已跑过 —— 启动任务那一帧 pump 看到的还是 None,不会进入维持每帧刷新的
+        // Some(false) 分支,本帧结束时没有任何重绘被排程。这里只要有任务在跑就无条件补一次 request_repaint,
+        // 确保进度动画与完成检测不再依赖 egui 处理输入后的隐式补帧(用户点完即停手、无后续输入时也能自愈)。
+        if self.is_busy() {
+            ctx.request_repaint();
+        }
     }
 }
 

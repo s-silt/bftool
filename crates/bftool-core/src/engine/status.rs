@@ -36,18 +36,31 @@ pub struct StatusReport {
 /// 单块盘的损坏复查记录不应让 `?` 拖垮整个状态收集 —— 否则无参 `bftool` 直接报错、
 /// GUI 仪表盘整屏失效,而待归档数 / 事务残留 / 其余盘本与这条损坏记录无关。
 /// 恢复路径:对该盘重跑 `bftool verify` 会重写记录。(review-r2 #5)
+/// 但读失败不再静默吞:经 reporter 区分「损坏(Err→warn)」与「从未复查(Ok(None),静默)」,
+/// 让 CLI 用户看到「记录损坏」而非误以为「从未复查」。GUI 传 NoopReporter 避免每次刷新刷屏。(review-r3 round4)
 fn tolerant_last_verify(
     system_root: &std::path::Path,
     drive_id: &str,
+    reporter: &dyn Reporter,
 ) -> Option<verify_state::LastVerify> {
-    verify_state::read_last_verify(system_root, drive_id).unwrap_or(None)
+    match verify_state::read_last_verify(system_root, drive_id) {
+        Ok(v) => v,
+        Err(e) => {
+            reporter.warn(&format!(
+                "盘「{}」的复查记录读取失败、已按『未知』显示(可能损坏);请对该盘重跑 verify:{:#}",
+                drive_id, e
+            ));
+            None
+        }
+    }
 }
 
 /// 收集状态(扫描在线盘 + 各盘最近复查 + 待归档数 + 事务残留)。
-pub fn gather(cfg: &Config) -> Result<StatusReport> {
+/// `reporter`:用于在某盘复查记录损坏时发 warn(CLI 传真 reporter;GUI 传 NoopReporter 防刷屏)。
+pub fn gather(cfg: &Config, reporter: &dyn Reporter) -> Result<StatusReport> {
     let mut drives = Vec::new();
-    for d in drive::scan_mounted()? {
-        let last_verify = tolerant_last_verify(&cfg.system_root, &d.id);
+    for d in drive::scan_mounted(None)? {
+        let last_verify = tolerant_last_verify(&cfg.system_root, &d.id, reporter);
         drives.push(DriveStatus {
             drive: d,
             last_verify,
@@ -66,9 +79,10 @@ pub fn gather(cfg: &Config) -> Result<StatusReport> {
     })
 }
 
-/// `_reporter` 暂未使用:状态面板是多行整屏渲染,CLI 直接 println(GUI 走 gather)。
-pub fn run(cfg: &Config, _reporter: &dyn Reporter) -> Result<()> {
-    let s = gather(cfg)?;
+/// 状态面板是多行整屏渲染,CLI 直接 println(GUI 走 gather)。reporter 传给 gather 用于
+/// 复查记录损坏时的 warn。
+pub fn run(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
+    let s = gather(cfg, reporter)?;
     println!("==================== 归档备份工具 (bftool) ====================");
     println!("  待备份(源)  : {}", display_root(&s.ready_root));
     println!("  已备份      : {}", display_root(&s.archived_root));
@@ -189,12 +203,16 @@ mod tests {
             system_root: sys.clone(),
             ..Config::default()
         };
-        let s = gather(&cfg).unwrap();
+        let s = gather(&cfg, &crate::reporter::NoopReporter).unwrap();
         assert_eq!(s.pending_count, 2);
         assert!(!s.txn_pending);
         // 造一个事务残留
         std::fs::write(paths::system_pending_txn(&sys), "x").unwrap();
-        assert!(gather(&cfg).unwrap().txn_pending);
+        assert!(
+            gather(&cfg, &crate::reporter::NoopReporter)
+                .unwrap()
+                .txn_pending
+        );
     }
 
     // ── review-r2 R3-5:ready_root 是文件(非目录)时 count_subdirs 返回 0,不 Err 拖垮 gather ──
@@ -222,7 +240,39 @@ mod tests {
             verify_state::read_last_verify(&sys, "备份1").is_err(),
             "前提:损坏日志确实让 read_last_verify 失败"
         );
-        // 容错包装退化为 None(=未知),不 panic、不 Err,不拖垮整个 gather。
-        assert!(tolerant_last_verify(&sys, "备份1").is_none());
+        // 容错包装退化为 None(=未知),不 panic、不 Err、不拖垮整个 gather;
+        // 但**不再静默**:经 reporter 发 warn,让损坏记录可被区分于『从未复查』。(review-r3 round4)
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        assert!(tolerant_last_verify(&sys, "备份1", &rep).is_none());
+        assert!(
+            rep.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.contains("复查记录读取失败")),
+            "损坏复查日志应发 warn(不静默吞),实际:{:?}",
+            rep.0.lock().unwrap()
+        );
+    }
+
+    /// 记录型 Reporter:只收集 warn,用于断言「不静默」。
+    struct RecReporter(std::sync::Mutex<Vec<String>>);
+    impl Reporter for RecReporter {
+        fn log(&self, _level: crate::reporter::LogLevel, _msg: &str) {}
+        fn warn(&self, msg: &str) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
+        fn progress_bytes(
+            &self,
+            _label: &str,
+            _total: u64,
+        ) -> Box<dyn crate::reporter::ProgressHandle> {
+            Box::new(NoopProg)
+        }
+    }
+    struct NoopProg;
+    impl crate::reporter::ProgressHandle for NoopProg {
+        fn inc(&mut self, _delta: u64) {}
+        fn finish(&mut self) {}
     }
 }

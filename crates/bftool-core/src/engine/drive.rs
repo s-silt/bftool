@@ -79,7 +79,7 @@ impl WritableDrive {
 }
 
 pub fn list_mounted(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
-    let drives = scan_mounted()?;
+    let drives = scan_mounted(Some(reporter))?;
     if drives.is_empty() {
         reporter.warn("未发现已初始化的备份盘。");
         reporter.info("插入一块空盘后，运行：bftool init <盘符> 把它初始化为下一个「备份N」。");
@@ -105,8 +105,22 @@ pub fn list_mounted(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     Ok(())
 }
 
+/// 探测某盘是否已封盘。`Path::is_file()` 在 stat 失败(权限拒绝/瞬时锁/FS 错误)时返回 false,
+/// 会把「封盘标记其实存在但此刻 stat 不到」误判为未封盘 → 该盘可能被 pick_active 重新选为可写盘、
+/// 误写已封盘的冷备盘。改为区分 NotFound(确认无标记=未封盘)与其它错误(封盘态未知 → fail-closed
+/// 当作已封盘),与本文件 read_to_string 失败的处理一致,绝不误写已封盘盘。(review-r3 round4)
+pub fn drive_is_sealed(root: &Path) -> bool {
+    match fs::symlink_metadata(paths::drive_sealed_path(root)) {
+        Ok(_) => true,                                               // 标记存在 → 已封盘
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false, // 确认无标记 → 未封盘
+        Err(_) => true, // 读不出(权限/锁/FS 错误)→ 封盘态未知,保守当已封盘,绝不误写
+    }
+}
+
 /// 扫描所有已挂载、被识别为备份盘的卷。
-pub fn scan_mounted() -> Result<Vec<DriveInfo>> {
+/// `reporter`:Some 时,对「看起来是备份盘(有 本盘编号.txt)但编号读失败或为空」的卷发出 warn,
+/// 而非静默跳过(io 错误不得被静默吞掉);只读/内部场景传 None 避免刷屏。(review-r3 #8/#9)
+pub fn scan_mounted(reporter: Option<&dyn Reporter>) -> Result<Vec<DriveInfo>> {
     let mut out = Vec::new();
     let disks = sysinfo::Disks::new_with_refreshed_list();
     for d in disks.list() {
@@ -119,15 +133,39 @@ pub fn scan_mounted() -> Result<Vec<DriveInfo>> {
         if !id_file.is_file() {
             continue;
         }
+        // 已确认 本盘编号.txt 存在却读不出 → 不静默跳过:这块盘看起来是备份盘,读失败
+        // (权限/瞬时 IO/被占用)应可见,否则编号分配与多盘安全闸都在"看不全所有盘"的前提下工作。
+        // 仍 skip(不 fail-closed,以免一块无关盘的瞬时锁拖垮整次扫描/列盘/选盘)。(review-r3 #8)
         let id = match fs::read_to_string(&id_file) {
             Ok(s) => s.trim().to_string(),
-            Err(_) => continue,
+            Err(e) => {
+                if let Some(r) = reporter {
+                    r.warn(&format!(
+                        "跳过盘 {}:(看起来是备份盘但读取 {} 失败:{})—— 编号/容量信息可能不全,请检查该盘。",
+                        letter,
+                        id_file.display(),
+                        e
+                    ));
+                }
+                continue;
+            }
         };
+        // 空/全空白编号 = 损坏或未初始化:与 resolve_drive_id 的 .filter(|s| !s.is_empty()) 一致,
+        // 不放行为合法备份盘,否则它会被 pick_active 选为可写盘、把空编号写进索引污染盘身份。(review-r3 #9)
+        if id.is_empty() {
+            if let Some(r) = reporter {
+                r.warn(&format!(
+                    "跳过盘 {}:(本盘编号文件为空,疑似损坏)—— 请重新 init 该盘。",
+                    letter
+                ));
+            }
+            continue;
+        }
         out.push(DriveInfo {
             letter,
             root: root.clone(),
             id,
-            sealed: paths::drive_sealed_path(&root).is_file(),
+            sealed: drive_is_sealed(&root),
             free_bytes: d.available_space(),
             total_bytes: d.total_space(),
         });
@@ -155,14 +193,22 @@ fn usable_drives(all: Vec<DriveInfo>, min_drive_gb: u64) -> (Vec<DriveInfo>, Vec
 /// `run_plan` 在执行前用它复验「单盘不变式」——`pick_active` 的多盘检查只在 `plan()` 跑过一次，
 /// 预览→执行之间若插入第二块可写盘，需在这里重新拦下，否则单盘安全闸被绕过。(SEC-007)
 pub fn usable_drives_now(min_drive_gb: u64) -> Result<Vec<DriveInfo>> {
-    let (usable, _too_small) = usable_drives(scan_mounted()?, min_drive_gb);
+    let (usable, _too_small) = usable_drives(scan_mounted(None)?, min_drive_gb);
     Ok(usable)
 }
 
 /// 返回唯一一块未封盘且容量达标的备份盘；多块返回错误；零块返回 None。
 /// 容量过滤(min_drive_gb)是防误抓 U 盘/SD 卡的安全闸。(ledger L-006)
 pub fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
-    let (usable, too_small) = usable_drives(scan_mounted()?, min_drive_gb);
+    // min_drive_gb=0 会使容量闸 total_bytes >= 0 恒真 → 禁用『防误抓 U 盘/SD 卡』安全闸。
+    // 在选盘这步(消费该闸、且有 reporter)显式提醒,不让安全闸被静默关闭。(review-r3 round2)
+    if min_drive_gb == 0 {
+        reporter.warn(
+            "min_drive_gb=0 已禁用『防误抓 U 盘/SD 卡』的最小容量闸 —— 任何未封盘的已初始化盘\
+             (含小容量介质)都可能被选为可写备份盘。如非有意,请把配置 min_drive_gb 调回正值(默认 200)。",
+        );
+    }
+    let (usable, too_small) = usable_drives(scan_mounted(Some(reporter))?, min_drive_gb);
     for d in &too_small {
         reporter.warn(&format!(
             "忽略疑似过小的盘 {} ({}:) {:.0}GB(低于最小 {}GB)—— 防误抓 U 盘/SD 卡。\
@@ -243,7 +289,13 @@ pub fn init(
         }
     }
 
-    let id = resolve_drive_id(&root, id, force, cfg)?;
+    // 并发 init 两块新盘会因 next_drive_number(读 seq/全局索引/挂载盘)+ bump_drive_seq(写回)非原子
+    // 而分到相同「备份N」→ 盘身份碰撞、find/恢复歧义。用与 archive 同一把系统级跨进程锁,把
+    // 「定号 → 写本盘编号 → bump seq」串成临界区,消除分号碰撞;与正在跑的归档也互斥。(review-r3 round4)
+    fs::create_dir_all(&cfg.system_root).ok(); // 锁文件在 system_root,先确保其存在
+    let _sys_lock = crate::engine::archive::ArchiveLock::acquire(&cfg.system_root)?;
+
+    let id = resolve_drive_id(&root, id, force, cfg, reporter)?;
 
     // 写盘内目录
     let info = paths::drive_info_dir(&root);
@@ -257,19 +309,37 @@ pub fn init(
 
     // 序号文件追踪：保证下次取下一块的时候编号单调递增
     if let Some(n) = parse_drive_number(&cfg.name_prefix, &id) {
-        bump_drive_seq(cfg, n)?;
+        bump_drive_seq(cfg, n, reporter)?;
     }
 
     // re-init = 当作新盘用:若残留封盘标记,清除它。否则盘虽被重新初始化、提示"可以 archive",
     // 但封盘标记仍在 → pick_active/try_into_writable 仍判其为已封盘而拒写,提示与实际矛盾。(EH-005)
+    // 清除的**存在性判据**必须与 drive_is_sealed 同源(symlink_metadata):若用 is_file(),标记是
+    // 非普通文件(或 stat 受限)时不清除,而 drive_is_sealed 仍判已封盘 → init 报「可写新盘」、archive
+    // 却判封盘拒写的矛盾态。stat 失败(非 NotFound)时无法安全清除 → fail-closed 上报,而非静默放过。(review-r3 round5)
     let sealed_marker = paths::drive_sealed_path(&root);
-    if sealed_marker.is_file() {
-        fs::remove_file(&sealed_marker)
-            .with_context(|| format!("清除封盘标记失败：{}", sealed_marker.display()))?;
-        reporter.info(&format!(
-            "已清除 {}: 的封盘标记(重新初始化 = 当作可写新盘)。",
-            letter
-        ));
+    match fs::symlink_metadata(&sealed_marker) {
+        Ok(meta) => {
+            let res = if meta.is_dir() {
+                fs::remove_dir_all(&sealed_marker)
+            } else {
+                fs::remove_file(&sealed_marker)
+            };
+            res.with_context(|| format!("清除封盘标记失败：{}", sealed_marker.display()))?;
+            reporter.info(&format!(
+                "已清除 {}: 的封盘标记(重新初始化 = 当作可写新盘)。",
+                letter
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // 无封盘标记,无需清除
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "检查封盘标记失败,无法确认是否需清除(为避免 init 报可写而 archive 仍判封盘的矛盾态已停止):{}",
+                    sealed_marker.display()
+                )
+            });
+        }
     }
 
     reporter.ok(&format!("已初始化备份盘 {} ({}:)", id, letter));
@@ -313,7 +383,13 @@ fn classify_for_init(cfg: &Config, letter: &str, root: &Path) -> Result<InitClas
 /// 决定本盘编号。R5-3:已是备份盘(盘上有 本盘编号.txt)时 **不指定 --id 必须复用现有编号、
 /// 绝不分配新号** —— 否则重初始化会静默改掉盘身份,让盘上已索引数据与新号脱节、find/恢复指向错误。
 /// 显式 --id 改成与现有不同的号(非 --force)直接拒绝;--force 才允许强改。
-fn resolve_drive_id(root: &Path, id: Option<&str>, force: bool, cfg: &Config) -> Result<String> {
+fn resolve_drive_id(
+    root: &Path,
+    id: Option<&str>,
+    force: bool,
+    cfg: &Config,
+    reporter: &dyn Reporter,
+) -> Result<String> {
     let existing_id = fs::read_to_string(paths::drive_id_path(root))
         .ok()
         .map(|s| s.trim().to_string())
@@ -336,7 +412,11 @@ fn resolve_drive_id(root: &Path, id: Option<&str>, force: bool, cfg: &Config) ->
         // 未指定 --id:已是备份盘 → 复用现有编号;全新盘 → 取下一个「备份N」。
         _ => match existing_id {
             Some(ex) => Ok(ex),
-            None => Ok(format!("{}{}", cfg.name_prefix, next_drive_number(cfg)?)),
+            None => Ok(format!(
+                "{}{}",
+                cfg.name_prefix,
+                next_drive_number(cfg, reporter)?
+            )),
         },
     }
 }
@@ -433,13 +513,29 @@ fn next_number(found: &[u32]) -> u32 {
 }
 
 /// 计算下一个可用「备份N」编号 = max(序号文件, 全局索引里出现过的「备份N」, 当前挂载盘里的「备份N」) + 1
-fn next_drive_number(cfg: &Config) -> Result<u32> {
+fn next_drive_number(cfg: &Config, reporter: &dyn Reporter) -> Result<u32> {
     let mut found: Vec<u32> = Vec::new();
     let seq_file = paths::system_drive_seq(&cfg.system_root);
-    if let Ok(text) = fs::read_to_string(&seq_file) {
-        if let Ok(n) = text.trim().parse::<u32>() {
-            found.push(n);
-        }
+    // 盘号计数文件(seq)是「编号单调不碰撞」的唯一持久兜底(一块已 init 但从未 archive、且此刻
+    // 离线的盘,只有它还记得编号)。区分两种读失败:文件不存在 = 全新系统首盘,正常静默;但
+    // 「存在却内容损坏/读不出」必须可见,否则在唯一兜底失效时仍乐观分配可能重号 ——
+    // 与下方全局索引读损坏即 bail 的处理对齐。(review-r3 round2)
+    match fs::read_to_string(&seq_file) {
+        Ok(text) => match text.trim().parse::<u32>() {
+            Ok(n) => found.push(n),
+            Err(_) => reporter.warn(&format!(
+                "盘号计数文件内容损坏(非数字「{}」),无法据此保证「备份N」编号单调不碰撞,\
+                 请人工核对当前最大编号后修复:{}",
+                text.trim(),
+                seq_file.display()
+            )),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // 全新系统首盘:正常
+        Err(e) => reporter.warn(&format!(
+            "读取盘号计数文件失败({}),无法据此保证「备份N」编号单调不碰撞:{}",
+            e,
+            seq_file.display()
+        )),
     }
     let gc = paths::system_global_catalog(&cfg.system_root);
     if gc.is_file() {
@@ -463,7 +559,9 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
             }
         }
     }
-    for d in scan_mounted()? {
+    // 编号分配路径不得在「看不全所有盘」的前提下静默工作:传 Some(reporter),让有 本盘编号.txt
+    // 却读不出的在线盘至少发 warn(配合 seq 兜底,降低重号风险)。(review-r3 round2)
+    for d in scan_mounted(Some(reporter))? {
         if let Some(n) = parse_drive_number(&cfg.name_prefix, &d.id) {
             found.push(n);
         }
@@ -471,17 +569,38 @@ fn next_drive_number(cfg: &Config) -> Result<u32> {
     Ok(next_number(&found))
 }
 
-fn bump_drive_seq(cfg: &Config, n: u32) -> Result<()> {
+fn bump_drive_seq(cfg: &Config, n: u32, reporter: &dyn Reporter) -> Result<()> {
     let seq_file = paths::system_drive_seq(&cfg.system_root);
     if let Some(parent) = seq_file.parent() {
         fs::create_dir_all(parent).ok();
     }
-    let cur = fs::read_to_string(&seq_file)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    if n > cur {
-        durable::write_synced(&seq_file, n.to_string().as_bytes())?; // 原子写,断电不留半截序号(review-r2 R4-4)
+    // 盘号计数器单调不回退。区分读失败种类:NotFound = 全新系统首盘,正常写入 n;但「文件存在却读不出/
+    // 内容损坏」绝不能当 cur=0 —— 那会让 n>0 成立、把磁盘上更大的旧值覆写成较小的 n,造成计数器回退、
+    // 后续给新盘自动选号时与离线旧盘重号。读不出时保守跳过本次 bump(保留磁盘上更大的旧值)并 warn,
+    // 与 next_drive_number 的 seq 读取处理对齐。(review-r3 round3)
+    match fs::read_to_string(&seq_file) {
+        Ok(text) => match text.trim().parse::<u32>() {
+            Ok(cur) => {
+                if n > cur {
+                    durable::write_synced(&seq_file, n.to_string().as_bytes())?;
+                    // 原子写(review-r2 R4-4)
+                }
+            }
+            Err(_) => reporter.warn(&format!(
+                "盘号计数文件内容损坏(非数字「{}」),跳过本次更新以免把计数器写小导致后续重号;\
+                 请人工核对当前最大编号后修复:{}",
+                text.trim(),
+                seq_file.display()
+            )),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            durable::write_synced(&seq_file, n.to_string().as_bytes())?; // 全新系统首盘:正常写入
+        }
+        Err(e) => reporter.warn(&format!(
+            "读取盘号计数文件失败({}),跳过本次更新以免把计数器写小导致后续重号:{}",
+            e,
+            seq_file.display()
+        )),
     }
     Ok(())
 }
@@ -563,7 +682,19 @@ pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
         })?
         .trim()
         .to_string();
-    // 容量信息：从 sysinfo 兜底；失败则填 0
+    // 空/全空白编号 = 损坏或未初始化:与 scan_mounted/resolve_drive_id 的判定一致,拒绝当作
+    // 合法备份盘,否则空 id 会被 archive 写进本盘/全局索引污染盘身份、find/恢复无法定位。(review-r3 #9)
+    if id.is_empty() {
+        bail!(
+            "{}: 本盘编号文件为空,疑似损坏,请重新 init 该盘（{}）",
+            letter,
+            id_file.display()
+        );
+    }
+    // 容量信息来自 sysinfo。若该盘符未被枚举到(例如卷以 GUID 路径挂载、或枚举时机差异),
+    // 旧实现 free/total 停留在 0 → 下游把任何非空项目误判「超过单盘容量」或整盘 TooSmall,
+    // 静默拒绝一块其实可写的盘。改为 fail-closed:容量读不到就明确报错,而非伪装成 0 容量盘。(review-r3 #10)
+    let mut found = false;
     let mut free = 0;
     let mut total = 0;
     let disks = sysinfo::Disks::new_with_refreshed_list();
@@ -572,15 +703,23 @@ pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
             if l == letter {
                 free = d.available_space();
                 total = d.total_space();
+                found = true;
                 break;
             }
         }
+    }
+    if !found {
+        bail!(
+            "{}: 无法读取该盘容量信息(未被系统磁盘列表枚举到)—— 无法安全判定是否够放。\
+             请确认盘符正确、盘在线;若该盘以卷 GUID 方式挂载,请改用普通盘符 X:\\。",
+            letter
+        );
     }
     Ok(DriveInfo {
         letter,
         root: root.clone(),
         id,
-        sealed: paths::drive_sealed_path(&root).is_file(),
+        sealed: drive_is_sealed(&root),
         free_bytes: free,
         total_bytes: total,
     })
@@ -589,6 +728,7 @@ pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reporter::NoopReporter;
 
     fn di(letter: &str, total_gb: u64, sealed: bool) -> DriveInfo {
         let bytes = total_gb * 1024 * 1024 * 1024;
@@ -615,17 +755,20 @@ mod tests {
         std::fs::create_dir_all(paths::drive_info_dir(&root)).unwrap();
         std::fs::write(paths::drive_id_path(&root), "备份3").unwrap();
         // 不指定 --id → 复用现有「备份3」,不分配新号
-        assert_eq!(resolve_drive_id(&root, None, false, &cfg).unwrap(), "备份3");
+        assert_eq!(
+            resolve_drive_id(&root, None, false, &cfg, &NoopReporter).unwrap(),
+            "备份3"
+        );
         // 指定相同 --id → OK
         assert_eq!(
-            resolve_drive_id(&root, Some("备份3"), false, &cfg).unwrap(),
+            resolve_drive_id(&root, Some("备份3"), false, &cfg, &NoopReporter).unwrap(),
             "备份3"
         );
         // 指定不同 --id 且非 force → 拒绝改号
-        assert!(resolve_drive_id(&root, Some("备份9"), false, &cfg).is_err());
+        assert!(resolve_drive_id(&root, Some("备份9"), false, &cfg, &NoopReporter).is_err());
         // --force 可改号
         assert_eq!(
-            resolve_drive_id(&root, Some("备份9"), true, &cfg).unwrap(),
+            resolve_drive_id(&root, Some("备份9"), true, &cfg, &NoopReporter).unwrap(),
             "备份9"
         );
     }
@@ -766,8 +909,86 @@ mod tests {
         .unwrap();
 
         assert!(
-            next_drive_number(&cfg).is_err(),
+            next_drive_number(&cfg, &NoopReporter).is_err(),
             "bad global catalog must not be ignored when assigning the next drive id"
+        );
+    }
+
+    /// 记录型 Reporter:只收集 warn 文本,用于断言「不静默」。
+    struct RecReporter(std::sync::Mutex<Vec<String>>);
+    impl Reporter for RecReporter {
+        fn log(&self, _level: crate::reporter::LogLevel, _msg: &str) {}
+        fn warn(&self, msg: &str) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
+        fn progress_bytes(
+            &self,
+            _label: &str,
+            _total: u64,
+        ) -> Box<dyn crate::reporter::ProgressHandle> {
+            Box::new(NoopProg)
+        }
+    }
+    struct NoopProg;
+    impl crate::reporter::ProgressHandle for NoopProg {
+        fn inc(&mut self, _delta: u64) {}
+        fn finish(&mut self) {}
+    }
+
+    // ── review-r3 round2:盘号计数文件「存在但内容损坏」→ 发 warn(不再静默)且不 bail,仍能算出编号
+    // (区别于全局索引损坏的硬失败,也区别于文件不存在的正常静默)──
+    #[test]
+    fn next_drive_number_warns_on_corrupt_seq_not_silent() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            system_root: d.path().to_path_buf(),
+            ..Config::default()
+        };
+        let seq = paths::system_drive_seq(&cfg.system_root);
+        if let Some(p) = seq.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&seq, "garbage").unwrap(); // 损坏:非数字
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            next_drive_number(&cfg, &rep).is_ok(),
+            "损坏 seq 应 warn 跳过而非 bail(区别于全局索引损坏的硬失败)"
+        );
+        let logs = rep.0.lock().unwrap();
+        assert!(
+            logs.iter().any(|m| m.contains("盘号计数文件")),
+            "损坏 seq 必须发 warn(不静默),实际 warn:{:?}",
+            logs
+        );
+    }
+
+    // ── review-r3 round3:bump_drive_seq 遇损坏 seq 不得当 cur=0 把计数器写小(回退→重号)──
+    #[test]
+    fn bump_drive_seq_corrupt_does_not_shrink_counter() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            system_root: d.path().to_path_buf(),
+            ..Config::default()
+        };
+        let seq = paths::system_drive_seq(&cfg.system_root);
+        if let Some(p) = seq.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&seq, "garbage").unwrap(); // 损坏:不可解析(模拟读不出真实大值)
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        bump_drive_seq(&cfg, 3, &rep).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&seq).unwrap(),
+            "garbage",
+            "损坏 seq 不应被覆写成较小的 3(避免计数器回退)"
+        );
+        assert!(
+            rep.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.contains("盘号计数文件")),
+            "损坏 seq 的 bump 必须发 warn"
         );
     }
 

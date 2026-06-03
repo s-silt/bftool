@@ -23,7 +23,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             .map(|(_, t)| t.elapsed().as_millis() > CACHE_TTL_MS)
             .unwrap_or(true);
         if stale {
-            match status::gather(&app.cfg) {
+            // GUI 仪表盘每 1500ms 刷新一次:复查记录损坏的 warn 走 NoopReporter 丢弃,避免每次刷新刷屏。(review-r3 round4)
+            match status::gather(&app.cfg, &bftool_core::reporter::NoopReporter) {
                 Ok(r) => {
                     app.status_cache = Some((r.clone(), now));
                     Some(r)

@@ -69,7 +69,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     format!(
                         "{} 个索引来源读取失败已跳过：{}",
                         outcome.sources_failed.len(),
-                        outcome.sources_failed.join("、")
+                        find::render_failed_sources(&outcome.sources_failed)
                     ),
                 );
             }
@@ -139,9 +139,11 @@ fn run_search(app: &mut App) {
     app.find_ui.error = None;
     app.find_ui.result = None;
     let cfg = app.cfg.clone();
-    app.find_task = Some(BackgroundTask::spawn(move |_cancel| {
-        find::search(&cfg, &kw)
-    }));
+    app.find_task = Some(
+        BackgroundTask::spawn(move |_cancel| find::search(&cfg, &kw))
+            // 只读查询:关窗时 detach 而非 join,避免卡在慢速/掉线网络盘的大索引读上挂死 UI。(review-r3 round3)
+            .detachable(),
+    );
 }
 
 fn normalize_keyword(raw: &str) -> Result<String, String> {

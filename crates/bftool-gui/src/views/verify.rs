@@ -125,7 +125,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn rescan(app: &mut App) {
-    match drive::scan_mounted() {
+    match drive::scan_mounted(None) {
         Ok(ds) => app.verify_ui.drives = Some(ds),
         Err(e) => {
             app.verify_ui.drives = Some(Vec::new());
@@ -149,7 +149,13 @@ fn start_verify(app: &mut App) {
     let sel = app.verify_ui.selected.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
         let r = verify::run(&cfg, &reporter, sel.as_deref(), cancel)?;
-        Ok(verify_summary(r.checked, r.bad, r.extra, r.cancelled))
+        Ok(verify_summary(
+            r.checked,
+            r.bad,
+            r.extra,
+            r.size_only,
+            r.cancelled,
+        ))
     }));
 }
 
@@ -167,17 +173,33 @@ fn start_verify_one(app: &mut App, target: PathBuf) {
     let cfg = app.cfg.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
         let r = verify::verify_one(&cfg, &reporter, &target, cancel)?;
-        Ok(verify_summary(r.checked, r.bad, r.extra, r.cancelled))
+        Ok(verify_summary(
+            r.checked,
+            r.bad,
+            r.extra,
+            r.size_only,
+            r.cancelled,
+        ))
     }));
 }
 
 /// 复查摘要文案。纯函数,可测。
 /// 结论与 core `VerifyOutcome`/`outcome_label` 对齐:取消 > 损坏 > 多余 > 完好。
 /// extra-only(无损坏但有清单外多余文件)是**警示态**,不能标"完好"。(BF-VERIFY-SUMMARY-EXTRA)
-fn verify_summary(checked: u64, bad: u64, extra: u64, cancelled: bool) -> String {
+fn verify_summary(checked: u64, bad: u64, extra: u64, size_only: u64, cancelled: bool) -> String {
     let mut s = format!("检查 {} · 损坏/缺失 {} · 多余 {}", checked, bad, extra);
+    if size_only > 0 {
+        s.push_str(&format!(" · 仅大小校验 {}", size_only));
+    }
     if cancelled {
         s.push_str(" · 已取消");
+    } else if checked == 0 && bad == 0 && extra == 0 {
+        // 一项都没校验 ≠ 校验通过:空校验(该盘/项目尚无已归档内容、或清单为空)不能标「完好」,
+        // 否则把「什么都没查」呈现成「内容完整」。(review-r3 round4)
+        s.push_str(" · 无可校验项");
+    } else if bad == 0 && size_only > 0 {
+        // 有文件只校验了大小、未验证内容(清单无哈希)→ 不能笼统标「完好」。(review-r3 round4)
+        s.push_str(" · 仅大小校验(未验证内容)");
     } else if bad == 0 && extra == 0 {
         s.push_str(" · 完好");
     } else if bad == 0 {
@@ -192,19 +214,38 @@ mod tests {
 
     #[test]
     fn verify_summary_text() {
-        assert!(verify_summary(10, 0, 0, false).contains("完好"));
-        let s = verify_summary(10, 2, 1, false);
+        assert!(verify_summary(10, 0, 0, 0, false).contains("完好"));
+        let s = verify_summary(10, 2, 1, 0, false);
         assert!(s.contains("损坏/缺失 2"));
         assert!(s.contains("多余 1"));
         assert!(!s.contains("完好"), "有损坏不应显示完好");
-        assert!(verify_summary(5, 0, 0, true).contains("已取消"));
+        assert!(verify_summary(5, 0, 0, 0, true).contains("已取消"));
     }
 
     // ── BF-VERIFY-SUMMARY-EXTRA: extra-only(无损坏但有多余文件)不能标"完好" ──
     #[test]
     fn verify_summary_extra_only_is_not_clean() {
-        let s = verify_summary(10, 0, 3, false);
+        let s = verify_summary(10, 0, 3, 0, false);
         assert!(!s.contains("完好"), "有多余文件不应显示完好;实际:{s}");
         assert!(s.contains("有多余文件"), "应提示有多余文件;实际:{s}");
+    }
+
+    // ── review-r3 round4:检查 0 项不能标「完好」(空校验 ≠ 校验通过)──
+    #[test]
+    fn verify_summary_zero_checked_is_not_clean() {
+        let s = verify_summary(0, 0, 0, 0, false);
+        assert!(!s.contains("完好"), "0 项被检查不应显示完好;实际:{s}");
+        assert!(s.contains("无可校验项"), "应给中性提示;实际:{s}");
+    }
+
+    // ── review-r3 round4:有「仅大小校验(无哈希)」文件时不能标「完好」,须提示未验证内容 ──
+    #[test]
+    fn verify_summary_size_only_is_not_clean() {
+        let s = verify_summary(10, 0, 0, 4, false);
+        assert!(
+            !s.contains("· 完好"),
+            "含未验证内容的文件不应标完好;实际:{s}"
+        );
+        assert!(s.contains("仅大小校验"), "应提示仅大小校验;实际:{s}");
     }
 }

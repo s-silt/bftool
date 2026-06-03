@@ -19,29 +19,69 @@ pub fn check_paths(
     let a = canon(archived);
     let s = canon(system);
 
-    if eq_ci(&r, &a) {
-        bail!("待备份 与 已备份 不能是同一目录（{}）。", r.display());
+    // 已知局限(review-r3 round4):根目录本身是 junction/symlink 时,canon 的 canonicalize 会跟随它,
+    // is_inside/qualifier 基于解析后路径,对链接重定向的嵌套/同卷判定保护有限。这里只在加载阶段对
+    // 「根目录本身是 reparse point」发显式提醒,让该已知局限对用户可见(不改判定逻辑本身)。
+    for (name, p) in [
+        ("待备份", ready),
+        ("已备份", archived),
+        ("备份系统", system),
+    ] {
+        if let Ok(meta) = std::fs::symlink_metadata(p) {
+            if meta.file_type().is_symlink() {
+                warnings.push(format!(
+                    "提醒:{}({}) 本身是符号链接/junction —— 路径关系与同卷安全判定对链接重定向的保护有限,建议改用真实目录。",
+                    name,
+                    p.display()
+                ));
+            }
+        }
     }
-    if is_inside(&a, &r) {
-        bail!(
-            "已备份({}) 不能位于 待备份({}) 之内，否则会被当作待归档项目处理。",
-            a.display(),
-            r.display()
-        );
+
+    // 三个根目录两两之间既不能相等、也不能互相嵌套(任一方向)。
+    // 旧实现只查了 ready==archived、a/s 嵌套在 r、r 嵌套在 a —— 漏了
+    // system 与 ready/archived「完全相等」(is_inside 在相等时返回 false 拦不住)
+    // 以及 system↔archived 的双向嵌套。误配会把系统文件(全局索引/事务标记/日志)
+    // 写进已备份或待备份树,污染备份/索引。改为对 (r,a,s) 做全覆盖的两两校验。(review-r3)
+    let dirs: [(&str, &Path); 3] = [
+        ("待备份", r.as_path()),
+        ("已备份", a.as_path()),
+        ("备份系统", s.as_path()),
+    ];
+    for i in 0..3 {
+        for j in (i + 1)..3 {
+            if eq_ci(dirs[i].1, dirs[j].1) {
+                bail!(
+                    "{} 与 {} 不能是同一目录（{}）。",
+                    dirs[i].0,
+                    dirs[j].0,
+                    dirs[i].1.display()
+                );
+            }
+        }
     }
-    if is_inside(&s, &r) {
-        bail!(
-            "备份系统({}) 不能位于 待备份({}) 之内。",
-            s.display(),
-            r.display()
-        );
-    }
-    if is_inside(&r, &a) {
-        bail!(
-            "待备份({}) 不能位于 已备份({}) 之内。",
-            r.display(),
-            a.display()
-        );
+    for i in 0..3 {
+        for j in 0..3 {
+            if i == j {
+                continue;
+            }
+            if is_inside(dirs[i].1, dirs[j].1) {
+                // 位于 待备份(索引 0) 之内的任何目录都会被 discover 当作待归档项目。
+                let extra = if j == 0 {
+                    "，否则会被当作待归档项目处理"
+                } else {
+                    ""
+                };
+                bail!(
+                    "{}({}) 不能位于 {}({}) 之内{}。",
+                    dirs[i].0,
+                    dirs[i].1.display(),
+                    dirs[j].0,
+                    dirs[j].1.display(),
+                    extra
+                );
+            }
+        }
     }
 
     if let Some(drive) = drive_root {
@@ -119,15 +159,22 @@ fn strip_verbatim(p: &Path) -> PathBuf {
 }
 
 fn eq_ci(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy()
-        .eq_ignore_ascii_case(b.to_string_lossy().as_ref())
+    // 用 Unicode 全量折叠(to_lowercase),与 is_inside 保持一致。曾用 eq_ignore_ascii_case 只折叠
+    // ASCII,导致仅在非 ASCII 字母大小写上不同的同一目录(如 D:\Été 与 D:\été,NTFS 视为同一)
+    // 在「同目录」闸(check_paths)与「根目录在备份盘上」数据安全闸里被判不等而漏拦。(review-r3 round2)
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 fn is_inside(child: &Path, parent: &Path) -> bool {
     // 注意:canonicalize 在路径不存在时回退原始路径,junction/symlink 重定向场景下保护有限。
     // Windows 备份场景下此风险低(正常用户不会故意构建 junction 攻击自己),已知局限。
-    let c = format!("{}\\", child.to_string_lossy().to_lowercase());
-    let p = format!("{}\\", parent.to_string_lossy().to_lowercase());
+    // 比较前把两侧规范化为「恰好一个尾分隔符」:父目录本就以 `\` 结尾时(盘根 D:\、或 toml 写的带
+    // 尾斜杠根),直接追加会得到双反斜杠 `d:\\`,无法成为 `d:\child\` 的前缀 → 嵌套漏判、安全闸被绕过
+    // (如 ready=D:\、archived=D:\Archived 时『已备份在待备份内』本应 bail 却放行)。
+    // 先 trim_end_matches('\\') 再统一补一个 `\`。(review-r3 round3)
+    let norm = |s: &str| format!("{}\\", s.trim_end_matches('\\'));
+    let c = norm(&child.to_string_lossy().to_lowercase());
+    let p = norm(&parent.to_string_lossy().to_lowercase());
     c.starts_with(&p) && c != p
 }
 
@@ -142,19 +189,33 @@ fn is_volume_root(p: &Path) -> bool {
 }
 
 fn qualifier(p: &Path) -> String {
-    // 取盘符部分 "D:" / ""；字符安全:多字节首字符 / UNC 不 panic(旧 `&s[1..2]` 会)。(ledger L-023)
-    // 注意:junction/symlink 仍可绕过此盘符比较(已知局限,Windows 备份场景风险低)。
+    // 取卷标识:盘符 "D:" 或 UNC 卷 "\\SERVER\SHARE"(均大写归一化);无法识别时为 ""。
+    // 字符安全:多字节首字符 / UNC 不 panic(旧 `&s[1..2]` 会)。(ledger L-023)
+    // 注意:junction/symlink 仍可绕过此卷比较(已知局限,Windows 备份场景风险低)。
     let full = p.to_string_lossy();
-    // 先剥掉 Windows `canonicalize()` 对**真实存在**路径加的 verbatim 前缀(`\\?\` / `\\?\UNC\`)。
-    // 否则裸取前两字符会得到 `\\` → 盘符判空 → check_paths 的「根目录在备份盘上」安全闸与
-    // 跨分区警告都静默失效(review-r2 #1/#4:canon 后的路径走这里,而 drive.root 未 canon,两边永不相等)。
-    let s: &str = match full.strip_prefix(r"\\?\") {
-        Some(rest) => match rest.strip_prefix(r"UNC\") {
-            Some(_) => "", // verbatim UNC:无盘符
-            None => rest,  // \\?\C:\... → C:\...
-        },
-        None => full.as_ref(),
+    // 先剥掉 Windows `canonicalize()` 对**真实存在**路径加的 verbatim 前缀(`\\?\` / `\\?\UNC\`)——
+    // 否则盘符/卷判空 → check_paths 的「根目录在备份盘上」安全闸与跨分区警告静默失效
+    // (review-r2 #1/#4:canon 后的路径走这里,而 drive.root 未 canon,两边永不相等)。
+    // `\\?\UNC\server\share\…` 还原成普通 UNC 形态 `\\server\share\…` 统一处理。(review-r3)
+    let s: String = if let Some(rest) = full.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = full.strip_prefix(r"\\?\") {
+        rest.to_string() // \\?\C:\... → C:\...
+    } else {
+        full.into_owned()
     };
+    // UNC 路径(`\\server\share\…`):卷标识取 `\\server\share`(大小写归一化为大写)。
+    // 旧实现一律返回空串,导致两个不同网络共享的 qualifier 都为 "" → 误判同卷,
+    // 跨分区警告对 UNC 配置静默失效。(review-r3)
+    if let Some(rest) = s.strip_prefix(r"\\") {
+        let mut parts = rest.splitn(3, '\\');
+        if let (Some(server), Some(share)) = (parts.next(), parts.next()) {
+            if !server.is_empty() && !share.is_empty() {
+                return format!(r"\\{}\{}", server.to_uppercase(), share.to_uppercase());
+            }
+        }
+        return String::new();
+    }
     let mut it = s.chars();
     match (it.next(), it.next()) {
         (Some(c), Some(':')) if c.is_ascii_alphabetic() => format!("{}:", c.to_ascii_uppercase()),
@@ -185,13 +246,39 @@ pub fn folder_stable(root: &Path, minutes: u64) -> StableCheck {
         if !e.file_type().is_file() {
             continue;
         }
-        if let Ok(meta) = e.metadata() {
-            if let Ok(mt) = meta.modified() {
-                if mt > cutoff {
-                    return StableCheck {
-                        stable: false,
-                        reason: format!("最近被修改：{}", e.file_name().to_string_lossy()),
-                    };
+        // metadata()/modified() 读失败不再静默跳过时间窗判定:取不到修改时间 = 无法确认稳定 →
+        // 保守判「未稳定」(fail-closed),与本闸的暂态语义一致(未稳定只是本轮跳过、下轮再来,不误备),
+        // 也与下游 manifest/folder_stats 的 fail-closed 对齐,避免一个正在被写入但 metadata 瞬时
+        // 读不到的文件被误判已稳定而提前归档。(review-r3 round4)
+        let meta = match e.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                return StableCheck {
+                    stable: false,
+                    reason: format!(
+                        "无法读元数据(保守判未稳定):{}({})",
+                        e.file_name().to_string_lossy(),
+                        err
+                    ),
+                }
+            }
+        };
+        match meta.modified() {
+            Ok(mt) if mt > cutoff => {
+                return StableCheck {
+                    stable: false,
+                    reason: format!("最近被修改：{}", e.file_name().to_string_lossy()),
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return StableCheck {
+                    stable: false,
+                    reason: format!(
+                        "无法读修改时间(保守判未稳定):{}({})",
+                        e.file_name().to_string_lossy(),
+                        err
+                    ),
                 }
             }
         }
@@ -222,7 +309,7 @@ mod tests {
     fn qualifier_is_char_safe() {
         assert_eq!(qualifier(Path::new("D:\\x")), "D:");
         assert_eq!(qualifier(Path::new("e:\\")), "E:");
-        assert_eq!(qualifier(Path::new(r"\\srv\share")), "");
+        assert_eq!(qualifier(Path::new(r"\\srv\share")), r"\\SRV\SHARE"); // UNC:卷标识
         assert_eq!(qualifier(Path::new("中:\\x")), ""); // 多字节首字符:不 panic
         assert_eq!(qualifier(Path::new("")), "");
     }
@@ -234,11 +321,21 @@ mod tests {
         // Windows canonicalize() 对**存在**的路径返回 `\\?\` verbatim 前缀(实测 C:\Windows → \\?\C:\Windows)。
         assert_eq!(qualifier(Path::new(r"\\?\C:\Windows")), "C:");
         assert_eq!(qualifier(Path::new(r"\\?\E:\ready")), "E:");
-        // verbatim UNC 没有盘符
-        assert_eq!(qualifier(Path::new(r"\\?\UNC\srv\share")), "");
-        // 普通盘符 / 普通 UNC 行为不变
+        // verbatim UNC 还原成卷标识(\\server\share),不再误判为空串
+        assert_eq!(qualifier(Path::new(r"\\?\UNC\srv\share")), r"\\SRV\SHARE");
+        // 普通盘符行为不变;普通 UNC 取卷标识
         assert_eq!(qualifier(Path::new(r"D:\x")), "D:");
-        assert_eq!(qualifier(Path::new(r"\\srv\share")), "");
+        assert_eq!(qualifier(Path::new(r"\\srv\share")), r"\\SRV\SHARE");
+        // 不同共享 → 不同卷标识(跨分区警告据此对 UNC 生效)
+        assert_ne!(
+            qualifier(Path::new(r"\\srvA\share1")),
+            qualifier(Path::new(r"\\srvB\share2"))
+        );
+        // 同一共享下的子路径 → 同卷标识
+        assert_eq!(
+            qualifier(Path::new(r"\\srv\share\sub\a")),
+            qualifier(Path::new(r"\\srv\share"))
+        );
     }
 
     // ── L-026: is_inside 边界(前缀不能误判为嵌套) ──
@@ -247,6 +344,38 @@ mod tests {
         assert!(is_inside(Path::new("D:\\a\\b"), Path::new("D:\\a")));
         assert!(!is_inside(Path::new("D:\\ab"), Path::new("D:\\a"))); // 前缀但非父目录
         assert!(!is_inside(Path::new("D:\\a"), Path::new("D:\\a"))); // 自身不算 inside
+    }
+
+    // ── review-r3 round3:父目录以 `\` 结尾(盘根/带尾斜杠)不得漏判嵌套 ──
+    #[test]
+    fn is_inside_handles_trailing_slash_parent() {
+        assert!(
+            is_inside(Path::new(r"D:\Archived"), Path::new(r"D:\")),
+            "盘根 D:\\ 作父目录时其子目录应判在内(旧实现双反斜杠漏判)"
+        );
+        assert!(
+            is_inside(Path::new(r"D:\lib\done"), Path::new(r"D:\lib\")),
+            "带尾斜杠的父目录应正确判嵌套"
+        );
+        assert!(
+            !is_inside(Path::new(r"D:\"), Path::new(r"D:\")),
+            "盘根自身不算 inside"
+        );
+    }
+
+    #[test]
+    fn check_paths_rejects_subdir_of_drive_root() {
+        // ready=整盘根、archived=盘根子目录:本应判「已备份在待备份内」并 bail。
+        let r = check_paths(
+            Path::new(r"D:\"),
+            Path::new(r"D:\Archived"),
+            Path::new(r"D:\Sys"),
+            None,
+        );
+        assert!(
+            r.is_err(),
+            "ready=盘根、archived=其子目录 应被嵌套闸拒绝(否则盘根下一切会被当待归档项目移走)"
+        );
     }
 
     // ── L-026: check_paths 拒绝同目录/嵌套/同备份盘 ──
@@ -358,6 +487,86 @@ mod tests {
             None,
         );
         assert!(r.is_err(), "正斜杠嵌套(已备份在待备份内)应被拒");
+    }
+
+    // ── review-r3:三根目录两两关系须全覆盖 —— system 与 ready/archived 相等、
+    // 以及 system↔archived 双向嵌套,旧实现都漏了(is_inside 在相等时返回 false)──
+    #[test]
+    fn check_paths_rejects_same_system_archived() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\archived"),
+            Path::new("D:\\lib\\archived"), // 备份系统 == 已备份
+            None,
+        );
+        assert!(r.is_err(), "备份系统==已备份 应拒绝");
+    }
+
+    #[test]
+    fn check_paths_rejects_same_system_ready() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\archived"),
+            Path::new("D:\\lib\\ready"), // 备份系统 == 待备份
+            None,
+        );
+        assert!(r.is_err(), "备份系统==待备份 应拒绝");
+    }
+
+    #[test]
+    fn check_paths_rejects_system_inside_archived() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\archived"),
+            Path::new("D:\\lib\\archived\\sys"), // 备份系统 在 已备份 之内
+            None,
+        );
+        assert!(r.is_err(), "备份系统 在 已备份 内 应拒绝");
+    }
+
+    #[test]
+    fn check_paths_rejects_archived_inside_system() {
+        let r = check_paths(
+            Path::new("D:\\lib\\ready"),
+            Path::new("D:\\lib\\sys\\archived"), // 已备份 在 备份系统 之内
+            Path::new("D:\\lib\\sys"),
+            None,
+        );
+        assert!(r.is_err(), "已备份 在 备份系统 内 应拒绝");
+    }
+
+    // ── review-r3:两个不同 UNC 共享应触发跨分区警告(旧实现 qualifier 对 UNC 恒空 → 漏报)──
+    #[test]
+    fn check_paths_warns_on_different_unc_shares() {
+        let w = check_paths(
+            Path::new(r"\\srvA\share1\ready"),
+            Path::new(r"\\srvB\share2\archived"),
+            Path::new(r"\\srvB\share2\sys"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            w.iter().any(|s| s.contains("不在同一分区")),
+            "不同 UNC 共享应有跨分区提醒,实际:{:?}",
+            w
+        );
+    }
+
+    // ── review-r3 round2:eq_ci 须用 Unicode 折叠(与 is_inside 一致),否则仅非 ASCII 大小写
+    // 不同的同一目录(NTFS 视为同一)会绕过「同目录」安全闸 ──
+    #[test]
+    fn check_paths_rejects_same_dir_differing_only_in_non_ascii_case() {
+        // Z: 几乎不存在 → canon 退化为词法路径、保留原大小写,正好考验 eq_ci 的折叠策略。
+        let r = check_paths(
+            Path::new(r"Z:\nope\Été"),
+            Path::new(r"Z:\nope\été"),
+            Path::new(r"Z:\nope\sys"),
+            None,
+        );
+        assert!(
+            r.is_err(),
+            "仅非 ASCII 大小写不同的同一目录应被同目录闸拒绝(eq_ci 需 Unicode 折叠)"
+        );
     }
 
     // ── review-r2 R2-6:folder_stable 的 minutes*60 不得溢出 panic(stable_minutes 用户可控)──

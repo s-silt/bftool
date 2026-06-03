@@ -178,14 +178,42 @@ impl Config {
     fn from_path(p: &Path) -> Result<Self> {
         let text = fs::read_to_string(p)?;
         let mut cfg: Self = toml::from_str(&text).context("配置文件 TOML 解析失败")?;
+        // 归一化 name_prefix(trim),与 GUI parse_form 的 trim 行为一致。否则 CLI 直接编辑 toml
+        // 写入带首尾空白的前缀(如 "备份 ")会被原样持久化:盘号生成用 format!("{prefix}{n}") 得
+        // "备份 1",而 GUI 侧 trim 成 "备份" 后 strip_prefix("备份 1") 得 " 1" 解析失败 → 看不到既有
+        // 盘号 → 可能重号、盘身份失效。两路统一 trim 即可消除分叉。(review-r3 #12)
+        cfg.name_prefix = cfg.name_prefix.trim().to_string();
         // 必须在 resolve_root **之前**拒掉空/纯空白根目录:否则 resolve_root 会把空路径
         // 悄悄变成配置文件所在目录(base.join("")),用户得到一个意外的源/索引位置,而
         // 解析后的 validate 看到的已是非空的 base 路径、检查不到。(review-r2 R2-5)
         cfg.check_roots_nonempty()?;
+        // 把相对根目录锚定到「配置文件所在目录」绝对化,供引擎消费。
+        // 不变量(review-r3 round3):这些绝对化结果**仅供本次运行消费**,不得被原样持久化到
+        // 另一位置 —— 否则相对语义会被悄悄改成「锚定到旧目录」的绝对路径。当前 GUI 保存走
+        // settings::parse_form 用**原始表单字符串**重建 Config(见 parse_form,不调 resolve_root),
+        // 不复用这里加载后的绝对化 Config,故该问题在生产中不可达;若未来新增「保存已加载配置」
+        // 的路径,必须持久化原始相对值而非这里的绝对化值。
         let base = config_base_dir(p);
         cfg.ready_root = resolve_root(&base, cfg.ready_root);
         cfg.archived_root = resolve_root(&base, cfg.archived_root);
         cfg.system_root = resolve_root(&base, cfg.system_root);
+        // extra_catalogs 的相对项同样锚定到配置文件目录(与三根目录一致),否则会按**进程 cwd**解析 →
+        // GUI 双击启动(cwd=随机)与 CLI 终端(cwd=项目目录)查到的额外索引不同、结果分叉。
+        // 绝对/UNC 路径原样保留。注意:空/纯空白项**不**锚定(否则 resolve_root 会把 "" 变成 base 这个
+        // 非空路径、绕过 validate() 的空项拒绝)——保留原样交 validate() 拒掉。(review-r3 round4)
+        cfg.extra_catalogs = cfg
+            .extra_catalogs
+            .into_iter()
+            .map(|c| {
+                // 先 trim 首尾空白(与 name_prefix、GUI parse_form 一致),再判空/锚定。
+                let trimmed = c.as_os_str().to_string_lossy().trim().to_string();
+                if trimmed.is_empty() {
+                    c // 空/纯空白项保留原样,交 validate() 拒绝(勿锚定成 base 绕过校验)
+                } else {
+                    resolve_root(&base, PathBuf::from(trimmed))
+                }
+            })
+            .collect();
         Ok(cfg)
     }
 
@@ -427,6 +455,24 @@ mod tests {
         assert_eq!(c.name_prefix, "备份");
     }
 
+    // ── review-r3 #12:CLI 直接编辑 toml 写带首尾空白的 name_prefix,加载时应被 trim,
+    // 与 GUI parse_form 一致,避免盘号 strip_prefix 失配/重号 ──
+    #[test]
+    fn from_path_trims_name_prefix_whitespace() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bftool.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"D:/r\"\n\
+             archived_root = \"D:/a\"\n\
+             system_root = \"D:/s\"\n\
+             name_prefix = \"备份 \"\n",
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(c.name_prefix, "备份", "name_prefix 首尾空白应被 trim 掉");
+    }
+
     #[test]
     fn rejects_unknown_config_field() {
         let d = tempfile::tempdir().unwrap();
@@ -445,6 +491,59 @@ mod tests {
         assert!(
             format!("{:#}", err).contains("reserve_gbb"),
             "unknown field should be named in error: {err:#}"
+        );
+    }
+
+    // ── review-r3 round4:extra_catalogs 相对项也锚定到配置文件目录(与三根目录一致),
+    // 消除 CLI/GUI 因进程 cwd 不同导致的额外索引解析分叉;绝对项原样保留 ──
+    #[test]
+    fn from_path_anchors_relative_extra_catalogs_to_config_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg_dir = d.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let p = cfg_dir.join("bftool.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"D:/r\"\n\
+             archived_root = \"D:/a\"\n\
+             system_root = \"D:/s\"\n\
+             extra_catalogs = [\"sub/cat.csv\", \"D:/abs/cat.csv\"]\n",
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(
+            c.extra_catalogs[0],
+            cfg_dir.join("sub/cat.csv"),
+            "相对额外索引应锚定到配置文件目录"
+        );
+        assert_eq!(
+            c.extra_catalogs[1],
+            std::path::PathBuf::from("D:/abs/cat.csv"),
+            "绝对额外索引应原样保留"
+        );
+    }
+
+    // ── review-r3 round5:extra_catalogs 条目的首尾空白应被 trim(与 name_prefix、GUI parse_form 一致),
+    // 否则带空白的绝对路径不再被识别为绝对、被错误锚定到 base ──
+    #[test]
+    fn from_path_trims_extra_catalogs_whitespace() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg_dir = d.path().join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let p = cfg_dir.join("bftool.toml");
+        std::fs::write(
+            &p,
+            "ready_root = \"D:/r\"\n\
+             archived_root = \"D:/a\"\n\
+             system_root = \"D:/s\"\n\
+             extra_catalogs = [\"  D:/abs/cat.csv  \"]\n",
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(
+            c.extra_catalogs[0],
+            std::path::PathBuf::from("D:/abs/cat.csv"),
+            "额外索引条目首尾空白应被 trim 后再判绝对/锚定"
         );
     }
 
