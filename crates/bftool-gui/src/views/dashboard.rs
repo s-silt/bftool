@@ -209,14 +209,16 @@ fn kpi_row(ui: &mut egui::Ui, report: &StatusReport) {
 
 /// 复查结论 → (标签, 颜色)。纯函数,可测。
 fn outcome_label(o: &VerifyOutcome) -> (&'static str, Color32) {
-    match o {
-        VerifyOutcome::Clean => ("完好", theme::OK),
-        VerifyOutcome::IssuesFound { .. } => ("发现损坏", theme::DANGER),
-        VerifyOutcome::ExtraOnly { .. } => ("有多余文件", theme::WARN),
+    // 强优化:文案统一用 core 的权威 VerifyOutcome::label();此处只决定配色(UI 关注点)。
+    let color = match o {
+        VerifyOutcome::Clean => theme::OK,
+        VerifyOutcome::IssuesFound { .. } => theme::DANGER,
+        VerifyOutcome::ExtraOnly { .. } => theme::WARN,
         // 仅大小校验(清单无哈希)未验证内容 → WARN 色,不绿标完好。(review-r3 round5)
-        VerifyOutcome::CleanButSizeOnly { .. } => ("仅大小校验·未验证内容", theme::WARN),
-        VerifyOutcome::Cancelled => ("上次取消", theme::TEXT_BODY),
-    }
+        VerifyOutcome::CleanButSizeOnly { .. } => theme::WARN,
+        VerifyOutcome::Cancelled => theme::TEXT_BODY,
+    };
+    (o.label(), color)
 }
 
 fn latest_verify(report: &StatusReport) -> (String, String, Color32) {

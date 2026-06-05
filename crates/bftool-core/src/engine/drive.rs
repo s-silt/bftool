@@ -28,7 +28,7 @@ pub type BackupDrive = DriveInfo;
 
 /// 可写入的备份盘:不变量 = 未封盘且容量达标。archive 写路径只接受它,编译期防"写错盘/封盘盘"。
 #[derive(Debug, Clone)]
-pub struct WritableDrive(BackupDrive);
+pub(crate) struct WritableDrive(BackupDrive);
 
 /// `try_into_writable` 失败原因(带"怎么修")。
 #[derive(Debug)]
@@ -54,7 +54,7 @@ impl std::error::Error for DriveError {}
 
 impl DriveInfo {
     /// 升级为可写盘:仅**未封盘且容量 ≥ min_drive_gb**时成功;阈值显式传入(来自 `cfg.min_drive_gb`)。
-    pub fn try_into_writable(self, min_drive_gb: u64) -> Result<WritableDrive, DriveError> {
+    pub(crate) fn try_into_writable(self, min_drive_gb: u64) -> Result<WritableDrive, DriveError> {
         if self.sealed {
             return Err(DriveError::Sealed);
         }
@@ -70,10 +70,8 @@ impl DriveInfo {
 }
 
 impl WritableDrive {
-    pub fn inner(&self) -> &BackupDrive {
-        &self.0
-    }
-    pub fn into_inner(self) -> BackupDrive {
+    // 强优化:删除仅测试引用的死方法 inner();生产路径只用 into_inner()。收敛 API 表面。
+    pub(crate) fn into_inner(self) -> BackupDrive {
         self.0
     }
 }
@@ -109,7 +107,7 @@ pub fn list_mounted(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
 /// 会把「封盘标记其实存在但此刻 stat 不到」误判为未封盘 → 该盘可能被 pick_active 重新选为可写盘、
 /// 误写已封盘的冷备盘。改为区分 NotFound(确认无标记=未封盘)与其它错误(封盘态未知 → fail-closed
 /// 当作已封盘),与本文件 read_to_string 失败的处理一致,绝不误写已封盘盘。(review-r3 round4)
-pub fn drive_is_sealed(root: &Path) -> bool {
+pub(crate) fn drive_is_sealed(root: &Path) -> bool {
     match fs::symlink_metadata(paths::drive_sealed_path(root)) {
         Ok(_) => true,                                               // 标记存在 → 已封盘
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false, // 确认无标记 → 未封盘
@@ -192,14 +190,14 @@ fn usable_drives(all: Vec<DriveInfo>, min_drive_gb: u64) -> (Vec<DriveInfo>, Vec
 /// 当前在线、未封盘、容量达标的备份盘列表（不打日志、不挑唯一）。
 /// `run_plan` 在执行前用它复验「单盘不变式」——`pick_active` 的多盘检查只在 `plan()` 跑过一次，
 /// 预览→执行之间若插入第二块可写盘，需在这里重新拦下，否则单盘安全闸被绕过。(SEC-007)
-pub fn usable_drives_now(min_drive_gb: u64) -> Result<Vec<DriveInfo>> {
+pub(crate) fn usable_drives_now(min_drive_gb: u64) -> Result<Vec<DriveInfo>> {
     let (usable, _too_small) = usable_drives(scan_mounted(None)?, min_drive_gb);
     Ok(usable)
 }
 
 /// 返回唯一一块未封盘且容量达标的备份盘；多块返回错误；零块返回 None。
 /// 容量过滤(min_drive_gb)是防误抓 U 盘/SD 卡的安全闸。(ledger L-006)
-pub fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
+pub(crate) fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
     // min_drive_gb=0 会使容量闸 total_bytes >= 0 恒真 → 禁用『防误抓 U 盘/SD 卡』安全闸。
     // 在选盘这步(消费该闸、且有 reporter)显式提醒,不让安全闸被静默关闭。(review-r3 round2)
     if min_drive_gb == 0 {
@@ -503,7 +501,7 @@ fn readme(id: &str) -> String {
     )
 }
 
-pub fn parse_drive_number(prefix: &str, id: &str) -> Option<u32> {
+fn parse_drive_number(prefix: &str, id: &str) -> Option<u32> {
     id.strip_prefix(prefix).and_then(|s| s.parse::<u32>().ok())
 }
 
@@ -606,7 +604,7 @@ fn bump_drive_seq(cfg: &Config, n: u32, reporter: &dyn Reporter) -> Result<()> {
 }
 
 /// 写封盘标记。当前盘剩余不足下一个项目时调用。
-pub fn seal(drive: &DriveInfo) -> Result<()> {
+pub(crate) fn seal(drive: &DriveInfo) -> Result<()> {
     let cat = paths::drive_catalog_path(&drive.root);
     let (cnt, bytes) = if cat.is_file() {
         let mut total_bytes = 0u64;
@@ -659,7 +657,7 @@ fn qualifier_letter(p: &Path) -> Option<String> {
 }
 
 /// 把盘符字符串规范化为根路径 PathBuf。
-pub fn root_from_letter(letter: &str) -> Result<PathBuf> {
+fn root_from_letter(letter: &str) -> Result<PathBuf> {
     let l = letter.trim_end_matches(':').to_uppercase();
     if l.len() != 1 {
         bail!("盘符无效：{}（应为单字母）", letter);
@@ -668,7 +666,7 @@ pub fn root_from_letter(letter: &str) -> Result<PathBuf> {
 }
 
 /// 根据盘符直接读 DriveInfo（不要求事先 scan_mounted）。
-pub fn info_by_letter(letter: &str) -> Result<DriveInfo> {
+pub(crate) fn info_by_letter(letter: &str) -> Result<DriveInfo> {
     let letter = letter.trim_end_matches(':').to_uppercase();
     let root = root_from_letter(&letter)?;
     let id_file = paths::drive_id_path(&root);
@@ -829,7 +827,7 @@ mod tests {
         assert!(di("F", 8, false).try_into_writable(200).is_err()); // 过小
         let w = di("E", 500, false).try_into_writable(200);
         assert!(w.is_ok());
-        assert_eq!(w.unwrap().inner().letter, "E");
+        assert_eq!(w.unwrap().into_inner().letter, "E");
     }
 
     // ── L-006: min_drive_gb 真正生效,排除过小盘(防误抓 U 盘) ──

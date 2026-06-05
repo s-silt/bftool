@@ -56,6 +56,21 @@ pub enum VerifyOutcome {
     Cancelled,
 }
 
+impl VerifyOutcome {
+    /// 复查结论的权威中文标签。CLI(status)与 GUI(dashboard)统一复用,避免同一结论两套说法
+    /// (历史上 CLI「发现损坏!」与 GUI「发现损坏」曾漂移,新增/改分支须人肉同步两处易再漂)。
+    /// GUI 的配色是 UI 关注点,另在其渲染层决定。(强优化 review)
+    pub fn label(&self) -> &'static str {
+        match self {
+            VerifyOutcome::Clean => "完好",
+            VerifyOutcome::IssuesFound { .. } => "发现损坏",
+            VerifyOutcome::ExtraOnly { .. } => "有多余文件",
+            VerifyOutcome::CleanButSizeOnly { .. } => "仅大小校验·未验证内容",
+            VerifyOutcome::Cancelled => "上次取消",
+        }
+    }
+}
+
 /// 复查结果。`has_corruption()` = 发现损坏/缺失;结构化明细在 `issues`/`extras`。
 /// CLI 据此设非零退出码(L-007);GUI 直接列明细(Spec D §4.1)。
 #[derive(Debug, Default, Clone)]

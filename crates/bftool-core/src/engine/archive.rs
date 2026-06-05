@@ -834,6 +834,51 @@ enum HandleOutcome {
 ///
 /// 无论哪条路径,**安全前置(稳定/统计/容量/源复核)都在此实时重验**——冻的是命名,不是安全判断。
 #[allow(clippy::too_many_arguments)]
+/// 把一批坏/多余文件从 `dest` 移入隔离目录 `quar_dir`(下次运行 robocopy 风格补传重校)。`rels` 是相对
+/// `dest` 的路径;`require_exists`=true 时只隔离磁盘上确实存在的(SHA256 diff 路径,源端可能无此文件),
+/// 压缩包路径的 rel 由 `strip_prefix(dest)` 得到、本就存在,传 false。建隔离目录/rename 失败 → warn 不
+/// 静默、跳过该文件。返回成功移动数。强优化:抽出 handle_one 内两处重复的隔离循环,保留 diff 路径的
+/// exists 守卫这一非对称(否则会改变压缩包路径的可观察隔离行为)。
+fn quarantine_rels<'a>(
+    quar_dir: &Path,
+    dest: &Path,
+    rels: impl Iterator<Item = &'a Path>,
+    require_exists: bool,
+    reporter: &dyn Reporter,
+) -> usize {
+    let mut moved = 0usize;
+    for rel in rels {
+        let src_p = dest.join(rel);
+        if require_exists && !src_p.exists() {
+            continue;
+        }
+        let dst_p = quar_dir.join(rel);
+        if let Some(p) = dst_p.parent() {
+            if let Err(e) = fs::create_dir_all(p) {
+                // 不 swallow:建隔离目录失败时明确归因、跳过该文件隔离。(ledger L-015)
+                reporter.warn(&format!(
+                    "建隔离目录失败 {}:{} —— 坏文件 {} 未隔离,请手动检查。",
+                    p.display(),
+                    e,
+                    src_p.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(e) = fs::rename(&src_p, &dst_p) {
+            reporter.warn(&format!(
+                "隔离失败 {}：{}（请手动检查 {}）",
+                rel.display(),
+                e,
+                src_p.display()
+            ));
+        } else {
+            moved += 1;
+        }
+    }
+    moved
+}
+
 fn handle_one(
     cfg: &Config,
     reporter: &dyn Reporter,
@@ -1141,35 +1186,13 @@ fn handle_one(
         // 隔离坏文件，让下次 robocopy 风格的"补传"再来一遍
         if !d.bad_dst_rels.is_empty() {
             let quar = paths::drive_quarantine_dir(&drive.root).join(&name);
-            let mut moved = 0usize;
-            for rel in &d.bad_dst_rels {
-                let src_p = dest.join(rel);
-                if src_p.exists() {
-                    let dst_p = quar.join(rel);
-                    if let Some(p) = dst_p.parent() {
-                        if let Err(e) = fs::create_dir_all(p) {
-                            // 不 swallow:建隔离目录失败时明确归因、跳过该文件隔离。(ledger L-015)
-                            reporter.warn(&format!(
-                                "建隔离目录失败 {}:{} —— 坏文件 {} 未隔离,请手动检查。",
-                                p.display(),
-                                e,
-                                src_p.display()
-                            ));
-                            continue;
-                        }
-                    }
-                    if let Err(e) = fs::rename(&src_p, &dst_p) {
-                        reporter.warn(&format!(
-                            "隔离失败 {}：{}（请手动检查 {}）",
-                            rel,
-                            e,
-                            src_p.display()
-                        ));
-                    } else {
-                        moved += 1;
-                    }
-                }
-            }
+            let moved = quarantine_rels(
+                &quar,
+                &dest,
+                d.bad_dst_rels.iter().map(Path::new),
+                true, // diff 路径:源端可能无此文件,只隔离磁盘上确实存在的
+                reporter,
+            );
             reporter.action(&format!(
                 "已将 {} 个损坏/多余的目标文件移到：{} → 下次运行会自动补传并重新校验。",
                 moved,
@@ -1194,28 +1217,15 @@ fn handle_one(
             }
             if !r.archive_failed.is_empty() {
                 let quar = paths::drive_quarantine_dir(&drive.root).join(&name);
-                let mut moved = 0usize;
-                for (bad, _reason) in &r.archive_failed {
-                    if let Ok(rel) = bad.strip_prefix(&dest) {
-                        let to = quar.join(rel);
-                        if let Some(p) = to.parent() {
-                            if let Err(e) = fs::create_dir_all(p) {
-                                reporter.warn(&format!(
-                                    "建隔离目录失败 {}:{} —— 坏压缩包 {} 未隔离,请手动检查。",
-                                    p.display(),
-                                    e,
-                                    bad.display()
-                                ));
-                                continue;
-                            }
-                        }
-                        if let Err(e) = fs::rename(bad, &to) {
-                            reporter.warn(&format!("隔离失败 {}：{}", bad.display(), e));
-                        } else {
-                            moved += 1;
-                        }
-                    }
-                }
+                let moved = quarantine_rels(
+                    &quar,
+                    &dest,
+                    r.archive_failed
+                        .iter()
+                        .filter_map(|(bad, _)| bad.strip_prefix(&dest).ok()),
+                    false, // 压缩包路径:rel 由 strip_prefix(dest) 得到,本就存在,无需 exists 守卫
+                    reporter,
+                );
                 reporter.action(&format!(
                     "已隔离 {} 个损坏压缩包到 {}；下次运行会自动补传并重测。",
                     moved,
@@ -1259,7 +1269,39 @@ fn handle_one(
         return Ok(HandleOutcome::Skipped);
     }
 
-    // 事务式提交
+    // 事务式提交(抽出为 commit_archive,使最安全攸关的提交段成为命名函数)。(强优化 review)
+    commit_archive(
+        cfg,
+        reporter,
+        drive,
+        proj_path,
+        &name,
+        &proj_no,
+        &dest_name,
+        dup_in_drive,
+        &catalog,
+        &src,
+        opts,
+    )
+}
+
+/// 事务式提交单个项目:写标记 → 写清单/本盘索引/全局索引 → rename 移源 → 清标记。AR-01 提交顺序保证
+/// 任一步失败时源仍在『待备份』、可由 check_pending_txn 恢复。强优化:从 handle_one 543 行长流的尾部
+/// 抽出,行为与抽取前逐字一致(仅把原局部变量改为参数/借用)。
+#[allow(clippy::too_many_arguments)]
+fn commit_archive(
+    cfg: &Config,
+    reporter: &dyn Reporter,
+    drive: &DriveInfo,
+    proj_path: &Path,
+    name: &str,
+    proj_no: &str,
+    dest_name: &str,
+    dup_in_drive: bool,
+    catalog: &Path,
+    src: &manifest::Manifest,
+    opts: &Options,
+) -> Result<HandleOutcome> {
     // AR-01 提交顺序:写标记 → 写清单/索引 → rename 移源 → 清标记。
     // 这样如果 write_csv/catalog 失败,源还在 待备份,下次可以重做。
     // rename 失败时不清标记(抛错 → 标记留着,下次 check_pending_txn 感知)。
@@ -1273,7 +1315,7 @@ fn handle_one(
     let rel_manifest = format!("本盘信息\\校验清单\\{}.sha256.csv", dest_name);
     // AR-04: arch_dest 的最终值(含时间戳冲突处理)在 pending.write 之前确定,
     // 保证 PendingTxn.move_to 记录的是真正的目标路径。
-    let mut arch_dest = cfg.archived_root.join(&name);
+    let mut arch_dest = cfg.archived_root.join(name);
     if arch_dest.exists() {
         let stamp = Local::now().format("%Y%m%d%H%M%S");
         arch_dest = cfg.archived_root.join(format!("{}_{}", name, stamp));
@@ -1281,8 +1323,8 @@ fn handle_one(
 
     let txn_path = paths::system_pending_txn(&cfg.system_root);
     let pending = txn::PendingTxn {
-        project_dest_name: dest_name.clone(),
-        project_src_name: name.clone(),
+        project_dest_name: dest_name.to_string(),
+        project_src_name: name.to_string(),
         drive_id: drive.id.clone(),
         drive_letter: drive.letter.clone(),
         in_drive_path: format!("项目\\{}", dest_name),
@@ -1298,10 +1340,10 @@ fn handle_one(
     let commit_writes = (|| -> Result<()> {
         src.write_csv(&manifest_path)?;
         append_drive_catalog(
-            &catalog,
+            catalog,
             &DriveCatalogRow {
-                project_no: proj_no,
-                project_name: dest_name.clone(),
+                project_no: proj_no.to_string(),
+                project_name: dest_name.to_string(),
                 file_count: src.count() as u64,
                 total_bytes: src_bytes,
                 archived_utc: utc.clone(),
@@ -1317,10 +1359,10 @@ fn handle_one(
         append_global_catalog(
             &paths::system_global_catalog(&cfg.system_root),
             &GlobalCatalogRow {
-                folder_name: dest_name.clone(),
+                folder_name: dest_name.to_string(),
                 drive_name: drive.id.clone(),
                 archived_time: local_time.clone(),
-                project_no: leading_digits(&name),
+                project_no: leading_digits(name),
                 in_drive_path: format!("项目\\{}", dest_name),
                 file_count: src.count() as u64,
                 size_gb: size_gbval,
@@ -1741,7 +1783,7 @@ fn source_bftool_part_files(root: &Path) -> Result<Vec<String>> {
         match entry {
             Ok(e) if e.file_type().is_file() => {
                 let name = e.file_name().to_string_lossy();
-                if name.ends_with(".bftool-part") {
+                if name.ends_with(cruft::PART_SUFFIX) {
                     let rel = e
                         .path()
                         .strip_prefix(root)

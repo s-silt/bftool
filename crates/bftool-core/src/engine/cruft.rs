@@ -34,13 +34,18 @@ pub const CRUFT_DIRS: &[&str] = &[
     ".TemporaryItems",
 ];
 
+/// bftool 原子复制的临时文件后缀。复制写 `<target>.bftool-part` → fsync → rename;cruft 过滤靠它
+/// 把中断残留排除出 manifest/复制/校验/容量统计。三处契约(复制写、cruft 过滤、源端 .part 检测)必须用
+/// 同一字面量,否则手误改一处会让『复制写的临时名 cruft 不认 → 被当真实文件参与校验/移动』静默错配。(强优化 review)
+pub const PART_SUFFIX: &str = ".bftool-part";
+
 /// 前缀模式：以 "._" 开头（macOS resource fork on non-HFS volumes）
 pub fn is_cruft_file(name: &str) -> bool {
     if name.starts_with("._") {
         return true;
     }
     // bftool 原子复制的临时文件:不算项目内容,manifest/复制/校验/容量统计都忽略。(ledger L-014)
-    if name.ends_with(".bftool-part") {
+    if name.ends_with(PART_SUFFIX) {
         return true;
     }
     CRUFT_FILES.iter().any(|c| c.eq_ignore_ascii_case(name))
