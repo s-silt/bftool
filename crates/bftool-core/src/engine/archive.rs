@@ -1478,40 +1478,40 @@ struct GlobalCatalogRow {
     manifest_path: String,
 }
 
+/// 索引追加的幂等判定:对**已读入的现有内容**判断该行是否已存在(命中则跳过追加)。
+type DedupCheck<'a> = dyn Fn(&[u8]) -> Result<bool> + 'a;
+
 fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
-    append_catalog_row(path, row)
+    append_catalog_row(path, row, None)
 }
 
 fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
-    // 幂等:同一(文件夹名, 备份盘名)已登记则跳过,不重复追加。孤儿索引行修复:提交写序改为
-    // 「全局先于本盘」(见 commit_archive)后,『全局已写、本盘未写』窗口崩溃→源仍在待备份→重做会以
-    // **原名**(dup_in_drive=false)再次调用本函数;幂等跳过避免在全局索引留下重复行。仅按精确
-    // (文件夹名,盘名)匹配,合法的时间戳唯一名(不同 dest_name)不受影响。(强优化:孤儿索引行)
-    if global_has_folder_on_drive(path, &row.folder_name, &row.drive_name)? {
-        return Ok(());
-    }
-    append_catalog_row(path, row)
+    // 幂等:同(文件夹名,备份盘名)已登记则跳过,不重复追加。孤儿索引行修复:提交写序「全局先于本盘」后,
+    // 『全局已写、本盘未写』窗口崩溃→源仍在待备份→重做以**原名**(dup_in_drive=false)再次调用本函数;
+    // 幂等吸收避免全局留下重复行。强优化(P3):复用 append_catalog_row **已读入**的现有内容做判断,
+    // 避免对全局索引(可上万行)在提交关键段多读一遍。
+    let dedup = |content: &[u8]| {
+        global_content_has_folder_on_drive(content, &row.folder_name, &row.drive_name)
+    };
+    append_catalog_row(path, row, Some(&dedup))
 }
 
-/// 全局索引是否已有某(文件夹名, 备份盘名)行。供 append_global_catalog 幂等用。匹配口径与
-/// catalog_has_project / global_has_folder 一致:**缺列 → bail**(索引不可信,绝不当作「不存在」静默放过
-/// 导致重复追加);**NTFS 大小写折叠**(cfg!(windows) 下 to_lowercase)—— 否则源仅大小写改名后重做的
-/// dest_name 与崩溃前全局行仅大小写不同 → 精确比较漏命中 → 幂等失效、留下仅大小写不同的重复全局行
-/// (正是本修复要消除的孤儿/重复形态在大小写维度复活)。(强优化:孤儿索引行 + 对抗式 review P2)
-fn global_has_folder_on_drive(global: &Path, folder: &str, drive: &str) -> Result<bool> {
-    if !global.is_file() {
+/// 给定全局索引的**已读入字节**,判断是否已有某(文件夹名,备份盘名)行。供 append_global_catalog 幂等用,
+/// 复用 append_catalog_row 读入的内容、不再单独读盘。匹配口径与 catalog_has_project / global_has_folder
+/// 一致:**缺列 → bail**(索引不可信,绝不当作「不存在」静默放过导致重复追加);**NTFS 大小写折叠**
+/// (cfg!(windows) 下 to_lowercase)—— 否则源仅大小写改名后重做的 dest_name 与崩溃前全局行仅大小写不同 →
+/// 漏命中 → 幂等失效、留下仅大小写不同的重复全局行。(强优化:孤儿索引行 + 对抗式 review P2/P3)
+fn global_content_has_folder_on_drive(content: &[u8], folder: &str, drive: &str) -> Result<bool> {
+    if content.is_empty() {
         return Ok(false);
     }
-    let mut rdr = csv::Reader::from_path(global)?;
+    let mut rdr = csv::Reader::from_reader(content);
     let headers = rdr.headers()?.clone();
     let (Some(ci_f), Some(ci_d)) = (
         headers.iter().position(|h| h == "文件夹名"),
         headers.iter().position(|h| h == "备份盘名"),
     ) else {
-        anyhow::bail!(
-            "全局索引缺少『文件夹名』或『备份盘名』列,索引不可信(可能损坏或被改格式):{}",
-            global.display()
-        );
+        anyhow::bail!("全局索引缺少『文件夹名』或『备份盘名』列,索引不可信(可能损坏或被改格式)");
     };
     let fold = |s: &str| {
         if cfg!(windows) {
@@ -1541,7 +1541,14 @@ fn global_has_folder_on_drive(global: &Path, folder: &str, drive: &str) -> Resul
 /// 旧索引或完整新索引,绝不半行 —— 与 manifest/事务标记的原子写一致。(review-r2 R2-4 / L-001)
 ///
 /// AR-10:`file_existed` 探测与写入之间的 TOCTOU 在单进程串行归档下可接受(无并发写者)。
-fn append_catalog_row<R: serde::Serialize>(path: &Path, row: &R) -> Result<()> {
+///
+/// `dedup`:可选幂等判定,对**已读入的现有内容**判断该行是否已存在,命中则跳过追加(复用这次读,
+/// 不再单独读盘)。全局索引用它做(文件夹名,盘名)幂等;本盘索引传 None。
+fn append_catalog_row<R: serde::Serialize>(
+    path: &Path,
+    row: &R,
+    dedup: Option<&DedupCheck>,
+) -> Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).ok();
     }
@@ -1551,6 +1558,11 @@ fn append_catalog_row<R: serde::Serialize>(path: &Path, row: &R) -> Result<()> {
     } else {
         Vec::new()
     };
+    if let Some(dedup) = dedup {
+        if dedup(&content)? {
+            return Ok(()); // 已存在 → 幂等跳过(复用上面这次读,不重复读盘)
+        }
+    }
     let mut wtr = csv::WriterBuilder::new()
         .has_headers(!existed) // 文件不存在时连表头一起写
         .from_writer(Vec::new());
