@@ -1338,11 +1338,36 @@ fn commit_archive(
     };
     pending.write(&txn_path)?;
 
-    // 写清单 + 本盘索引 + 全局索引(在 rename 之前写)。R5-2:这三处写在**写标记之后**,任一失败必须
+    // 写清单 + 全局索引 + 本盘索引(在 rename 之前写)。R5-2:这三处写在**写标记之后**,任一失败必须
     // 中止本轮(CommitInterrupted),否则 handle_one 返回普通 Err、run_plan 继续,下个项目的
     // pending.write 会覆盖本项目残留的事务标记、抹掉崩溃恢复证据(与移源失败的 R3-3 守卫对称)。
+    //
+    // 孤儿索引行修复:写序为「全局先于本盘」(本盘是最后一步)。这样『单边已写』崩溃窗口落在
+    // 「全局已写、本盘未写、源未移」—— 恢复时源仍在待备份→重做,而重做看到 dup_in_drive(本盘)=false
+    // → 复用**原名原副本**(copy_folder size-skip),不再用时间戳改名产生重复副本+孤儿本盘行;全局
+    // append 幂等吸收那条已写的全局行。『双边都写、仅未移源』仍是既有的可接受重复(两份都在两索引、
+    // 都可被 find 定位,非孤儿)。`moved && indexed(全局)` 的「已完成」判定不受影响:移源在两索引之后,
+    // moved=true 蕴含全局必已写。
+    // 取舍(对抗式 review P2):新写序下「全局已写、未提交」窗口里 find(只读全局)会把该项目显示为
+    // 已备份,而事务尚未提交(本盘未写、源未移)。但此窗口内盘上副本**已通过 SHA256 校验**(commit_archive
+    // 在 handle_one 的 diff 通过后才进入)→ 数据真实安全、in_drive_path 指向真副本,且下次 archive 的
+    // check_pending_txn 会自愈重做。这是自愈瞬态(数据从不丢),严格优于旧写序留下的**永久**孤儿。(强优化:孤儿索引行)
     let commit_writes = (|| -> Result<()> {
         src.write_csv(&manifest_path)?;
+        append_global_catalog(
+            &paths::system_global_catalog(&cfg.system_root),
+            &GlobalCatalogRow {
+                folder_name: dest_name.to_string(),
+                drive_name: drive.id.clone(),
+                archived_time: local_time.clone(),
+                project_no: leading_digits(name),
+                in_drive_path: format!("项目\\{}", dest_name),
+                file_count: src.count() as u64,
+                size_gb: size_gbval,
+                verify: verify_status.token().to_string(),
+                manifest_path: rel_manifest,
+            },
+        )?;
         append_drive_catalog(
             catalog,
             &DriveCatalogRow {
@@ -1358,20 +1383,6 @@ fn commit_archive(
                 } else {
                     String::new()
                 },
-            },
-        )?;
-        append_global_catalog(
-            &paths::system_global_catalog(&cfg.system_root),
-            &GlobalCatalogRow {
-                folder_name: dest_name.to_string(),
-                drive_name: drive.id.clone(),
-                archived_time: local_time.clone(),
-                project_no: leading_digits(name),
-                in_drive_path: format!("项目\\{}", dest_name),
-                file_count: src.count() as u64,
-                size_gb: size_gbval,
-                verify: verify_status.token().to_string(),
-                manifest_path: rel_manifest,
             },
         )?;
         Ok(())
@@ -1472,7 +1483,53 @@ fn append_drive_catalog(path: &Path, row: &DriveCatalogRow) -> Result<()> {
 }
 
 fn append_global_catalog(path: &Path, row: &GlobalCatalogRow) -> Result<()> {
+    // 幂等:同一(文件夹名, 备份盘名)已登记则跳过,不重复追加。孤儿索引行修复:提交写序改为
+    // 「全局先于本盘」(见 commit_archive)后,『全局已写、本盘未写』窗口崩溃→源仍在待备份→重做会以
+    // **原名**(dup_in_drive=false)再次调用本函数;幂等跳过避免在全局索引留下重复行。仅按精确
+    // (文件夹名,盘名)匹配,合法的时间戳唯一名(不同 dest_name)不受影响。(强优化:孤儿索引行)
+    if global_has_folder_on_drive(path, &row.folder_name, &row.drive_name)? {
+        return Ok(());
+    }
     append_catalog_row(path, row)
+}
+
+/// 全局索引是否已有某(文件夹名, 备份盘名)行。供 append_global_catalog 幂等用。匹配口径与
+/// catalog_has_project / global_has_folder 一致:**缺列 → bail**(索引不可信,绝不当作「不存在」静默放过
+/// 导致重复追加);**NTFS 大小写折叠**(cfg!(windows) 下 to_lowercase)—— 否则源仅大小写改名后重做的
+/// dest_name 与崩溃前全局行仅大小写不同 → 精确比较漏命中 → 幂等失效、留下仅大小写不同的重复全局行
+/// (正是本修复要消除的孤儿/重复形态在大小写维度复活)。(强优化:孤儿索引行 + 对抗式 review P2)
+fn global_has_folder_on_drive(global: &Path, folder: &str, drive: &str) -> Result<bool> {
+    if !global.is_file() {
+        return Ok(false);
+    }
+    let mut rdr = csv::Reader::from_path(global)?;
+    let headers = rdr.headers()?.clone();
+    let (Some(ci_f), Some(ci_d)) = (
+        headers.iter().position(|h| h == "文件夹名"),
+        headers.iter().position(|h| h == "备份盘名"),
+    ) else {
+        anyhow::bail!(
+            "全局索引缺少『文件夹名』或『备份盘名』列,索引不可信(可能损坏或被改格式):{}",
+            global.display()
+        );
+    };
+    let fold = |s: &str| {
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let (want_f, want_d) = (fold(folder), fold(drive));
+    for rec in rdr.records() {
+        let rec = rec?;
+        let hit = rec.get(ci_f).map(|v| fold(v) == want_f).unwrap_or(false)
+            && rec.get(ci_d).map(|v| fold(v) == want_d).unwrap_or(false);
+        if hit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 把一行追加进 CSV 索引并**原子落盘**:读现有内容到内存 → 追加序列化的新行(文件不存在时
@@ -3392,5 +3449,117 @@ mod tests {
             reconcile_item_drive(&planned, 0, Some(&sealed)),
             ItemDriveCheck::AbortSealed
         ));
+    }
+
+    // ── 强优化(孤儿索引行):append_global_catalog 对同(文件夹名,备份盘名)幂等;不同盘照常追加 ──
+    #[test]
+    fn append_global_catalog_idempotent_per_folder_and_drive() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.csv");
+        let mk = |drive: &str| GlobalCatalogRow {
+            folder_name: "001proj".into(),
+            drive_name: drive.into(),
+            archived_time: "2026-06-06 00:00:00".into(),
+            project_no: "001".into(),
+            in_drive_path: "项目\\001proj".into(),
+            file_count: 1,
+            size_gb: 0.0,
+            verify: "SHA256-OK".into(),
+            manifest_path: "本盘信息\\校验清单\\001proj.sha256.csv".into(),
+        };
+        append_global_catalog(&g, &mk("备份1")).unwrap();
+        append_global_catalog(&g, &mk("备份1")).unwrap(); // 同(文件夹,盘)→ 幂等跳过
+        append_global_catalog(&g, &mk("备份2")).unwrap(); // 不同盘 → 仍追加
+        let gc = fs::read_to_string(&g).unwrap();
+        assert_eq!(
+            gc.lines().filter(|l| l.starts_with("001proj,备份1,")).count(),
+            1,
+            "同盘同名应幂等(只一行),实际:\n{gc}"
+        );
+        assert_eq!(
+            gc.lines().filter(|l| l.starts_with("001proj,备份2,")).count(),
+            1,
+            "不同盘应照常追加"
+        );
+    }
+
+    // ── 强优化(孤儿索引行,对抗式 review P2):幂等判定 NTFS 大小写折叠,仅大小写不同视为同项目 ──
+    #[cfg(windows)]
+    #[test]
+    fn append_global_catalog_idempotent_case_insensitive_on_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.csv");
+        let mk = |folder: &str| GlobalCatalogRow {
+            folder_name: folder.into(),
+            drive_name: "备份1".into(),
+            archived_time: "2026-06-06 00:00:00".into(),
+            project_no: "001".into(),
+            in_drive_path: format!("项目\\{}", folder),
+            file_count: 1,
+            size_gb: 0.0,
+            verify: "SHA256-OK".into(),
+            manifest_path: "m".into(),
+        };
+        append_global_catalog(&g, &mk("MyProj")).unwrap();
+        append_global_catalog(&g, &mk("myproj")).unwrap(); // 仅大小写不同 → NTFS 折叠后应幂等跳过
+        let gc = fs::read_to_string(&g).unwrap();
+        assert_eq!(
+            gc.lines()
+                .filter(|l| l.to_lowercase().starts_with("myproj,备份1,"))
+                .count(),
+            1,
+            "仅大小写不同应被 NTFS 折叠视为同项目、幂等跳过,实际:\n{gc}"
+        );
+    }
+
+    // ── 强优化(孤儿索引行):「全局已写、本盘未写」崩溃→重做应复用原名、无时间戳重复副本、全局无重复行 ──
+    // 同时守住两个修复点:写序「全局先于本盘」(否则全局不会被写)+ 全局 append 幂等(否则重做产生重复行)。
+    #[test]
+    fn redo_after_partial_global_write_reuses_name_no_orphan() {
+        let (_d, cfg, drive) = temp_world();
+        let p = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("a.txt"), b"hello").unwrap();
+        // 模拟「全局已写、本盘未写」崩溃:把本盘索引路径占成目录 → append_drive 失败;
+        // 因新写序「全局先于本盘」,此前 append_global 已成功写入。
+        let drive_cat = paths::drive_catalog_path(&drive.root);
+        fs::create_dir_all(&drive_cat).unwrap();
+        let out = handle_one(&cfg, &NoopReporter, &drive, &p, &test_opts(), None, None).unwrap();
+        assert!(
+            matches!(out, HandleOutcome::CommitInterrupted),
+            "本盘写失败应 CommitInterrupted"
+        );
+        let global = paths::system_global_catalog(&cfg.system_root);
+        assert!(
+            global_has_folder(&global, "001proj").unwrap(),
+            "新写序下全局索引应已写(全局先于本盘)"
+        );
+        assert!(p.is_dir(), "提交中断,源仍在待备份");
+
+        // 解除占用,重做(源仍在待备份)。
+        fs::remove_dir_all(&drive_cat).unwrap();
+        let out2 = handle_one(&cfg, &NoopReporter, &drive, &p, &test_opts(), None, None).unwrap();
+        assert!(matches!(out2, HandleOutcome::Done(_)), "重做应成功");
+        assert!(!p.exists(), "重做后源被移走");
+
+        // 复用原名,不产生时间戳重复副本(孤儿)。
+        let proj_dir = paths::drive_projects_dir(&drive.root);
+        let stamped = fs::read_dir(&proj_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("001proj_"));
+        assert!(!stamped, "应复用原名 001proj,不产生时间戳重复副本+孤儿");
+        // 全局索引只有一行 001proj(幂等吸收了崩溃前写的那行)。
+        let gc = fs::read_to_string(&global).unwrap();
+        assert_eq!(
+            gc.lines().filter(|l| l.starts_with("001proj,")).count(),
+            1,
+            "全局索引应只有一行 001proj(幂等),实际:\n{gc}"
+        );
+        // 本盘索引补回该行。
+        assert!(
+            catalog_has_project(&drive_cat, "001proj").unwrap(),
+            "本盘索引应补回 001proj"
+        );
     }
 }
