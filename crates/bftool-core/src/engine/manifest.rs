@@ -293,9 +293,10 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
     // 对称检查:源有但目标缺的文件,显式报告,不只靠 count/total_bytes 聚合量兜底
     // (聚合量在 cruft 过滤不对称时可能被凑平 → 漏检;reason 也更准)。缺失文件不进
     // bad_dst_rels(目标侧无此文件可隔离),copy_folder 下轮会自动补传。(ledger L-002)
-    let dmap: HashMap<&str, &Entry> = dst.entries.iter().map(|e| (e.rel.as_str(), e)).collect();
+    // 对称缺失只需 dst 的 key 集合,无需把 &Entry 一并装箱(原 HashMap 的 value 从未被读)。
+    let dkeys: std::collections::HashSet<&str> = dst.entries.iter().map(|e| e.rel.as_str()).collect();
     for ent in &src.entries {
-        if !dmap.contains_key(ent.rel.as_str()) {
+        if !dkeys.contains(ent.rel.as_str()) {
             d.reasons.push(format!("源有目标缺 {}", ent.rel));
         }
     }
@@ -487,5 +488,58 @@ mod tests {
             entries: vec![e("a", 10, "h1", "")],
         };
         assert!(diff(&src, &dst, true).ok());
+    }
+
+    // ── 强优化:钉死 no_hash 模式(check_hash=false)的 diff 判定契约 ──
+    // diff 在 no_hash 路径由 handle_one 传 check_hash=false。此时哈希比对被短路,只比
+    // count+size+对称缺失。把"等大小内容不同被有意放行、而 size 不同/缺失仍 fail"钉成
+    // 回归护栏 —— no_hash 是绕过 SHA256 的高危模式,其判定边界必须稳定不漂移。
+    #[test]
+    fn diff_no_hash_ignores_hash_mismatch_but_catches_size_and_missing() {
+        // (a) 同 rel、同 size、不同 hash:check_hash=false 有意放行
+        let src = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let dst = Manifest {
+            entries: vec![e("a", 10, "h2", "")],
+        };
+        assert!(
+            diff(&src, &dst, false).ok(),
+            "no_hash 模式应不比哈希,等大小不同内容应判通过"
+        );
+        // 对照:同输入在 check_hash=true 下必须 fail,证明放行确由 no_hash 造成
+        assert!(
+            !diff(&src, &dst, true).ok(),
+            "对照组:开哈希时应抓出哈希不一致"
+        );
+
+        // (b) 同 rel、size 不同:no_hash 下仍 fail
+        let src_sz = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let dst_sz = Manifest {
+            entries: vec![e("a", 11, "h1", "")],
+        };
+        assert!(
+            !diff(&src_sz, &dst_sz, false).ok(),
+            "no_hash 下大小不一致仍应 fail"
+        );
+
+        // (c) 目标缺文件:no_hash 下仍显式报"源有目标缺"
+        let src_m = Manifest {
+            entries: vec![e("a", 10, "h1", ""), e("b", 10, "h2", "")],
+        };
+        let dst_m = Manifest {
+            entries: vec![e("a", 10, "h1", "")],
+        };
+        let d = diff(&src_m, &dst_m, false);
+        assert!(!d.ok());
+        assert!(
+            d.reasons
+                .iter()
+                .any(|r| r.contains("源有目标缺") && r.contains('b')),
+            "no_hash 下仍应显式报告缺失,实际 reasons={:?}",
+            d.reasons
+        );
     }
 }

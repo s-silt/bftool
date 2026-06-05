@@ -258,19 +258,36 @@ fn start_archive(app: &mut App) {
     app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
+        let planned = plan.items.len();
         let s = archive::run_plan(&cfg, &plan, cancel, &reporter)?;
-        let mut parts = vec![format!("完成 {} 项", s.handled)];
-        if s.failed > 0 {
-            parts.push(format!("失败 {}", s.failed));
-        }
-        if s.cancelled {
-            parts.push("已取消".to_string());
-        }
-        if s.sealed_stopped {
-            parts.push("已封盘停本轮".to_string());
-        }
-        Ok(parts.join("，"))
+        Ok(summarize_archive(planned, &s))
     }));
+}
+
+/// 归档结束后状态栏文案。纯函数,可测。强优化:core 的多个安全前置失败分支(盘掉线/换盘/检测到多块盘/
+/// 复验失败)是 `reporter.error(原因)` 后 `return Ok(ArchiveSummary::default())` —— handled=0、failed=0、
+/// !cancelled、!sealed_stopped。旧闭包无条件产「完成 0 项」,在空闲态配绿点显示,等价于「成功无操作」,
+/// 把本轮『因安全原因被拒、需用户处理』误导成成功。这里据 planned 区分『被中止』『干净无操作』『正常结果』。
+fn summarize_archive(planned: usize, s: &archive::ArchiveSummary) -> String {
+    let quiet = s.handled == 0 && s.failed == 0 && !s.cancelled && !s.sealed_stopped;
+    if quiet {
+        return if planned > 0 {
+            "本轮未归档任何项目(执行前被中止,请看日志原因:盘掉线/换盘/检测到多块盘/中途封盘等)".to_string()
+        } else {
+            "本轮无可处理项目".to_string()
+        };
+    }
+    let mut parts = vec![format!("完成 {} 项", s.handled)];
+    if s.failed > 0 {
+        parts.push(format!("失败 {}", s.failed));
+    }
+    if s.cancelled {
+        parts.push("已取消".to_string());
+    }
+    if s.sealed_stopped {
+        parts.push("已封盘停本轮".to_string());
+    }
+    parts.join("，")
 }
 
 fn parse_limit(text: &str) -> Result<usize, String> {
@@ -351,5 +368,38 @@ mod tests {
         assert_eq!(parse_limit("").unwrap(), 0);
         assert_eq!(parse_limit(" 2 ").unwrap(), 2);
         assert!(parse_limit("1O").is_err());
+    }
+
+    // ── 强优化:被安全前置中止(planned>0、handled=0、全 false)绝不显示「完成」误导成功 ──
+    #[test]
+    fn summarize_archive_rejected_round_is_not_success() {
+        // core 安全前置拒绝 → 默认 summary(全 0/false),但本轮其实计划了项目。
+        let rejected = archive::ArchiveSummary::default();
+        let txt = summarize_archive(3, &rejected);
+        assert!(
+            !txt.contains("完成"),
+            "被中止的本轮不应显示「完成」,实际:{txt}"
+        );
+        assert!(txt.contains("中止"), "应提示被中止,实际:{txt}");
+
+        // 真·无可处理项目(planned=0)→ 另一套文案,也不含「完成」。
+        let empty = summarize_archive(0, &archive::ArchiveSummary::default());
+        assert!(!empty.contains("完成") && empty.contains("无可处理"));
+
+        // 正常归档结果仍如实显示「完成 N 项」。
+        let done = archive::ArchiveSummary {
+            handled: 2,
+            ..Default::default()
+        };
+        assert!(summarize_archive(2, &done).contains("完成 2 项"));
+
+        // 封盘停本轮不算 quiet,如实显示。
+        let sealed = archive::ArchiveSummary {
+            handled: 1,
+            sealed_stopped: true,
+            ..Default::default()
+        };
+        let st = summarize_archive(2, &sealed);
+        assert!(st.contains("完成 1 项") && st.contains("封盘"));
     }
 }

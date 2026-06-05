@@ -1017,4 +1017,40 @@ mod tests {
         );
         assert!(!paths::drive_sealed_path(&root).exists());
     }
+
+    // ── 强优化:seal 正向路径 —— 合法本盘索引应写出封盘标记,统计项目数/总字节正确,且可被识别 ──
+    // 现有 seal 测试只覆盖『坏索引 → 不产出标记』;本测试锁死正向写出与 drive_is_sealed 识别链路。
+    #[test]
+    fn seal_writes_marker_with_counts_and_is_recognized() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("drive");
+        std::fs::create_dir_all(paths::drive_info_dir(&root)).unwrap();
+        std::fs::write(
+            paths::drive_catalog_path(&root),
+            "ProjectName,TotalBytes\nA,10\nB,20\n",
+        )
+        .unwrap();
+        let drive = DriveInfo {
+            letter: "E".into(),
+            root: root.clone(),
+            id: "备份1".into(),
+            sealed: false,
+            free_bytes: 0,
+            total_bytes: 0,
+        };
+        seal(&drive).unwrap();
+        let marker = paths::drive_sealed_path(&root);
+        assert!(marker.is_file(), "合法索引应写出封盘标记");
+        assert!(drive_is_sealed(&root), "封盘后 drive_is_sealed 应为 true");
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert!(text.contains("归档总字节"), "标记应含归档总字节,实际:\n{text}");
+        assert!(
+            text.contains("30"),
+            "归档总字节应为 30(10+20),实际:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l.contains("项目数量") && l.contains('2')),
+            "项目数量应为 2,实际:\n{text}"
+        );
+    }
 }

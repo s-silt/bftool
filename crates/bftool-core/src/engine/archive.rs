@@ -472,6 +472,31 @@ impl Drop for ArchiveLock {
     }
 }
 
+/// `run_plan` 每个项目执行前对盘的实时裁决。
+enum ItemDriveCheck {
+    /// 同一块盘:用该值作为本项目可见剩余(已取 min(投影, 实时))。
+    Use(u64),
+    /// 盘内编号变了(同盘符被热插拔换了另一块盘)→ 中止本轮。
+    AbortSwapped,
+    /// 盘在本轮中途被封盘 → 中止本轮。
+    AbortSealed,
+}
+
+/// 每个项目执行前,按实时盘状态校正可见容量并**复验盘身份**。plan→run 边界(`run_plan` 开头)已验过
+/// 一次盘内编号/封盘态,但多项目一轮里,项目与项目之间仍可能被热插拔换盘(同盘符)或中途封盘。本工具
+/// 「认盘靠盘内编号、不靠盘符」—— 复用每项本就要做的 `info_by_letter` 实时查询顺带校验身份,编号不符/
+/// 被封盘即中止本轮,绝不把后续项目写到一块身份已不可信的盘上(否则数据落到错盘、索引却记成计划盘 id)。
+/// 读不到(盘离线)则保守退回投影值,沿用 plan→run 边界其余守卫兜底。纯函数,便于单测覆盖各分支。(强优化 review)
+fn reconcile_item_drive(planned: &DriveInfo, consumed: u64, live: Option<&DriveInfo>) -> ItemDriveCheck {
+    let projected = planned.free_bytes.saturating_sub(consumed);
+    match live {
+        Some(l) if l.id.trim() != planned.id.trim() => ItemDriveCheck::AbortSwapped,
+        Some(l) if l.sealed => ItemDriveCheck::AbortSealed,
+        Some(l) => ItemDriveCheck::Use(projected.min(l.free_bytes)),
+        None => ItemDriveCheck::Use(projected),
+    }
+}
+
 /// 执行计划:**冻"意图"(目标名/选盘)、不冻"安全判断"**。每项执行前重验受外部状态影响的安全前置——
 /// 盘仍在且未封盘(本函数开头按盘上 marker 实时重读)、源仍稳定、容量仍够、目标名仍不冲突——
 /// 任一已变 → 该项"计划已过期"跳过,绝不照旧 plan 误归档/误封盘。(Spec D §4.1)
@@ -627,16 +652,35 @@ pub fn run_plan(
         };
         // 把可见剩余传给 handle_one。R6-1:取 min(投影剩余, 实时剩余):consumed 处理本工具自身
         // 串行占用;但 plan→run 之间若有外部进程往备份盘写入,实时剩余会更低 —— 实时重查校正,
-        // 查询失败(盘离线等)则退回投影值(保守:不放大可用量)。
+        // 查询失败(盘离线等)则退回投影值(保守:不放大可用量)。强优化:这次实时查询顺带复验盘身份
+        // (编号/封盘),拦住「轮内同盘符热插拔换盘」窗口(见 reconcile_item_drive)。
         let mut drive_now = drive.clone();
-        let projected = drive.free_bytes.saturating_sub(consumed);
-        let live_free = drive::info_by_letter(&drive.letter)
-            .ok()
-            .map(|d| d.free_bytes);
-        drive_now.free_bytes = match live_free {
-            Some(live) => projected.min(live),
-            None => projected,
-        };
+        let live = drive::info_by_letter(&drive.letter).ok();
+        match reconcile_item_drive(drive, consumed, live.as_ref()) {
+            ItemDriveCheck::Use(free) => drive_now.free_bytes = free,
+            ItemDriveCheck::AbortSwapped => {
+                let now_id = live
+                    .as_ref()
+                    .map(|l| l.id.trim().to_string())
+                    .unwrap_or_default();
+                reporter.error(&format!(
+                    "计划已过期:盘符 {}: 上现在是「{}」而本轮计划针对「{}」(运行中途换过盘?)\
+                     → 停止本轮,已完成项目保留,请重新规划(bftool archive)。",
+                    drive.letter,
+                    now_id,
+                    drive.id.trim()
+                ));
+                break;
+            }
+            ItemDriveCheck::AbortSealed => {
+                reporter.error(&format!(
+                    "计划已过期:盘 {} ({}:) 在本轮中途被封盘 → 停止本轮,请换未封盘的盘重新规划。",
+                    drive.id.trim(),
+                    drive.letter
+                ));
+                break;
+            }
+        }
         match handle_one(
             cfg,
             reporter,
@@ -921,7 +965,8 @@ fn handle_one(
                 }
             };
             let occupied_after_plan = dest_phys.exists() && !dest_existed_at_plan;
-            let taken = indexed || occupied_after_plan;
+            // indexed / occupied_after_plan 两条早返回已穷尽『冻结名被占用』的全部情形,
+            // 故下方不再需要 `let taken = ...` 兜底块(恒为已处理态,不可达)。(review 强优化)
             if indexed {
                 reporter.warn(&format!(
                     "计划已过期：目标名『{}』在本盘索引中已存在(预览后被占用)→ 跳过本项目,请重新规划。",
@@ -936,14 +981,6 @@ fn handle_one(
                 ));
                 return Ok(HandleOutcome::StalePlan);
             }
-            if taken {
-                // Defensive fallback if future conditions are added above.
-                reporter.warn(&format!(
-                    "计划已过期：目标名『{}』已被占用 → 跳过本项目,请重新规划。",
-                    frozen
-                ));
-                return Ok(HandleOutcome::StalePlan);
-            };
             frozen.to_string()
         }
         // 直调路径:自行裁决,重名时现算唯一时间戳名(旧行为)。
@@ -1440,9 +1477,27 @@ fn catalog_has_project(catalog: &Path, project_name: &str) -> Result<bool> {
             catalog.display()
         );
     };
+    // NTFS 大小写不敏感:仅大小写不同的同名也算已存在,否则归档侧重名闸漏判 → 会尝试写进既有目录
+    // (diff 兜底 fail-closed,但旧备份独有文件会被挪进隔离区降级)。与 verify::extras_key / safety 的
+    // to_lowercase 折叠口径一致;非 Windows 保持精确比较。(强优化 review)
+    let want = if cfg!(windows) {
+        project_name.to_lowercase()
+    } else {
+        project_name.to_string()
+    };
     for rec in rdr.records() {
         let rec = rec?;
-        if rec.get(col).map(|v| v == project_name).unwrap_or(false) {
+        let hit = rec
+            .get(col)
+            .map(|v| {
+                if cfg!(windows) {
+                    v.to_lowercase() == want
+                } else {
+                    v == want
+                }
+            })
+            .unwrap_or(false);
+        if hit {
             return Ok(true);
         }
     }
@@ -1616,9 +1671,25 @@ fn global_has_folder(global: &Path, folder_name: &str) -> Result<bool> {
             global.display()
         );
     };
+    // 同 catalog_has_project:NTFS 大小写折叠,仅大小写不同的同名也算已登记;非 Windows 精确比较。(强优化 review)
+    let want = if cfg!(windows) {
+        folder_name.to_lowercase()
+    } else {
+        folder_name.to_string()
+    };
     for rec in rdr.records() {
         let rec = rec?;
-        if rec.get(col).map(|v| v == folder_name).unwrap_or(false) {
+        let hit = rec
+            .get(col)
+            .map(|v| {
+                if cfg!(windows) {
+                    v.to_lowercase() == want
+                } else {
+                    v == want
+                }
+            })
+            .unwrap_or(false);
+        if hit {
             return Ok(true);
         }
     }
@@ -2959,5 +3030,260 @@ mod tests {
                 n.starts_with("001proj_") && n != "001proj"
             });
         assert!(renamed, "重做应以时间戳唯一名归档,不覆盖原 001proj");
+    }
+
+    // ── 强优化:续传 size-skip + SHA256 diff 兜底 —— 等大小坏副本必须被隔离、源不移、不写索引 ──
+    // copy_folder 对『目标已存在且大小相同』的文件 continue 跳过(性能优化);正确性靠 handle_one
+    // 的 manifest::diff 逐文件比哈希兜底。本测试命中最危险协同路径:dest 预置一份与源等大小但
+    // 内容不同的副本(size-skip 会跳过它)→ diff 抓出哈希不一致 → 坏文件进隔离区、返回 Skipped、
+    // 源保留、索引不写。锁死『size 相同但内容不同』不会被静默当成功。(强优化 review)
+    #[test]
+    fn handle_one_size_skip_bad_copy_is_quarantined_source_kept() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap(); // 源 5B
+                                                          // 盘上预置一份"续传半成品":同名同大小(5B)但内容不同 → copy_folder 会 size-skip 跳过复制。
+        let dest = paths::drive_projects_dir(&drive.root).join("001proj");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("a.txt"), b"world").unwrap(); // 等大小坏副本
+                                                          // forced=Some(("001proj", true)):dest_existed_at_plan=true(续传),不判 occupied。
+        let outcome = handle_one(
+            &cfg,
+            &NoopReporter,
+            &drive,
+            &proj,
+            &test_opts(),
+            None,
+            Some(("001proj", true)),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, HandleOutcome::Skipped),
+            "等大小内容不同 → diff 抓出 → 应 Skipped(不当成功)"
+        );
+        assert!(proj.is_dir(), "校验失败,源不应被移走");
+        assert!(
+            paths::drive_quarantine_dir(&drive.root)
+                .join("001proj")
+                .join("a.txt")
+                .is_file(),
+            "坏副本应被移入隔离区"
+        );
+        assert!(
+            !paths::system_global_catalog(&cfg.system_root).is_file(),
+            "校验失败不应写全局索引"
+        );
+    }
+
+    // ── 强优化:run_plan 执行期 consumed 累计触发封盘(前项占用后,后项余量不足停本轮) ──
+    // 现有测试只覆盖 plan 期 plan_items 纯函数;本测试走 run_plan 集成路径,验证 consumed 扣减 →
+    // handle_one 返回 DriveSealed → summary.sealed_stopped、后项源保留。(强优化 review)
+    #[test]
+    fn run_plan_seals_mid_round_on_cumulative_consumed() {
+        let (_d, cfg, mut drive) = temp_world();
+        drive.free_bytes = 6000; // 够一个 4096,不够两个
+        let p1 = cfg.ready_root.join("001a");
+        let p2 = cfg.ready_root.join("002b");
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+        fs::write(p1.join("f"), vec![0u8; 4096]).unwrap();
+        fs::write(p2.join("f"), vec![0u8; 4096]).unwrap();
+        let plan = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![
+                PlanItem {
+                    name: "001a".into(),
+                    est_bytes: 4096,
+                    dest_existed_at_plan: false,
+                    action: PlanAction::Archive {
+                        dest_name: "001a".into(),
+                    },
+                },
+                PlanItem {
+                    name: "002b".into(),
+                    est_bytes: 4096,
+                    dest_existed_at_plan: false,
+                    action: PlanAction::Archive {
+                        dest_name: "002b".into(),
+                    },
+                },
+            ],
+            opts: test_opts(),
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let s = run_plan(&cfg, &plan, &cancel, &NoopReporter).unwrap();
+        assert_eq!(s.handled, 1, "第一个项目应归档");
+        assert!(s.sealed_stopped, "第二个项目累计余量不足应封盘停本轮");
+        assert!(p2.is_dir(), "封盘停本轮后第二个项目源应仍在待备份");
+        assert!(
+            !cfg.archived_root.join("002b").exists(),
+            "第二个项目不应被归档"
+        );
+        assert!(
+            cfg.archived_root.join("001a").is_dir(),
+            "第一个项目应已归档移源"
+        );
+    }
+
+    // ── 强优化:ArchiveLock 的 Drop(RAII)在 run_plan 正常退出后释放锁,次轮可再取锁 ──
+    // 现有测试只覆盖『锁预先存在 → 拒绝』。本测试锁死反向:正常跑完锁文件消失、第二轮能成功取锁,
+    // 防止 `_archive_lock` 误成 `_` 立即 drop / 锁未释放导致归档永久被自己上轮残留锁挡死。(强优化 review)
+    #[test]
+    fn run_plan_releases_lock_so_next_round_can_acquire() {
+        let (_d, cfg, drive) = temp_world();
+        let lock = cfg.system_root.join(".bftool-archive.lock");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let p1 = cfg.ready_root.join("001a");
+        fs::create_dir_all(&p1).unwrap();
+        fs::write(p1.join("a.txt"), b"hello").unwrap();
+        let plan1 = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "001a".into(),
+                est_bytes: 5,
+                dest_existed_at_plan: false,
+                action: PlanAction::Archive {
+                    dest_name: "001a".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let s1 = run_plan(&cfg, &plan1, &cancel, &NoopReporter).unwrap();
+        assert_eq!(s1.handled, 1);
+        assert!(!lock.exists(), "run_plan 正常退出后应已释放归档锁(Drop)");
+
+        let p2 = cfg.ready_root.join("002b");
+        fs::create_dir_all(&p2).unwrap();
+        fs::write(p2.join("a.txt"), b"world").unwrap();
+        let plan2 = ArchivePlan {
+            drive: drive.clone(),
+            items: vec![PlanItem {
+                name: "002b".into(),
+                est_bytes: 5,
+                dest_existed_at_plan: false,
+                action: PlanAction::Archive {
+                    dest_name: "002b".into(),
+                },
+            }],
+            opts: test_opts(),
+        };
+        let s2 = run_plan(&cfg, &plan2, &cancel, &NoopReporter).unwrap();
+        assert_eq!(s2.handled, 1, "上轮锁已释放,第二轮应能取锁并归档");
+    }
+
+    // ── 强优化:崩溃重做(索引已写源未移)产出的新副本内容必须正确,且不触碰旧副本 ──
+    // 现有 idempotent 测试只验『改名/不覆盖/源移走』,两次源内容相同、从不读新副本内容。本测试把盘上
+    // 旧副本篡改成坏内容,重做后断言:新时间戳副本内容 == 源内容、旧坏副本未被覆盖、源被移走。(强优化 review)
+    #[test]
+    fn crash_redo_new_copy_content_correct_old_untouched() {
+        let (_d, cfg, drive) = temp_world();
+        let proj = cfg.ready_root.join("001proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        let proj_dir = paths::drive_projects_dir(&drive.root);
+        // 篡改盘上已索引的旧副本(模拟它其实是坏的)。
+        fs::write(proj_dir.join("001proj").join("a.txt"), b"BAD!!").unwrap();
+        // 崩溃残留:源又出现在待备份(内容正确)。
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        let out =
+            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        assert!(matches!(out, HandleOutcome::Done(_)), "重做应成功(改名归档)");
+        assert!(!proj.exists(), "重做后源被移走");
+        assert_eq!(
+            fs::read(proj_dir.join("001proj").join("a.txt")).unwrap(),
+            b"BAD!!",
+            "原(坏)副本不应被覆盖"
+        );
+        let renamed = fs::read_dir(&proj_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.starts_with("001proj_") && n != "001proj")
+            .expect("重做应产出时间戳唯一名新副本");
+        assert_eq!(
+            fs::read(proj_dir.join(&renamed).join("a.txt")).unwrap(),
+            b"hello",
+            "重做新副本内容应等于源内容"
+        );
+    }
+
+    // ── 强优化:NTFS 大小写不敏感 —— catalog/global 索引判重应折叠大小写(仅大小写不同算已存在) ──
+    #[cfg(windows)]
+    #[test]
+    fn catalog_and_global_has_project_case_insensitive_on_windows() {
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("cat.csv");
+        fs::write(&cat, "ProjectName,TotalBytes\nProj,10\n").unwrap();
+        assert!(
+            catalog_has_project(&cat, "proj").unwrap(),
+            "NTFS:仅大小写不同应判已存在"
+        );
+        assert!(catalog_has_project(&cat, "PROJ").unwrap());
+        assert!(!catalog_has_project(&cat, "other").unwrap());
+
+        let glob = d.path().join("global.csv");
+        fs::write(&glob, "文件夹名,盘\nProj,备份1\n").unwrap();
+        assert!(global_has_folder(&glob, "proj").unwrap());
+        assert!(!global_has_folder(&glob, "nope").unwrap());
+    }
+
+    // ── 强优化:每项执行前的盘身份复验(换盘/封盘中止;离线退回投影;同盘取 min(投影,实时)) ──
+    #[test]
+    fn reconcile_item_drive_guards_swap_seal_offline() {
+        let planned = DriveInfo {
+            letter: "T".into(),
+            root: std::path::PathBuf::new(),
+            id: "备份1".into(),
+            sealed: false,
+            free_bytes: 10_000,
+            total_bytes: 20_000,
+        };
+        // 盘离线/读不到 → 退回投影值(free - consumed)。
+        assert!(matches!(
+            reconcile_item_drive(&planned, 3_000, None),
+            ItemDriveCheck::Use(7_000)
+        ));
+        // 同盘、实时更低 → 取 min(投影 9000, 实时 4000)。
+        let same = DriveInfo {
+            id: "备份1".into(),
+            free_bytes: 4_000,
+            ..planned.clone()
+        };
+        assert!(matches!(
+            reconcile_item_drive(&planned, 1_000, Some(&same)),
+            ItemDriveCheck::Use(4_000)
+        ));
+        // 同盘、实时更高 → 仍取投影 9000。
+        let roomy = DriveInfo {
+            free_bytes: 999_999,
+            ..planned.clone()
+        };
+        assert!(matches!(
+            reconcile_item_drive(&planned, 1_000, Some(&roomy)),
+            ItemDriveCheck::Use(9_000)
+        ));
+        // 盘内编号变了(同盘符换盘)→ 中止本轮。
+        let other = DriveInfo {
+            id: "备份7".into(),
+            ..planned.clone()
+        };
+        assert!(matches!(
+            reconcile_item_drive(&planned, 0, Some(&other)),
+            ItemDriveCheck::AbortSwapped
+        ));
+        // 中途被封盘 → 中止本轮。
+        let sealed = DriveInfo {
+            id: "备份1".into(),
+            sealed: true,
+            ..planned.clone()
+        };
+        assert!(matches!(
+            reconcile_item_drive(&planned, 0, Some(&sealed)),
+            ItemDriveCheck::AbortSealed
+        ));
     }
 }

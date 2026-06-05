@@ -352,7 +352,14 @@ fn check_one_file(
     reporter: &dyn Reporter,
     report: &mut VerifyReport,
 ) {
-    let f = proj_dir.join(rel);
+    // rel 已在 read_manifest_rows 归一化为 `\` 分隔。proj_dir.join(rel) 在 Windows 上正确(\ 是分隔符),
+    // 但在非 Windows(Linux/CI)上 `\` 是合法文件名字符 → 整个 "sub\a.txt" 被当单一文件名,嵌套子目录
+    // 文件被误报 Missing,使 CI 对嵌套损坏结构性盲区。显式按 `\` 拆段 fold-join,跨平台一致(Windows 上
+    // "sub\a.txt".split('\\')=["sub","a.txt"],fold-join 与原 join 等价)。各段已由 validate_manifest_rel
+    // 保证不含空段/`.`/`..`/`:`。(强优化 review)
+    let f = rel
+        .split('\\')
+        .fold(proj_dir.to_path_buf(), |p, seg| p.join(seg));
     report.checked += 1;
     // 与归档侧 follow_links(false) 对齐:用 symlink_metadata 看路径**本身**、不跟随链接。归档时清单只登记
     // 真实文件(cruft::walk follow_links=false),若备份盘上某登记文件事后被替换成符号链接/junction(可指向
@@ -517,10 +524,18 @@ fn read_manifest_rows(
         if cruft::rel_has_cruft_component(&rel) {
             continue;
         }
+        // trim 单元格:外部/Excel 另存的清单常带尾随空白。不 trim 会让 (a) 含尾随空格的 Hash
+        // 与重算值 eq_ignore_ascii_case 永不相等 → 完好文件误报 Corrupt;(b) 空白 Hash " " 因
+        // is_empty()==false 绕过 size+hash 皆缺的 Unverifiable fail-closed;(c) Size "5 " parse 失败
+        // 静默 None → 跳过大小校验。与 verify_state::parse_count 已 trim 的口径一致。(强优化 review)
         let size = i_size
             .and_then(|c| rec.get(c))
-            .and_then(|s| s.parse::<u64>().ok());
-        let hash = i_hash.and_then(|c| rec.get(c)).unwrap_or("").to_string();
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let hash = i_hash
+            .and_then(|c| rec.get(c))
+            .map(|s| s.trim())
+            .unwrap_or("")
+            .to_string();
         // 归一化分隔符为 `\`,与 report_extras 产出的 rel 及 check_one_file 的 join 口径一致;
         // 否则正斜杠清单(旧版/外部工具写的 "sub/a.txt")会让已登记且已校验的文件被
         // report_extras 误报为「清单外多余」。本工具自写清单已是 `\`,此处只兜底外来清单。(review-r3)
@@ -770,6 +785,74 @@ mod tests {
         );
     }
 
+    // ── 强优化:清单整列缺 Hash(只有 Rel,Size,连 Hash 列都没有)→ size-only,不报损坏 ──
+    // setup() 硬编码三列表头,造不出『整列缺失』;手写两列清单覆盖 i_hash.is_none() 分支,
+    // 防止一块全 no-hash 内容的盘因解析回归被误绿标。(强优化 review)
+    #[test]
+    fn verify_tree_whole_hash_column_missing_is_size_only() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        // 只有两列、没有 Hash 列(模拟外部/旧版清单)。
+        fs::write(mdir.join("proj.sha256.csv"), "Rel,Size\na.txt,5\n").unwrap();
+        fs::write(proj.join("a.txt"), b"hello").unwrap();
+        let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "大小一致、整列无哈希 → 不报损坏");
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.size_only, 1, "整列缺 Hash 的行应计入 size_only");
+        assert_eq!(
+            r.outcome(),
+            VerifyOutcome::CleanButSizeOnly { size_only: 1 },
+            "结论应为『仅大小校验』而非 Clean"
+        );
+    }
+
+    // ── 强优化:嵌套子目录文件须跨平台按 `\` 拆段定位,不被误报 Missing(CI/Linux 盲区) ──
+    // 不走 setup()(它用 proj.join(rel) 建文件,在非 Windows 上 "sub\a.txt" 会建成单一文件名)。
+    #[test]
+    fn verify_tree_nested_subdir_file_checked_cross_platform() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(proj.join("sub")).unwrap();
+        let content = b"hello";
+        fs::write(proj.join("sub").join("a.txt"), content).unwrap();
+        // 清单用本工具自写的 `\` 分隔。check_one_file 必须跨平台拆段,否则非 Windows 误报 Missing。
+        fs::write(
+            mdir.join("proj.sha256.csv"),
+            format!("Rel,Size,Hash\nsub\\a.txt,5,{}\n", sha_of(content)),
+        )
+        .unwrap();
+        let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "嵌套子目录文件应被定位校验,不应误报 Missing");
+        assert_eq!(r.checked, 1);
+    }
+
+    // ── 强优化:Hash/Size 单元格的尾随空白须 trim,完好文件不被误报 Corrupt ──
+    #[test]
+    fn verify_tree_trims_whitespace_in_hash_and_size_cells() {
+        let d = tempfile::tempdir().unwrap();
+        let mdir = d.path().join("m");
+        let proj = d.path().join("p").join("proj");
+        fs::create_dir_all(&mdir).unwrap();
+        fs::create_dir_all(&proj).unwrap();
+        let content = b"hello";
+        fs::write(proj.join("a.txt"), content).unwrap();
+        // Hash 带尾随空格、Size 带尾随空格(模拟 Excel 另存)。
+        fs::write(
+            mdir.join("proj.sha256.csv"),
+            format!("Rel,Size,Hash\na.txt,5 ,{} \n", sha_of(content)),
+        )
+        .unwrap();
+        let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
+        assert_eq!(r.bad, 0, "尾随空白应被 trim,完好文件不应误报 Corrupt");
+        assert_eq!(r.checked, 1);
+        assert_eq!(r.size_only, 0, "Size trim 后应解析成功并精确比对(非 size_only)");
+    }
+
     // ── Phase 4 F-01/F-6: 清单缺 Size 且缺 Hash → fail-closed ──
     #[test]
     fn verify_tree_unverifiable_row_is_bad() {
@@ -998,6 +1081,27 @@ mod tests {
         assert_eq!(r.checked, 0, "项目边界即取消,未检查任何文件");
         assert!(!r.has_corruption());
         assert_eq!(r.outcome(), VerifyOutcome::Cancelled);
+    }
+
+    // ── 强优化:中途取消(已检查若干文件、已发现损坏)时结论应是 Cancelled,优先于 IssuesFound ──
+    // 现有取消测试是首项即取消(checked==0)。这里锁死 outcome() 的优先级:cancelled 压过 bad,
+    // 防止一次被用户中途取消的复查被误报成『整盘发现损坏』。(强优化 review)
+    #[test]
+    fn outcome_cancelled_takes_precedence_over_corruption() {
+        // 已检查若干文件并发现一处损坏,随后被取消。
+        let r = VerifyReport {
+            checked: 3,
+            bad: 1,
+            cancelled: true,
+            ..Default::default()
+        };
+        assert!(r.checked > 0);
+        assert!(r.has_corruption());
+        assert_eq!(
+            r.outcome(),
+            VerifyOutcome::Cancelled,
+            "取消应优先于损坏,避免把未跑完的复查误报为发现损坏"
+        );
     }
 
     /// 铺一块完整的临时"备份盘":本盘信息\本盘编号.txt + 校验清单\proj.sha256.csv + 项目\proj\<files>。
