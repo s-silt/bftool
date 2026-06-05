@@ -272,7 +272,8 @@ fn summarize_archive(planned: usize, s: &archive::ArchiveSummary) -> String {
     let quiet = s.handled == 0 && s.failed == 0 && !s.cancelled && !s.sealed_stopped;
     if quiet {
         return if planned > 0 {
-            "本轮未归档任何项目(执行前被中止,请看日志原因:盘掉线/换盘/检测到多块盘/中途封盘等)".to_string()
+            "本轮未归档任何项目(执行前被中止,请看日志原因:盘掉线/换盘/检测到多块盘/中途封盘等)"
+                .to_string()
         } else {
             "本轮无可处理项目".to_string()
         };

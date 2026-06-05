@@ -487,7 +487,11 @@ enum ItemDriveCheck {
 /// 「认盘靠盘内编号、不靠盘符」—— 复用每项本就要做的 `info_by_letter` 实时查询顺带校验身份,编号不符/
 /// 被封盘即中止本轮,绝不把后续项目写到一块身份已不可信的盘上(否则数据落到错盘、索引却记成计划盘 id)。
 /// 读不到(盘离线)则保守退回投影值,沿用 plan→run 边界其余守卫兜底。纯函数,便于单测覆盖各分支。(强优化 review)
-fn reconcile_item_drive(planned: &DriveInfo, consumed: u64, live: Option<&DriveInfo>) -> ItemDriveCheck {
+fn reconcile_item_drive(
+    planned: &DriveInfo,
+    consumed: u64,
+    live: Option<&DriveInfo>,
+) -> ItemDriveCheck {
     let projected = planned.free_bytes.saturating_sub(consumed);
     match live {
         Some(l) if l.id.trim() != planned.id.trim() => ItemDriveCheck::AbortSwapped,
@@ -1953,8 +1957,9 @@ fn copy_folder(
             // (被当 cruft 忽略、下轮重写),不会留下"大小对得上的半成品"被续传误跳过。(ledger L-014)
             // 强优化:复制时边读边算源哈希(copy_file_hashed),折叠掉独立的源清单读盘一遍。
             if no_hash {
-                fs::copy(path, &part)
-                    .with_context(|| format!("复制失败：{} → {}", path.display(), part.display()))?;
+                fs::copy(path, &part).with_context(|| {
+                    format!("复制失败：{} → {}", path.display(), part.display())
+                })?;
             } else {
                 let h = manifest::copy_file_hashed(path, &part)?;
                 src_hashes.insert(rel_key, h);
@@ -3365,9 +3370,11 @@ mod tests {
         // 崩溃残留:源又出现在待备份(内容正确)。
         fs::create_dir_all(&proj).unwrap();
         fs::write(proj.join("a.txt"), b"hello").unwrap();
-        let out =
-            handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
-        assert!(matches!(out, HandleOutcome::Done(_)), "重做应成功(改名归档)");
+        let out = handle_one(&cfg, &NoopReporter, &drive, &proj, &test_opts(), None, None).unwrap();
+        assert!(
+            matches!(out, HandleOutcome::Done(_)),
+            "重做应成功(改名归档)"
+        );
         assert!(!proj.exists(), "重做后源被移走");
         assert_eq!(
             fs::read(proj_dir.join("001proj").join("a.txt")).unwrap(),
@@ -3484,12 +3491,16 @@ mod tests {
         append_global_catalog(&g, &mk("备份2")).unwrap(); // 不同盘 → 仍追加
         let gc = fs::read_to_string(&g).unwrap();
         assert_eq!(
-            gc.lines().filter(|l| l.starts_with("001proj,备份1,")).count(),
+            gc.lines()
+                .filter(|l| l.starts_with("001proj,备份1,"))
+                .count(),
             1,
             "同盘同名应幂等(只一行),实际:\n{gc}"
         );
         assert_eq!(
-            gc.lines().filter(|l| l.starts_with("001proj,备份2,")).count(),
+            gc.lines()
+                .filter(|l| l.starts_with("001proj,备份2,"))
+                .count(),
             1,
             "不同盘应照常追加"
         );

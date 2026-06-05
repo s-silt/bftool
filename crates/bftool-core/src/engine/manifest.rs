@@ -351,7 +351,8 @@ pub fn diff(src: &Manifest, dst: &Manifest, check_hash: bool) -> Diff {
     // (聚合量在 cruft 过滤不对称时可能被凑平 → 漏检;reason 也更准)。缺失文件不进
     // bad_dst_rels(目标侧无此文件可隔离),copy_folder 下轮会自动补传。(ledger L-002)
     // 对称缺失只需 dst 的 key 集合,无需把 &Entry 一并装箱(原 HashMap 的 value 从未被读)。
-    let dkeys: std::collections::HashSet<&str> = dst.entries.iter().map(|e| e.rel.as_str()).collect();
+    let dkeys: std::collections::HashSet<&str> =
+        dst.entries.iter().map(|e| e.rel.as_str()).collect();
     for ent in &src.entries {
         if !dkeys.contains(ent.rel.as_str()) {
             d.reasons.push(format!("源有目标缺 {}", ent.rel));

@@ -865,7 +865,10 @@ mod tests {
         let r = verify_tree(&mdir, &d.path().join("p"), &abool(), &NoopReporter).unwrap();
         assert_eq!(r.bad, 0, "尾随空白应被 trim,完好文件不应误报 Corrupt");
         assert_eq!(r.checked, 1);
-        assert_eq!(r.size_only, 0, "Size trim 后应解析成功并精确比对(非 size_only)");
+        assert_eq!(
+            r.size_only, 0,
+            "Size trim 后应解析成功并精确比对(非 size_only)"
+        );
     }
 
     // ── Phase 4 F-01/F-6: 清单缺 Size 且缺 Hash → fail-closed ──

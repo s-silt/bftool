@@ -1041,13 +1041,17 @@ mod tests {
         assert!(marker.is_file(), "合法索引应写出封盘标记");
         assert!(drive_is_sealed(&root), "封盘后 drive_is_sealed 应为 true");
         let text = std::fs::read_to_string(&marker).unwrap();
-        assert!(text.contains("归档总字节"), "标记应含归档总字节,实际:\n{text}");
+        assert!(
+            text.contains("归档总字节"),
+            "标记应含归档总字节,实际:\n{text}"
+        );
         assert!(
             text.contains("30"),
             "归档总字节应为 30(10+20),实际:\n{text}"
         );
         assert!(
-            text.lines().any(|l| l.contains("项目数量") && l.contains('2')),
+            text.lines()
+                .any(|l| l.contains("项目数量") && l.contains('2')),
             "项目数量应为 2,实际:\n{text}"
         );
     }
