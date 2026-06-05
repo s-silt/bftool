@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -115,6 +115,28 @@ pub struct ManifestOpts {
 
 /// 生成文件夹清单。`no_hash=true` 时 `Entry.hash` 为 `None`(CSV 落盘仍写空串保持兼容)。
 pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result<Manifest> {
+    build_inner(root, opts, reporter, None)
+}
+
+/// 同 [`build`],但文件 SHA256 优先取自 `precomputed`(rel→大写十六进制),命中即免去再读一遍源内容。
+/// 强优化:供 handle_one 把『复制 + 生成源清单』折叠为一遍读源 —— copy_folder 复制时边读边算出各源文件
+/// 哈希注入此处;清单结构(rel/size/mtime/去重/cruft 过滤)仍由本函数权威产出,绝不偏离。未命中(极少:复制
+/// 与本次枚举之间源发生变化)回退逐文件 sha256_hex 保证正确性。`no_hash` 模式忽略 precomputed。
+pub(crate) fn build_with_hashes(
+    root: &Path,
+    opts: ManifestOpts,
+    reporter: &dyn Reporter,
+    precomputed: &HashMap<String, String>,
+) -> Result<Manifest> {
+    build_inner(root, opts, reporter, Some(precomputed))
+}
+
+fn build_inner(
+    root: &Path,
+    opts: ManifestOpts,
+    reporter: &dyn Reporter,
+    precomputed: Option<&HashMap<String, String>>,
+) -> Result<Manifest> {
     let files = real_files(root, reporter)?;
     let total_bytes: u64 = files
         .iter()
@@ -151,6 +173,9 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
 
         let hash = if opts.no_hash {
             None
+        } else if let Some(h) = precomputed.and_then(|m| m.get(&rel)) {
+            // 复制时已边读边算出该源文件哈希,直接复用,免去再读一遍源内容。(强优化:三遍读源折叠)
+            Some(h.clone())
         } else {
             match sha256_hex(f) {
                 Ok(h) => Some(h),
@@ -211,7 +236,7 @@ pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result
     Ok(Manifest { entries })
 }
 
-fn sha256_hex(path: &Path) -> Result<String> {
+pub(crate) fn sha256_hex(path: &Path) -> Result<String> {
     let f = File::open(path).with_context(|| format!("打开文件失败：{}", path.display()))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, f);
     let mut hasher = Sha256::new();
@@ -223,13 +248,45 @@ fn sha256_hex(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    let out = hasher.finalize();
-    let mut s = String::with_capacity(out.len() * 2);
-    for b in out {
+    Ok(hex_upper(&hasher.finalize()))
+}
+
+/// 复制 `src` → `dst` 的同时计算 **源** 的 SHA256(边读边算),返回大写十六进制。强优化:供 copy_folder
+/// 把『复制 + 生成源清单哈希』两遍读源折叠为一遍。与 [`sha256_hex`] 对同一字节产出**完全一致**的哈希
+/// (同一 Sha256 增量喂入),故折叠出的源哈希与目标侧 sha256_hex 可直接比对。注意:与 `fs::copy` 不同,
+/// 本函数不复制权限位(NTFS 备份只关心内容,清单只记 rel/size/hash/mtime,权限不参与校验)。
+pub(crate) fn copy_file_hashed(src: &Path, dst: &Path) -> Result<String> {
+    let in_f = File::open(src).with_context(|| format!("打开源失败：{}", src.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, in_f);
+    let out_f = File::create(dst).with_context(|| format!("创建目标失败：{}", dst.display()))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, out_f);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("读源失败：{}", src.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        writer
+            .write_all(&buf[..n])
+            .with_context(|| format!("写目标失败：{}", dst.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("刷写目标失败：{}", dst.display()))?;
+    Ok(hex_upper(&hasher.finalize()))
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         use std::fmt::Write as _;
         write!(&mut s, "{:02X}", b).ok();
     }
-    Ok(s)
+    s
 }
 
 fn path_relative(base: &Path, full: &Path) -> String {

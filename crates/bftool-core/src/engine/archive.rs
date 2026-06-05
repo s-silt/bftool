@@ -1141,14 +1141,24 @@ fn handle_one(
         }
     }
 
-    // 生成源清单
-    reporter.info(&format!("生成源清单/校验和（{:.2}GB，可能较慢）…", size_gb));
-    let src = manifest::build(
+    // 复制(强优化:复制时边读边算源哈希,把『复制 + 生成源清单』折叠为一遍读源,省掉独立的源清单读盘)。
+    fs::create_dir_all(&dest).context("创建目标目录失败")?;
+    reporter.info(&format!(
+        "复制并生成源校验和（{:.2}GB，可能较慢；断点续传：已存在且大小一致的文件跳过复制）…",
+        size_gb
+    ));
+    let src_hashes = copy_folder(proj_path, &dest, opts.no_hash, reporter)?;
+    reporter.info("复制完成，开始校验…");
+
+    // 源清单:复用复制时算出的哈希(build_with_hashes),免再读一遍源内容;rel/size/mtime/去重等结构仍由
+    // manifest 权威产出。size-skip 跳过复制的文件其哈希已在 copy_folder 内单独补算注入。
+    let src = manifest::build_with_hashes(
         proj_path,
         ManifestOpts {
             no_hash: opts.no_hash,
         },
         reporter,
+        &src_hashes,
     )?;
 
     // 0 真实文件:不归档、不移源 —— 否则"什么都没备份"会被记成 SHA256-OK 成功并把源移走。(ledger L-003)
@@ -1162,12 +1172,6 @@ fn handle_one(
         );
         return Ok(HandleOutcome::Skipped);
     }
-
-    // 复制
-    fs::create_dir_all(&dest).context("创建目标目录失败")?;
-    reporter.info("开始复制（断点续传：已存在且大小一致的文件会被跳过）…");
-    copy_folder(proj_path, &dest, reporter)?;
-    reporter.info("复制完成，开始校验…");
 
     // 目标清单 + 比对
     let dst = manifest::build(
@@ -1814,12 +1818,21 @@ fn source_bftool_part_files(root: &Path) -> Result<Vec<String>> {
 /// 但**不会漏检**：copy_folder 返回后，handle_one 会对整个目标目录重算 manifest 并与源做
 /// SHA256 diff(manifest::diff，非 no_hash 时逐文件比哈希)，内容不一致的文件在那一步被发现、
 /// 移入隔离目录，下次运行补传重校。即「大小跳过」是性能优化，「SHA256 diff」是正确性兜底。
-fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
+fn copy_folder(
+    src: &Path,
+    dst: &Path,
+    no_hash: bool,
+    reporter: &dyn Reporter,
+) -> Result<std::collections::HashMap<String, String>> {
     // 把「按系统杂文件名单静默排除、但其实含真实内容」的源条目变为可见 warn —— 防止用户真实数据
     // 恰好命名为 cruft(如恢复产物目录 found.000、或被命名为 Thumbs.db 的业务文件)在归档『成功』、
     // 源被 MOVE 走之后才发现备份里少了东西。只告警不改过滤(过滤须对称,否则 verify 误报)。(review-r3 round2)
     cruft::warn_excluded_real_content(src, reporter);
     fs::create_dir_all(dst).ok();
+    // 强优化:复制时边读边算出的各源文件 SHA256(rel→大写十六进制),供 build_with_hashes 复用,把
+    // 『复制 + 生成源清单』折叠为一遍读源(三遍读源 → 两遍)。no_hash 模式不算哈希、返回空表。
+    let mut src_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut errors: Vec<String> = Vec::new();
     for entry in cruft::walk(src) {
         let entry = match entry {
@@ -1842,16 +1855,25 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
                 errors.push(format!("建目录失败 {}：{}", target.display(), e));
             }
         } else if entry.file_type().is_file() {
+            // 源清单的哈希键:与 manifest::path_relative 同口径(strip_prefix 后归一化为 `\`)。
+            let rel_key = rel.to_string_lossy().replace('/', "\\");
             // 原子复制的临时名;先清理可能残留的孤儿 .part(上次中断留下),避免在备份盘累积。(Phase 4 F-3)
             let part = {
                 let mut s = target.clone().into_os_string();
-                s.push(".bftool-part");
+                s.push(cruft::PART_SUFFIX);
                 PathBuf::from(s)
             };
-            let _ = fs::remove_file(&part); // best-effort:失败也会被下面 fs::copy 覆盖
-                                            // 已存在且大小一致 → 视为已传，跳过（断点续传）
+            let _ = fs::remove_file(&part); // best-effort:失败也会被下面复制覆盖
+                                            // 已存在且大小一致 → 视为已传，跳过复制（断点续传）。
             if let (Ok(meta_src), Ok(meta_dst)) = (path.metadata(), target.metadata()) {
                 if meta_src.len() == meta_dst.len() {
+                    // 强优化:跳过复制的文件没有复制读流 → 其源哈希须单独补算,否则源清单缺该项、
+                    // diff 会误报「源有目标缺」。算成功就注入;失败则不注入,留给 build 回退兜底报错。
+                    if !no_hash {
+                        if let Ok(h) = manifest::sha256_hex(path) {
+                            src_hashes.insert(rel_key.clone(), h);
+                        }
+                    }
                     continue;
                 }
             }
@@ -1860,8 +1882,14 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
             }
             // 原子复制:写 <target>.bftool-part → fsync → rename。崩溃只会留下 .part
             // (被当 cruft 忽略、下轮重写),不会留下"大小对得上的半成品"被续传误跳过。(ledger L-014)
-            fs::copy(path, &part)
-                .with_context(|| format!("复制失败：{} → {}", path.display(), part.display()))?;
+            // 强优化:复制时边读边算源哈希(copy_file_hashed),折叠掉独立的源清单读盘一遍。
+            if no_hash {
+                fs::copy(path, &part)
+                    .with_context(|| format!("复制失败：{} → {}", path.display(), part.display()))?;
+            } else {
+                let h = manifest::copy_file_hashed(path, &part)?;
+                src_hashes.insert(rel_key, h);
+            }
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&part)
@@ -1889,7 +1917,7 @@ fn copy_folder(src: &Path, dst: &Path, reporter: &dyn Reporter) -> Result<()> {
         }
         anyhow::bail!("复制阶段枚举源失败 {} 项 → 本项目跳过。", errors.len());
     }
-    Ok(())
+    Ok(src_hashes)
 }
 
 /// 列出 待备份 下的待归档项目目录(按文件夹名前导数字升序,无数字前缀的排最后)。
@@ -2090,10 +2118,47 @@ mod tests {
         fs::create_dir_all(src.join("sub")).unwrap();
         fs::write(src.join("a.txt"), b"hello").unwrap();
         fs::write(src.join("sub").join("b.bin"), b"xyz").unwrap();
-        copy_folder(&src, &dst, &NoopReporter).unwrap();
+        let hashes = copy_folder(&src, &dst, false, &NoopReporter).unwrap();
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(fs::read(dst.join("sub").join("b.bin")).unwrap(), b"xyz");
         assert!(!dst.join("a.txt.bftool-part").exists(), "不应遗留 .part");
+        // 强优化:复制时边读边算的源哈希应与独立 sha256_hex 逐字一致(折叠正确性)。
+        assert_eq!(
+            hashes.get("a.txt").map(String::as_str),
+            Some(manifest::sha256_hex(&src.join("a.txt")).unwrap().as_str())
+        );
+        assert_eq!(
+            hashes.get("sub\\b.bin").map(String::as_str),
+            Some(
+                manifest::sha256_hex(&src.join("sub").join("b.bin"))
+                    .unwrap()
+                    .as_str()
+            )
+        );
+    }
+
+    // ── 强优化:size-skip(目标已存在同大小)跳过复制的文件,其源哈希仍须被补算注入(否则源清单缺项) ──
+    #[test]
+    fn copy_folder_size_skip_still_hashes_source() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("s");
+        let dst = d.path().join("t");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("a.txt"), b"hello").unwrap();
+        // 预置目标同名同大小(5B)不同内容 → 触发 size-skip(不复制),但源哈希仍须算出。
+        fs::write(dst.join("a.txt"), b"world").unwrap();
+        let hashes = copy_folder(&src, &dst, false, &NoopReporter).unwrap();
+        assert_eq!(
+            fs::read(dst.join("a.txt")).unwrap(),
+            b"world",
+            "size-skip 不应复制覆盖目标"
+        );
+        assert_eq!(
+            hashes.get("a.txt").map(String::as_str),
+            Some(manifest::sha256_hex(&src.join("a.txt")).unwrap().as_str()),
+            "size-skip 文件的源哈希须被单独补算注入"
+        );
     }
 
     // ── review-r3 #3:空目录建立失败不再 .ok() 静默吞,本项目 fail-closed(返回 Err、不移源)──
@@ -2107,7 +2172,7 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
         // 在 dst 下预置一个与该空目录同名的**文件**,使 create_dir_all(dst/sub_empty) 失败。
         fs::write(dst.join("sub_empty"), b"x").unwrap();
-        let r = copy_folder(&src, &dst, &NoopReporter);
+        let r = copy_folder(&src, &dst, false, &NoopReporter);
         assert!(
             r.is_err(),
             "空目录建立失败应 fail-closed(不静默吞),返回 Err"
@@ -2144,7 +2209,7 @@ mod tests {
             return;
         }
         let rep = RecordingReporter(std::sync::Mutex::new(Vec::new()));
-        copy_folder(&src, &dst, &rep).unwrap();
+        copy_folder(&src, &dst, false, &rep).unwrap();
         assert!(dst.join("real.txt").is_file(), "普通文件应被复制");
         assert!(
             !dst.join("jlink").join("inner.txt").exists(),
