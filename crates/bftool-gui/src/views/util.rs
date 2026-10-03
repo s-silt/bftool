@@ -64,7 +64,7 @@ pub fn copyable_path(ui: &mut egui::Ui, full_path: &str, max_len: usize) {
         }
         let copy_btn = ui.add(
             egui::Button::new(egui::RichText::new("复制").size(10.5))
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
                 .corner_radius(3),
         );
         if copy_btn.clicked() {
@@ -78,7 +78,7 @@ pub fn copyable_path(ui: &mut egui::Ui, full_path: &str, max_len: usize) {
 pub fn error_banner(ui: &mut egui::Ui, title: &str, error_detail: &str, next_step: &str) {
     egui::Frame::default()
         .fill(theme::DANGER_SOFT)
-        .stroke(egui::Stroke::new(1.0, theme::DANGER_BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, theme::DANGER_BORDER))
         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
@@ -111,7 +111,7 @@ pub fn error_banner(ui: &mut egui::Ui, title: &str, error_detail: &str, next_ste
 pub fn empty_state(ui: &mut egui::Ui, title: &str, desc: &str) {
     egui::Frame::default()
         .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
         .inner_margin(egui::Margin::symmetric(24, 20))
         .show(ui, |ui| {
@@ -158,7 +158,7 @@ pub fn progress_bar(progress: &Arc<Mutex<ProgressState>>, ui: &mut egui::Ui) {
 pub fn log_panel(logs: &[(LogLevel, String)], ui: &mut egui::Ui) {
     egui::Frame::default()
         .fill(theme::TRACK)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {

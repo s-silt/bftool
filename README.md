@@ -103,9 +103,11 @@ Demo 在创建 App、加载配置之前选定，使用合成配置、盘和结�
 
 ## 验证范围
 
-2026-10-03 的 Windows 限定安全验收：**341 通过、0 失败、33 项安全排除**（core/CLI 279，GUI 62）。33项为32项可达实际卷扫描／盘符读取及1项需要 Windows 符号链接权限；Linux 专属 cfg 测试未计入这些数字。fmt、严格 workspace Clippy、debug/release 构建通过。这是当前组合候选的结果，不能与历史版本计数累加。
+2026-10-03 的 Windows 限定安全验收：**344 通过、0 失败、33 项安全排除**（core/CLI 279，GUI 62，vendored XML兼容测试3）。33项为32项可达实际卷扫描／盘符读取及1项需要 Windows 符号链接权限；Linux 专属 cfg 测试未计入这些数字。fmt、严格 workspace Clippy、debug/release 构建通过。这是当前发布候选的结果，不能与历史版本计数累加。
 
 最终 debug 程序的 **宽／窄 × 应用缩放100%／125%／150% × 八页＝48张**自身截图已复看。egui 指针事件测试覆盖三种任务的重复启动、跨页取消、完成和关闭；它们不等同于 OS 原生鼠标输入。原生鼠标／滚动因窗口焦点请求被拒未验证，未绕过限制。系统 DPI、真实备份卷、断电、外部压缩程序执行及 Linux 上的最终组合仍未验证。详见 [安全修复与兼容边界](docs/REPAIR_ACCEPTANCE.md)。CI 状态以页面上具体提交对应的运行记录为准。
+
+本轮发布同步修复新 Rust CI 的浮点类型检查，并更新 quick-xml、webbrowser、anyhow、event-listener、memmap2 与 wayland-scanner。为保留原有可访问性功能，`vendor/zbus_xml` 保持4.x API并采用安全版本的 XML 解析器；来源、许可证和兼容修改见 [patch说明](vendor/zbus_xml/PATCH.md)。剩余 `number_prefix`、`paste`、`ttf-parser` 上游停止维护告警需要后续依赖迁移。
 
 ## 安全要点（请务必看）
 

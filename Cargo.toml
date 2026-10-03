@@ -4,6 +4,7 @@ members = [
     "crates/bftool-core",
     "crates/bftool-cli",
     "crates/bftool-gui",
+    "vendor/zbus_xml",
 ]
 # `cargo build / run` 默认只构建 CLI binary（包含 core 作为依赖）。
 # GUI 不进默认 build，避免纯 CLI 用户被迫编 eframe（拉 winit/wgpu 等大依赖）。
@@ -36,6 +37,11 @@ chrono    = { version = "0.4", default-features = false, features = ["clock", "s
 toml      = "0.8"
 sysinfo   = { version = "0.32", default-features = false, features = ["disk"] }
 eframe    = "0.31"
+
+# zbus_xml 4.x has no upstream release using quick-xml >= 0.41.
+# Keep the accessibility API while replacing the vulnerable XML parser.
+[patch.crates-io]
+zbus_xml = { path = "vendor/zbus_xml" }
 
 # 整个 workspace 的 release 配置在此统一，子 crate 不再重复声明。
 [profile.release]

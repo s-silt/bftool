@@ -27,9 +27,13 @@ service 负责操作入口与策略；pipeline 编排预检、计划、执行和
 
 锁定 CLI/core 依赖要求至少 Rust 1.85，GUI 的 image 依赖要求至少 1.88。本轮 Windows 实测 Rust/Cargo 1.95.0，不据依赖声明冒称已逐版验证精确 MSRV。
 
+## 发布依赖兼容修复
+
+更新 quick-xml 至0.41.0、webbrowser至1.2.2、wayland-scanner至0.31.11，另修复 anyhow、event-listener和memmap2的兼容安全告警版本。zbus_xml 4.x 无上游兼容修复版，因此以固定来源的最小patch保留其API和GUI可访问性；[来源及修改](../vendor/zbus_xml/PATCH.md)包含官方crate校验和MIT许可证。新增3项合成XML测试覆盖往返、无效类型和写入失败，原有341项加上这3项为344。保留33项安全排除。number_prefix、paste、ttf-parser的停止维护告警仍需后续迁移。
+
 ## 验证与剩余边界
 
-Windows 限定安全验收为341通过、0失败、33项安全排除（core/CLI279、GUI62）。32项可能扫描实际卷或读取盘符，1项需要Windows符号链接权限；Linux cfg专属测试不计入这些数字。限定命令见 `scripts/test_safe_windows.py`。fmt、严格workspace Clippy、debug/release构建通过，不能将这些数字与历史版本混用。
+Windows 限定安全验收为344通过、0失败、33项安全排除（core/CLI279、GUI62、vendored XML兼容测试3）。32项可能扫描实际卷或读取盘符，1项需要Windows符号链接权限；Linux cfg专属测试不计入这些数字。限定命令见 `scripts/test_safe_windows.py`。fmt、严格workspace Clippy、debug/release构建通过，不能将这些数字与历史版本混用。
 
 GUI修复包括：启动前隔离纯合成Demo；预览绑定启动时配置／选项；全局忙态守卫和取消归属；保留结构化VerifyReport并如实呈现取消、不可验证和仅大小结果；窄窗布局及滚动容器；截图失败非零退出并防止覆盖。
 

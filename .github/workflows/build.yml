@@ -78,6 +78,9 @@ jobs:
           Copy-Item "LICENSE" "$dist/LICENSE"
           New-Item -ItemType Directory -Force -Path "$dist/docs" | Out-Null
           Copy-Item "docs/REPAIR_ACCEPTANCE.md" "$dist/docs/REPAIR_ACCEPTANCE.md"
+          New-Item -ItemType Directory -Force -Path "$dist/vendor/zbus_xml" | Out-Null
+          Copy-Item "vendor/zbus_xml/PATCH.md" "$dist/vendor/zbus_xml/PATCH.md"
+          Copy-Item "vendor/zbus_xml/LICENSE" "$dist/vendor/zbus_xml/LICENSE"
           Compress-Archive -Path "$dist/*" -DestinationPath "bftool-${{ matrix.target }}.zip" -Force
       - uses: actions/upload-artifact@v6
         with:

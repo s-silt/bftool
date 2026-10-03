@@ -381,7 +381,7 @@ impl App {
             .frame(
                 egui::Frame::default()
                     .fill(theme::CARD)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
@@ -491,7 +491,7 @@ impl App {
             .frame(
                 egui::Frame::default()
                     .fill(crate::views::theme::CARD)
-                    .stroke(egui::Stroke::new(1.0, crate::views::theme::BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, crate::views::theme::BORDER))
                     .inner_margin(egui::Margin::symmetric(10, 14)),
             )
             .show(ctx, |ui| {
