@@ -10,6 +10,8 @@
 //! - `views`    ── 各视图渲染(T4 起)
 
 pub mod app;
+pub mod backend;
 pub mod reporter;
+pub mod screenshot;
 pub mod task;
 pub mod views;

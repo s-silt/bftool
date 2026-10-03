@@ -1,0 +1,134 @@
+[
+  {
+    "test": "engine::status::tests::gather_reports_pending_and_txn",
+    "category": "actual mounted-volume enumeration"
+  },
+  {
+    "test": "engine::verify::tests::verify_tree_flags_listed_file_replaced_by_symlink",
+    "category": "Windows symlink creation"
+  },
+  {
+    "test": "pipeline::archive::item::safety_regression_tests::a04_real_hash_diff_failure_is_counted_not_skipped",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::item::safety_regression_tests::existing_orphan_manifest_reserves_name_without_overwriting_evidence",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::item::safety_regression_tests::replaced_destination_directory_preserves_unknown_files_in_place",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::item::safety_regression_tests::s1_same_size_content_update_is_archived_again",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::item::safety_regression_tests::s2_stale_catalog_candidate_is_copied_and_verified_to_a_new_name",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::p0_contract_tests::content_changed_plans_rename_not_overwrite_intent",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::p0_contract_tests::second_incremental_pass_skips_unchanged_no_recopy",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::public_plan_canonicalizes_raw_windows_source_before_execution",
+    "category": "new test reaches real mounted-volume enumeration"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_checks_paths_before_creating_archived_root",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_executes_frozen_name_and_moves_source",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_preserves_preexisting_unindexed_dest_and_uses_unique_name",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_refuses_when_archive_lock_present",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_releases_lock_so_next_round_can_acquire",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_rename_failure_aborts_round_preserving_marker",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_seals_mid_round_on_cumulative_consumed",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_stale_when_frozen_name_taken",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_stops_when_pending_txn_parse_fails",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::archive::tests::run_plan_stops_when_pending_txn_unresolved",
+    "category": "automatic selection can enumerate real mounted volumes"
+  },
+  {
+    "test": "pipeline::watch::tests::watch_dry_run_does_not_acquire_or_change_writer_lock",
+    "category": "new test reaches real mounted-volume enumeration"
+  },
+  {
+    "test": "pipeline::watch::tests::watch_dry_run_does_not_create_system_directory",
+    "category": "new test reaches real mounted-volume enumeration"
+  },
+  {
+    "test": "pipeline::watch::tests::watch_dry_run_preserves_existing_directory_metadata",
+    "category": "new test reaches real mounted-volume enumeration"
+  },
+  {
+    "test": "pipeline::watch::tests::watch_normal_run_holds_lock_and_cancellation_releases_it",
+    "category": "new test reaches real mounted-volume enumeration"
+  },
+  {
+    "test": "metadata_only_planning_does_not_refresh_committed_index",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "mismatched_source_path_and_relative_identity_cannot_execute",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "recursive_namesakes_keep_distinct_source_and_incremental_identities",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "recursive_namesakes_move_each_verified_file_to_unique_archive_paths",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "seed_planning_without_payload_is_read_only_and_cannot_skip",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "sha256_verification_failure_counts_failed_without_commit_or_move",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "single_file_manifest_matches_destination_and_archive_commits",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "specified_source_is_executed_and_ready_namesake_is_untouched",
+    "category": "explicit synthetic letter still can reach physical T:"
+  },
+  {
+    "test": "unchanged_preview_is_revalidated_when_source_changes_before_execute",
+    "category": "explicit synthetic letter still can reach physical T:"
+  }
+]

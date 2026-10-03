@@ -665,7 +665,11 @@ mod tests {
         );
 
         // 默认文件名直接落在盘符根:父目录是 "D:\\",file_name 为空 → 同样回退到 stem。
-        let at_root = catalog_label(Path::new("D:\\备份索引名单.csv"));
+        #[cfg(windows)]
+        let root_file = Path::new("D:\\备份索引名单.csv");
+        #[cfg(not(windows))]
+        let root_file = Path::new("/备份索引名单.csv");
+        let at_root = catalog_label(root_file);
         assert_eq!(at_root, default_catalog_stem());
     }
 }

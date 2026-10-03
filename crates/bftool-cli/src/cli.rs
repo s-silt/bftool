@@ -13,9 +13,14 @@ use std::sync::atomic::AtomicBool;
 use bftool_core::config::{Config, ConfigSource};
 use bftool_core::engine;
 use bftool_core::reporter::Reporter;
+use bftool_core::service::{
+    self, ArchiveRequest, FileFilter, FindRequest, InitRequest, OperationRequest, OperationResult,
+    SourceSpec, VerifyRequest, WatchRequest,
+};
 
 /// CLI 的"永不取消"标志:GUI 传可置位的 AtomicBool,CLI 不支持图形化取消,
 /// 用这个工厂函数构造永远为 false 的标志,避免两处相同硬编码漂移。(EH-001)
+#[allow(dead_code)]
 fn no_cancel() -> AtomicBool {
     AtomicBool::new(false)
 }
@@ -38,6 +43,7 @@ fn no_cancel() -> AtomicBool {
   bftool init E                      # 把 E: 盘初始化为下一个「备份N」\n\
   bftool archive --dry-run           # 演练（只检查不复制）\n\
   bftool archive                     # 开始归档\n\
+  bftool archive --from <文件夹> --incremental --retain-source\n\
   bftool verify E                    # 复查 E: 盘\n\
   bftool find 项目关键词             # 查询项目在哪块盘\n\
 "
@@ -91,9 +97,25 @@ pub enum Command {
         /// 但不能与 --unsafe-no-hash 同时用：两者一起关 → 只剩 size+count+mtime ≈ 无校验，会被拒绝。
         #[arg(long)]
         no_test_archives: bool,
+
+        /// 指定源文件夹（其直接子目录 = 项目）；省略则用配置 ready_root
+        #[arg(long = "from")]
+        from: Option<PathBuf>,
+
+        /// 增量：完整内容快照与可信历史副本均匹配才跳过复制；变更项完整拷贝+SHA256
+        #[arg(long)]
+        incremental: bool,
+
+        /// 校验通过后不把源移到 archived_root（源常驻，适合增量/监视）
+        #[arg(long = "retain-source")]
+        retain_source: bool,
+
+        /// 仅处理含这些扩展名文件的项目（逗号分隔，如 zip,7z）；省略 = 全部
+        #[arg(long = "ext", value_delimiter = ',')]
+        ext: Option<Vec<String>>,
     },
 
-    /// 初始化一块空盘为下一个「备份N」（写本盘信息）
+    /// 初始化目标盘为下一个「备份N」（写本盘信息；不要求空盘）
     Init {
         /// 要初始化的盘符（例如 E、F）
         drive: String,
@@ -102,7 +124,7 @@ pub enum Command {
         #[arg(long)]
         id: Option<String>,
 
-        /// 跳过防呆（系统盘 / 资料库盘 / 非空盘检查）。风险自负
+        /// 跳过硬闸防呆（系统盘 / 资料库盘）。非空盘默认允许，无需本开关。风险自负
         #[arg(long)]
         force: bool,
     },
@@ -122,6 +144,29 @@ pub enum Command {
     /// 列出当前已挂载、可识别的备份盘
     Drives,
 
+    /// 监视文件夹：增量归档到机械盘池（poll；默认 retain_source）
+    Watch {
+        /// 监视的 SSD 文件夹
+        folder: PathBuf,
+        /// 轮询间隔秒（默认取配置 watch_poll_secs / 30）
+        #[arg(long = "poll-secs")]
+        poll_secs: Option<u64>,
+        /// 只跑一轮（测试/CI）
+        #[arg(long)]
+        once: bool,
+        /// 文件级扩展名过滤（逗号分隔）
+        #[arg(long = "ext", value_delimiter = ',')]
+        ext: Option<Vec<String>>,
+        /// 递归匹配 --ext
+        #[arg(long)]
+        recursive: bool,
+        /// 本次最多处理几个项目（0 = 不限）
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// 显示当前生效的配置
     ConfigShow,
 }
@@ -133,7 +178,7 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
     let cfg = loaded.config;
 
     match args.cmd {
-        None => engine::status::run(&cfg, reporter),
+        None => service::run_with_reporter(&cfg, OperationRequest::Status, reporter).map(|_| ()),
         Some(Command::Archive {
             dry_run,
             unsafe_no_hash,
@@ -143,6 +188,10 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             reserve_gb,
             drive,
             no_test_archives,
+            from,
+            incremental,
+            retain_source,
+            ext,
         }) => {
             // 强制二次确认：让"不校验内容"难以误开。重要资料应当走完整 SHA256。
             if unsafe_no_hash && !i_understand_this_can_miss_bitrot {
@@ -158,6 +207,15 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
 
             // Batch 3.5：--unsafe-no-hash + 任何方式关 archive test = 几乎无校验。
             // 判定收口到 core 的 verify_disabled,与 core::run 守卫同一真值(防漂移)。(ledger L-008)
+            // H7/Q1：增量路径禁止 --unsafe-no-hash（对拷贝项必须走 SHA256）；--force 无关本闸
+            if engine::archive::incremental_forbids_no_hash(incremental, unsafe_no_hash) {
+                bail!(
+                    "拒绝运行：[deny.verify_skip_watch] --incremental 与 --unsafe-no-hash 不能同时使用。\n\
+                     增量未变项会 skipped_unchanged（先核对内容与可信副本，再跳过复制）；\n\
+                     实际要拷的 New/Changed 项必须走 SHA256 三重校验。"
+                );
+            }
+
             if engine::archive::verify_disabled(unsafe_no_hash, cfg.test_archives, no_test_archives)
             {
                 bail!(
@@ -178,24 +236,57 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             if let Some(r) = reserve_gb {
                 cfg.reserve_gb = r;
             }
-            // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
-            let no_cancel = no_cancel();
-            let summary = engine::archive::run(
+            let include_ext = ext.filter(|v| !v.is_empty());
+            let options = engine::archive::Options {
+                dry_run,
+                // core API 仍叫 no_hash：CLI 层负责让"开启它"变得困难。
+                no_hash: unsafe_no_hash,
+                limit,
+                drive_letter_override: drive,
+                no_test_archives,
+                source_override: from.clone(),
+                incremental,
+                retain_source,
+                include_ext: include_ext.clone(),
+                file_globs: Vec::new(),
+                ext_recursive: false,
+                include_subfolder_projects: true,
+                seed_from_global_catalog: incremental,
+                incremental_verify: bftool_core::pipeline::archive::IncrementalVerifyMode::parse(
+                    &cfg.incremental_verify,
+                ),
+            };
+            let source = match from {
+                Some(p) => {
+                    let files = bftool_core::service::FileFilter::from_exts(
+                        include_ext.clone().unwrap_or_default(),
+                        false,
+                    );
+                    SourceSpec::Folder {
+                        root: p,
+                        include_subfolder_projects: true,
+                        files,
+                    }
+                }
+                None => SourceSpec::PendingRoot,
+            };
+            let result = service::run_with_reporter(
                 &cfg,
+                OperationRequest::Archive(ArchiveRequest {
+                    options,
+                    source,
+                    incremental,
+                    retain_source,
+                    seed_from_global_catalog: incremental,
+                }),
                 reporter,
-                engine::archive::Options {
-                    dry_run,
-                    // core API 仍叫 no_hash：CLI 层负责让"开启它"变得困难。
-                    no_hash: unsafe_no_hash,
-                    limit,
-                    drive_letter_override: drive,
-                    no_test_archives,
-                },
-                &no_cancel,
             )?;
+            let OperationResult::Archive { summary } = result else {
+                bail!("内部错误：archive 未返回 Archive 结果");
+            };
             if summary.failed > 0 {
                 bail!(
-                    "{} 个项目未成功归档(详见上方与「需人工处理.txt」);其余 {} 个已完成。\n\
+                    "{} 个项目未成功归档(详见上方与「需人工处理.txt」);其余 {} 个已完成。
                      (本命令以非零退出码结束,便于脚本/计划任务识别失败。)",
                     summary.failed,
                     summary.handled
@@ -204,24 +295,85 @@ pub fn dispatch(args: Cli, reporter: &dyn Reporter) -> Result<()> {
             Ok(())
         }
         Some(Command::Init { drive, id, force }) => {
-            engine::drive::init(&cfg, reporter, &drive, id.as_deref(), force)
+            // P1：CLI init 走统一 service::run（内部仍调 drive::init + pipeline stages）
+            let req = OperationRequest::Init(InitRequest::from_legacy_force(drive, id, force));
+            service::run_with_reporter(&cfg, req, reporter).map(|_| ())
         }
         Some(Command::Verify { drive }) => {
-            // CLI 不支持图形化取消:传一个永不取消的标志(行为不变)。
-            let no_cancel = no_cancel();
-            let report = engine::verify::run(&cfg, reporter, drive.as_deref(), &no_cancel)?;
-            if report.has_corruption() {
-                bail!(
-                    "复查发现 {} 处完整性问题（损坏/缺失/大小不符/读取失败等） —— 本盘完整性有问题。\n\
-                     请用其它副本恢复受损项目,或重做本盘。\n\
+            let result = service::run_with_reporter(
+                &cfg,
+                OperationRequest::Verify(VerifyRequest { drive }),
+                reporter,
+            )?;
+            match result {
+                OperationResult::Verify { .. } | OperationResult::Ok => Ok(()),
+                OperationResult::HardFail { message } => bail!(
+                    "{} —— 本盘完整性有问题。
+                     请用其它副本恢复受损项目,或重做本盘。
                      (本命令以非零退出码结束,便于定期复查脚本/计划任务识别坏盘。)",
-                    report.bad
-                );
+                    message
+                ),
+                other => bail!("内部错误：verify 返回意外结果: {:?}", other),
             }
-            Ok(())
         }
-        Some(Command::Find { keyword }) => engine::find::run(&cfg, &keyword),
-        Some(Command::Drives) => engine::drive::list_mounted(&cfg, reporter),
+        Some(Command::Find { keyword }) => service::run_with_reporter(
+            &cfg,
+            OperationRequest::Find(FindRequest { keyword }),
+            reporter,
+        )
+        .map(|_| ()),
+        Some(Command::Drives) => {
+            service::run_with_reporter(&cfg, OperationRequest::Drives, reporter).map(|_| ())
+        }
+        Some(Command::Watch {
+            folder,
+            poll_secs,
+            once,
+            ext,
+            recursive,
+            limit,
+            dry_run,
+        }) => {
+            let files = FileFilter::from_exts(ext.unwrap_or_default(), recursive);
+            let archive = engine::archive::Options {
+                dry_run,
+                no_hash: false, // watch/增量禁止 no_hash（H7）
+                limit,
+                drive_letter_override: None,
+                no_test_archives: false,
+                source_override: Some(folder.clone()),
+                incremental: true,
+                retain_source: true,
+                include_ext: if files.extensions.is_empty() {
+                    None
+                } else {
+                    Some(files.extensions.clone())
+                },
+                file_globs: files.globs.clone(),
+                ext_recursive: files.recursive,
+                include_subfolder_projects: true,
+                seed_from_global_catalog: true,
+                incremental_verify: bftool_core::pipeline::archive::IncrementalVerifyMode::parse(
+                    &cfg.incremental_verify,
+                ),
+            };
+            let req = WatchRequest {
+                folder,
+                files,
+                poll_secs: poll_secs.unwrap_or(0),
+                once,
+                archive,
+            };
+            let result = service::run_with_reporter(&cfg, OperationRequest::Watch(req), reporter)?;
+            match result {
+                OperationResult::Watch { failed, .. } if failed > 0 => {
+                    bail!("{} 个项目未成功归档（详见上方）。", failed)
+                }
+                OperationResult::Watch { .. } | OperationResult::Ok => Ok(()),
+                OperationResult::HardFail { message } => bail!("{message}"),
+                other => bail!("内部错误：watch 返回意外结果: {:?}", other),
+            }
+        }
         Some(Command::ConfigShow) => {
             // 查询性质，直接打到 stdout（GUI 端走 LoadedConfig getter，不解析这里的文本）。
             // 头一行用 TOML 注释标出「配置来源」——让用户/脚本明确当前生效配置从哪读的,

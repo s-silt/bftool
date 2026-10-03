@@ -2,7 +2,8 @@
 name = "bftool-gui"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# image 0.25.10 in Cargo.lock requires Rust 1.88.0.
+rust-version = "1.88"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

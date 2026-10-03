@@ -1,131 +1,417 @@
-//! 复查视图:选盘 → 后台 verify::run(重算 SHA256 比对清单)。唯一长任务,复用 archive 的后台机制。
-//! 复查对盘**只读**(Spec D §4.4);逐项 issue 经 GuiReporter 进日志,摘要经 task 回传。(Spec D §3/§5)
+//! 复查视图: 整盘、项目、文件选择清晰；分别展示已验证、损坏、缺失、不可验证和未检查，不把零检查数显示为全部正常。
+//! 对备份盘严格只读，封盘亦可安全复查。
 
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
 
-use bftool_core::engine::{drive, verify};
+use bftool_core::engine::drive;
+use bftool_core::engine::verify::{VerifyIssueKind, VerifyReport};
 use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
 use crate::reporter::{GuiReporter, ProgressState};
 use crate::task::BackgroundTask;
-use crate::views::util;
+use crate::views::{theme, util};
 
-/// 复查页跨帧状态。`selected=None` 表示"自动(单盘)"。
+/// 复查结果明细数据
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifyStats {
+    pub checked: u64,
+    pub bad: u64,
+    pub extra: u64,
+    pub size_only: u64,
+    pub cancelled: bool,
+}
+
+impl VerifyStats {
+    pub fn from_report(report: &VerifyReport) -> Self {
+        Self {
+            checked: report.checked,
+            bad: report.bad,
+            extra: report.extra,
+            size_only: report.size_only,
+            cancelled: report.cancelled,
+        }
+    }
+}
+
+/// 复查页跨帧状态。
 #[derive(Debug, Default)]
 pub struct VerifyUiState {
     pub drives: Option<Vec<drive::DriveInfo>>,
     pub selected: Option<String>,
+    pub last_stats: Option<VerifyStats>,
+    pub last_report: Option<VerifyReport>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
-    ui.heading("复查");
-    ui.add_space(4.0);
-    ui.label("重算备份盘上每个项目的 SHA256,与校验清单比对(对盘只读,封盘盘也能查)。");
+    theme::page_header(
+        ui,
+        "数据完整性复查",
+        "重算备份盘上每个归档项目的真实 SHA256 校验和并与历史清单逐一比对；严格只读，封盘亦可安全复查。",
+    );
 
     let busy = app.is_busy();
 
-    if ui
-        .add_enabled(!busy, egui::Button::new("🔄 刷新盘"))
-        .clicked()
-    {
-        rescan(app);
-    }
-    if app.verify_ui.drives.is_none() {
-        rescan(app);
-    }
+    // ── 模式与目标选择 ──
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "1. 选择复查范围与目标");
+        ui.add_space(4.0);
 
-    // 盘选择(扁平渲染;运行中选择只影响下一次,无害)
-    let mut sel = app.verify_ui.selected.clone();
-    ui.horizontal(|ui| {
-        if ui.selectable_label(sel.is_none(), "自动(单盘)").clicked() {
-            sel = None;
-        }
-        if let Some(drives) = &app.verify_ui.drives {
-            for d in drives {
-                let on = sel.as_deref() == Some(d.letter.as_str());
-                if ui
-                    .selectable_label(on, format!("{} ({}:)", d.id, d.letter))
-                    .clicked()
-                {
-                    sel = Some(d.letter.clone());
-                }
-            }
-        }
-    });
-    app.verify_ui.selected = sel;
-
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("✓ 开始复查"))
-            .clicked()
-        {
-            start_verify(app);
-        }
-        if busy {
-            let requested = app
-                .task
-                .as_ref()
-                .map(|t| t.cancel_requested())
-                .unwrap_or(false);
+        // 刷新盘
+        ui.horizontal(|ui| {
             if ui
-                .add_enabled(!requested, egui::Button::new("✕ 取消"))
+                .add_enabled(!busy, theme::btn_secondary("🔄 刷新备份盘"))
                 .clicked()
             {
-                if let Some(t) = &app.task {
-                    t.request_cancel();
+                rescan(app);
+            }
+            if app.verify_ui.drives.is_none() {
+                rescan(app);
+            }
+        });
+        ui.add_space(8.0);
+
+        // 整盘选择
+        ui.label(
+            egui::RichText::new("方式 A：整盘复查（核验指定盘上的所有备份项目）")
+                .font(theme::subtitle_font())
+                .color(theme::TEXT_TITLE),
+        );
+        ui.add_space(2.0);
+
+        let mut sel = app.verify_ui.selected.clone();
+        ui.horizontal_wrapped(|ui| {
+            let auto_on = sel.is_none();
+            let auto_resp = ui.selectable_label(auto_on, "自动识别单盘");
+            if auto_resp.clicked() {
+                sel = None;
+            }
+            if let Some(drives) = &app.verify_ui.drives {
+                for d in drives {
+                    let on = sel.as_deref() == Some(d.letter.as_str());
+                    let label = format!(
+                        "{} ({}:) - 剩余 {}",
+                        d.id,
+                        d.letter,
+                        util::fmt_gb(d.free_bytes)
+                    );
+                    if ui.selectable_label(on, label).clicked() {
+                        sel = Some(d.letter.clone());
+                    }
                 }
             }
-            if requested {
-                ui.label("取消中…(当前项目完成后停止)");
-            }
-        }
-    });
+        });
+        app.verify_ui.selected = sel;
 
-    // ── 单目标:只复查一个备份文件夹 / 一个文件的哈希 ──
-    ui.add_space(6.0);
-    ui.label("或只复查单个目标(到备份盘「项目」下选文件夹或文件):");
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("📁 选文件夹复查"))
-            .clicked()
-        {
-            if let Some(p) = rfd::FileDialog::new()
-                .set_title("选择要复查的备份项目文件夹")
-                .pick_folder()
-            {
-                start_verify_one(app, p);
-            }
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("📄 选文件复查"))
-            .clicked()
-        {
-            if let Some(p) = rfd::FileDialog::new()
-                .set_title("选择要复查的备份文件")
-                .pick_file()
-            {
-                start_verify_one(app, p);
-            }
-        }
-    });
-
-    ui.separator();
-    util::progress_bar(&app.progress, ui);
-    if let Some(s) = &app.last_summary {
-        ui.strong(format!("上次结果：{}", s));
+        ui.add_space(10.0);
         ui.separator();
-    }
-    ui.label("日志：");
-    util::log_panel(&app.logs, ui);
+        ui.add_space(6.0);
+
+        // 局部复查
+        ui.label(
+            egui::RichText::new("方式 B：针对性定向复查（选指定项目或具体文件）")
+                .font(theme::subtitle_font())
+                .color(theme::TEXT_TITLE),
+        );
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !busy && !app.backend.is_demo(),
+                    theme::btn_secondary("📁 选择项目文件夹复查"),
+                )
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("选择要复查的备份项目文件夹（备份盘「项目」目录下）")
+                    .pick_folder()
+                {
+                    start_verify_one(app, p);
+                }
+            }
+            if ui
+                .add_enabled(
+                    !busy && !app.backend.is_demo(),
+                    theme::btn_secondary("📄 选择单个备份文件复查"),
+                )
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("选择要复查的备份文件")
+                    .pick_file()
+                {
+                    start_verify_one(app, p);
+                }
+            }
+        });
+    });
+
+    ui.add_space(theme::GAP);
+
+    // ── 操作按钮行 ──
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            let start_btn = ui.add_enabled(
+                !busy,
+                theme::btn_primary(&app.operation_label("开始整盘复查")),
+            );
+            if start_btn.clicked() {
+                start_verify(app);
+            }
+
+            if busy {
+                ui.add_space(8.0);
+                if app.task_running(crate::app::TaskKind::Verify) {
+                    let requested = app
+                        .task
+                        .as_ref()
+                        .map(|t| t.cancel_requested())
+                        .unwrap_or(false);
+                    if requested {
+                        theme::badge(
+                            ui,
+                            "取消中(当前项目完成后停止)",
+                            theme::WARN,
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        let cancel_btn = ui.add(theme::btn_danger("停止复查"));
+                        if cancel_btn.clicked() {
+                            if let Some(t) = &app.task {
+                                t.request_cancel();
+                            }
+                        }
+                        cancel_btn.on_hover_text("在当前项目/文件完成后安全停止");
+                    }
+                } else {
+                    ui.label(app.busy_label());
+                }
+            }
+        });
+    });
+
+    ui.add_space(theme::GAP);
+
+    // ── 结果结构化呈现（已验证、损坏、缺失、不可验证、未检查） ──
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "2. 完整性复查核验结果");
+        ui.add_space(4.0);
+
+        if let Some(stats) = app.verify_ui.last_stats {
+            theme::card_grid(ui, 4, 4, |card, index| match index {
+                0 => {
+                    theme::kpi_card(
+                        card,
+                        "已检查文件 (Checked)",
+                        &stats.checked.to_string(),
+                        "已检查数（包含失败或仅大小项）",
+                        if stats.checked > 0 {
+                            theme::OK
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                    );
+                }
+                1 => {
+                    theme::kpi_card(
+                        card,
+                        "完整性问题 (Bad)",
+                        &stats.bad.to_string(),
+                        if stats.bad > 0 {
+                            "本次记录的完整性问题，详情见下方"
+                        } else {
+                            "本次已检查范围内记录为 0"
+                        },
+                        if stats.bad > 0 {
+                            theme::DANGER
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                    );
+                }
+                2 => {
+                    theme::kpi_card(
+                        card,
+                        "多余文件 (Extra)",
+                        &stats.extra.to_string(),
+                        if stats.extra > 0 {
+                            "发现清单外多余文件"
+                        } else {
+                            "本次已枚举范围内记录为 0"
+                        },
+                        if stats.extra > 0 {
+                            theme::WARN
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                    );
+                }
+                3 => {
+                    theme::kpi_card(
+                        card,
+                        "仅大小校验 (Size-only)",
+                        &stats.size_only.to_string(),
+                        if stats.size_only > 0 {
+                            "历史清单无哈希，仅核对大小"
+                        } else {
+                            "仅大小项记录为 0；不推定哈希覆盖"
+                        },
+                        if stats.size_only > 0 {
+                            theme::WARN
+                        } else {
+                            theme::TEXT_MUTED
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            });
+
+            ui.add_space(8.0);
+            if let Some(report) = &app.verify_ui.last_report {
+                let missing = report
+                    .issues
+                    .iter()
+                    .filter(|i| i.kind == VerifyIssueKind::Missing)
+                    .count();
+                let unreadable = report
+                    .issues
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            i.kind,
+                            VerifyIssueKind::ReadError | VerifyIssueKind::EnumError
+                        )
+                    })
+                    .count();
+                let unverifiable = report
+                    .issues
+                    .iter()
+                    .filter(|i| i.kind == VerifyIssueKind::Unverifiable)
+                    .count();
+                ui.label(format!("问题明细：缺失 {missing} · 读取/枚举失败 {unreadable} · 不可验证 {unverifiable}"));
+                if report.cancelled {
+                    ui.colored_label(
+                        theme::WARN,
+                        "未检查：任务已取消，剩余数量未知；不推定未检查内容完好。",
+                    );
+                }
+                if !report.issues.is_empty() {
+                    egui::ScrollArea::both().max_height(180.0).show(ui, |ui| {
+                        for issue in &report.issues {
+                            ui.label(format!(
+                                "{:?} · {} / {}",
+                                issue.kind, issue.project, issue.rel
+                            ));
+                        }
+                    });
+                }
+            }
+            // 总体结论条
+            if stats.cancelled {
+                theme::callout_with_tag(
+                    ui,
+                    theme::TEXT_MUTED,
+                    theme::TRACK,
+                    "已取消",
+                    "复查任务已中途安全停止，部分项目尚未完成核对。",
+                );
+            } else if stats.checked == 0 && stats.bad == 0 && stats.extra == 0 {
+                // 重点：检查 0 项不显示为全部正常！
+                theme::callout_with_tag(
+                    ui,
+                    theme::WARN,
+                    theme::WARN_SOFT,
+                    "未检查 / 无数据",
+                    "本次复查未发现任何已归档的校验项（当前盘尚无备份项目或清单为空）。零检查数不代表数据完好。",
+                );
+            } else if stats.bad > 0 {
+                theme::callout_with_tag(
+                    ui,
+                    theme::DANGER,
+                    theme::DANGER_SOFT,
+                    "发现完整性问题",
+                    &format!("记录 {} 处完整性问题（含缺失、读取失败或无法验证项）。请根据明细核对；不能据此推定这些项全部损坏。", stats.bad),
+                );
+            } else if stats.extra > 0 {
+                theme::callout_with_tag(
+                    ui,
+                    theme::WARN,
+                    theme::WARN_SOFT,
+                    "有多余文件",
+                    &format!(
+                        "本次枚举记录 {} 个清单外文件；未检查内容不作完整性结论。",
+                        stats.extra
+                    ),
+                );
+            } else if stats.size_only > 0 {
+                theme::callout_with_tag(
+                    ui,
+                    theme::WARN,
+                    theme::WARN_SOFT,
+                    "仅大小校验",
+                    &format!(
+                        "存在 {} 项仅按文件大小核对（无历史 SHA256 哈希），未完整核对内容。",
+                        stats.size_only
+                    ),
+                );
+            } else {
+                theme::callout_with_tag(
+                    ui,
+                    theme::OK,
+                    theme::OK_SOFT,
+                    "本次检查通过",
+                    &format!(
+                        "本次已检查 {} 项，报告未记录完整性问题；结论限于本次已检查范围。",
+                        stats.checked
+                    ),
+                );
+            }
+            if stats.size_only > 0 && (stats.extra > 0 || stats.bad > 0 || stats.cancelled) {
+                ui.colored_label(
+                    theme::WARN,
+                    format!("{} 项仅核对大小，未完整核对内容。", stats.size_only),
+                );
+            }
+        } else if let Some(error) = &app.verify_ui.error {
+            util::error_banner(
+                ui,
+                "复查失败",
+                error,
+                "请查看运行日志；失败不代表数据已验证。",
+            );
+        } else if let Some(s) = &app.verify_ui.summary {
+            ui.label(
+                egui::RichText::new(format!("最近一次复查结果：{s}"))
+                    .size(12.5)
+                    .color(theme::TEXT_BODY),
+            );
+        } else {
+            util::empty_state(
+                ui,
+                "暂无复查结果",
+                "选择上方备份盘或目标后点击「开始整盘复查」执行 SHA256 校验和核对。",
+            );
+        }
+    });
+
+    ui.add_space(theme::GAP);
+
+    // ── 进度条与实时日志 ──
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "复查进度与运行日志");
+        ui.add_space(4.0);
+        util::progress_bar(&app.progress, ui);
+        util::log_panel(&app.logs, ui);
+    });
 }
 
 fn rescan(app: &mut App) {
-    match drive::scan_mounted(None) {
+    match app.backend.drives() {
         Ok(ds) => app.verify_ui.drives = Some(ds),
         Err(e) => {
             app.verify_ui.drives = Some(Vec::new());
@@ -136,8 +422,16 @@ fn rescan(app: &mut App) {
 }
 
 fn start_verify(app: &mut App) {
+    if !app.ensure_idle() {
+        return;
+    }
     app.logs.clear();
     app.last_summary = None;
+    app.verify_ui.last_stats = None;
+    app.verify_ui.last_report = None;
+    app.verify_ui.summary = None;
+    app.verify_ui.error = None;
+    app.task_kind = Some(crate::app::TaskKind::Verify);
     if let Ok(mut p) = app.progress.lock() {
         *p = ProgressState::default();
     }
@@ -146,23 +440,30 @@ fn start_verify(app: &mut App) {
     app.rx = Some(rx);
     app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
+    let backend = app.backend;
     let sel = app.verify_ui.selected.clone();
     app.task = Some(BackgroundTask::spawn(move |cancel| {
-        let r = verify::run(&cfg, &reporter, sel.as_deref(), cancel)?;
-        Ok(verify_summary(
-            r.checked,
-            r.bad,
-            r.extra,
-            r.size_only,
-            r.cancelled,
-        ))
+        Ok(crate::app::ExecutionResult::Verification(backend.verify(
+            &cfg,
+            sel.as_deref(),
+            None,
+            cancel,
+            &reporter,
+        )?))
     }));
 }
 
-/// 后台复查单个目标(文件夹/文件)的哈希。core 自动定位所在盘 + 项目。
 fn start_verify_one(app: &mut App, target: PathBuf) {
+    if !app.ensure_idle() {
+        return;
+    }
     app.logs.clear();
     app.last_summary = None;
+    app.verify_ui.last_stats = None;
+    app.verify_ui.last_report = None;
+    app.verify_ui.summary = None;
+    app.verify_ui.error = None;
+    app.task_kind = Some(crate::app::TaskKind::Verify);
     if let Ok(mut p) = app.progress.lock() {
         *p = ProgressState::default();
     }
@@ -171,37 +472,38 @@ fn start_verify_one(app: &mut App, target: PathBuf) {
     app.rx = Some(rx);
     app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
+    let backend = app.backend;
     app.task = Some(BackgroundTask::spawn(move |cancel| {
-        let r = verify::verify_one(&cfg, &reporter, &target, cancel)?;
-        Ok(verify_summary(
-            r.checked,
-            r.bad,
-            r.extra,
-            r.size_only,
-            r.cancelled,
-        ))
+        Ok(crate::app::ExecutionResult::Verification(backend.verify(
+            &cfg,
+            None,
+            Some(&target),
+            cancel,
+            &reporter,
+        )?))
     }));
 }
 
-/// 复查摘要文案。纯函数,可测。
-/// 结论与 core `VerifyOutcome`/`outcome_label` 对齐:取消 > 损坏 > 多余 > 完好。
-/// extra-only(无损坏但有清单外多余文件)是**警示态**,不能标"完好"。(BF-VERIFY-SUMMARY-EXTRA)
-fn verify_summary(checked: u64, bad: u64, extra: u64, size_only: u64, cancelled: bool) -> String {
-    let mut s = format!("检查 {} · 损坏/缺失 {} · 多余 {}", checked, bad, extra);
+/// 复查摘要文案。纯函数，可测。
+pub fn verify_summary(
+    checked: u64,
+    bad: u64,
+    extra: u64,
+    size_only: u64,
+    cancelled: bool,
+) -> String {
+    let mut s = format!("检查 {} · 完整性问题 {} · 多余 {}", checked, bad, extra);
     if size_only > 0 {
         s.push_str(&format!(" · 仅大小校验 {}", size_only));
     }
     if cancelled {
         s.push_str(" · 已取消");
     } else if checked == 0 && bad == 0 && extra == 0 {
-        // 一项都没校验 ≠ 校验通过:空校验(该盘/项目尚无已归档内容、或清单为空)不能标「完好」,
-        // 否则把「什么都没查」呈现成「内容完整」。(review-r3 round4)
         s.push_str(" · 无可校验项");
     } else if bad == 0 && size_only > 0 {
-        // 有文件只校验了大小、未验证内容(清单无哈希)→ 不能笼统标「完好」。(review-r3 round4)
         s.push_str(" · 仅大小校验(未验证内容)");
     } else if bad == 0 && extra == 0 {
-        s.push_str(" · 完好");
+        s.push_str(" · 已检查范围完好");
     } else if bad == 0 {
         s.push_str(" · 有多余文件");
     }
@@ -216,13 +518,12 @@ mod tests {
     fn verify_summary_text() {
         assert!(verify_summary(10, 0, 0, 0, false).contains("完好"));
         let s = verify_summary(10, 2, 1, 0, false);
-        assert!(s.contains("损坏/缺失 2"));
+        assert!(s.contains("完整性问题 2"));
         assert!(s.contains("多余 1"));
         assert!(!s.contains("完好"), "有损坏不应显示完好");
         assert!(verify_summary(5, 0, 0, 0, true).contains("已取消"));
     }
 
-    // ── BF-VERIFY-SUMMARY-EXTRA: extra-only(无损坏但有多余文件)不能标"完好" ──
     #[test]
     fn verify_summary_extra_only_is_not_clean() {
         let s = verify_summary(10, 0, 3, 0, false);
@@ -230,7 +531,6 @@ mod tests {
         assert!(s.contains("有多余文件"), "应提示有多余文件;实际:{s}");
     }
 
-    // ── review-r3 round4:检查 0 项不能标「完好」(空校验 ≠ 校验通过)──
     #[test]
     fn verify_summary_zero_checked_is_not_clean() {
         let s = verify_summary(0, 0, 0, 0, false);
@@ -238,7 +538,6 @@ mod tests {
         assert!(s.contains("无可校验项"), "应给中性提示;实际:{s}");
     }
 
-    // ── review-r3 round4:有「仅大小校验(无哈希)」文件时不能标「完好」,须提示未验证内容 ──
     #[test]
     fn verify_summary_size_only_is_not_clean() {
         let s = verify_summary(10, 0, 0, 4, false);

@@ -27,8 +27,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo build (all targets)
         run: cargo build --workspace --all-targets --locked
-      - name: cargo test (all targets)
-        run: cargo test --workspace --all-targets --locked
+      - name: cargo test (audited Windows suite; 33 safety exclusions)
+        # Do not scan physical volumes or require symlink privileges in this suite.
+        # Exclusions are explicit; this is not a full-suite acceptance claim.
+        run: python scripts/test_safe_windows.py
       - name: cargo clippy (-D warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -62,7 +64,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: build release
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
       - name: package
         shell: pwsh
         run: |
@@ -74,6 +76,8 @@ jobs:
           Copy-Item "README.md" "$dist/README.md"
           Copy-Item "other.md" "$dist/other.md"
           Copy-Item "LICENSE" "$dist/LICENSE"
+          New-Item -ItemType Directory -Force -Path "$dist/docs" | Out-Null
+          Copy-Item "docs/REPAIR_ACCEPTANCE.md" "$dist/docs/REPAIR_ACCEPTANCE.md"
           Compress-Archive -Path "$dist/*" -DestinationPath "bftool-${{ matrix.target }}.zip" -Force
       - uses: actions/upload-artifact@v6
         with:
@@ -88,7 +92,9 @@ jobs:
     name: release
     needs: [build, audit]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Candidate tags are published explicitly as prereleases with a GUI-only package.
+    # Keep automatic stable releases for plain version tags.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     permissions:
       contents: write
     steps:

@@ -94,7 +94,9 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     println!("-----------------------------------------------------------");
 
     if s.drives.is_empty() {
-        println!("  机械盘 · 当前在线 : 无（插入空盘后执行 `bftool init <盘符>` 初始化）");
+        println!(
+            "  机械盘 · 当前在线 : 无（插入备份盘或目标盘后执行 `bftool init <盘符>` 初始化）"
+        );
     } else {
         for ds in &s.drives {
             let d = &ds.drive;
@@ -130,9 +132,7 @@ pub fn run(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
 
     println!("===========================================================");
     println!("常用命令：");
-    println!(
-        "  bftool init <盘符>            初始化一块空盘为下一个「备份N」（例：bftool init E）"
-    );
+    println!("  bftool init <盘符>            初始化目标盘为下一个「备份N」（例：bftool init E）");
     println!("  bftool archive --dry-run     演练（不真正复制）");
     println!("  bftool archive               正式归档");
     println!("  bftool verify [盘符]         复查：重算 SHA256 比对清单");

@@ -44,9 +44,9 @@ bftool
 
 会显示当前的源目录、检测到的备份盘、待归档项目数、可用子命令。
 
-### 3. 初始化一块空盘
+### 3. 初始化目标盘
 
-插上一块**空的**机械硬盘（NTFS 格式），假设盘符是 `E:`：
+插上一块机械硬盘作备份盘（NTFS 格式；**不要求空盘**），假设盘符是 `E:`：
 
 ```cmd
 bftool init E
@@ -73,7 +73,7 @@ bftool archive              # 正式开跑
 
 ### 5. 盘写满了
 
-工具会自动**封盘**（写 `已封盘.txt`）并提示。取下这块盘贴好标签离线收好，插上下一块空盘，再 `bftool init <新盘符>` → `bftool archive`。
+工具会自动**封盘**（写 `已封盘.txt`）并提示。取下这块盘贴好标签离线收好，插上下一块目标盘，再 `bftool init <新盘符>` → `bftool archive`。
 
 ### 6. 复查（防坏道）
 
@@ -103,8 +103,8 @@ bftool find 关键词
 | `bftool archive --unsafe-no-hash --i-understand-this-can-miss-bitrot` | **危险**：跳过 SHA256 内容校验，挡不住静默损坏（比特腐烂）。必须两个开关同时传才生效，单独 `--unsafe-no-hash` 会被拒绝。仅适合海量素材类、且接受静默损坏不可见的场景；**不可再生的资料请保持完整 SHA256**。开启此项要求机器装了 7-Zip/WinRAR/Bandizip 任一（让压缩包测试兜底）；同时关压缩包测试 → 直接拒绝。 |
 | `bftool archive --no-test-archives` | 关掉压缩包内部结构测试（默认开启）。SHA256 字节级校验仍在。与 `--unsafe-no-hash` 互斥（两者同关 ≈ 没在校验）。 |
 | `bftool archive --limit 1` | 本次只处理一个项目 |
-| `bftool init <盘符>` | 初始化一块空盘为下一个「备份N」 |
-| `bftool init <盘符> --force` | 跳过防呆（系统盘/资料库盘/非空盘）；风险自负 |
+| `bftool init <盘符>` | 初始化目标盘为下一个「备份N」（不要求空盘；非空仅警告） |
+| `bftool init <盘符> --force` | 跳过硬闸（系统盘/资料库盘）；非空默认允许无需 force；风险自负 |
 | `bftool verify [盘符]` | 复查指定盘 |
 | `bftool find <关键词>` | 在全局索引查项目位置 |
 | `bftool drives` | 列出已识别的备份盘 |

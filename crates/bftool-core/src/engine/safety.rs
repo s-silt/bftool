@@ -473,7 +473,12 @@ mod tests {
         let child = parent.join("不存在子");
         let cp = canon(&parent);
         let cc = canon(&child);
-        assert_eq!(cc, cp.join("不存在子"), "不存在子应锚定到存在父的规范名");
+        // Join using this platform's native separator before converting the
+        // comparison form to Windows-style separators. Joining an already
+        // normalized comparison path adds '/' on Linux and gives a false failure.
+        let expected = strip_verbatim(&parent.canonicalize().unwrap()).join("不存在子");
+        let expected = PathBuf::from(expected.to_string_lossy().replace('/', "\\"));
+        assert_eq!(cc, expected, "不存在子应锚定到存在父的规范名");
         assert!(is_inside(&cc, &cp), "不存在子应被判在父内");
     }
 

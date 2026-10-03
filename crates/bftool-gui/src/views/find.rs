@@ -1,17 +1,15 @@
-//! 查找视图:关键词 → find::search → 结果表(来源 / 在哪块盘 / 盘内路径 / 校验)。
-//! 支持多机汇总:本机总索引 + 设置页配置的额外索引一并检索。(Spec D §5)
+//! 查找视图: 搜索框醒目，结果突出项目名、备份盘、盘内路径和时间，方便查看与复制；
+//! 表格支持长路径截断与完整查看、一键复制路径、明确的空状态和错误提示。
 
 use eframe::egui;
 
-use bftool_core::engine::find::{self, FindMatch, FindOutcome};
-use bftool_core::reporter::LogLevel;
+use bftool_core::engine::find::{FindMatch, FindOutcome};
 
 use crate::app::App;
 use crate::task::BackgroundTask;
-use crate::views::util;
+use crate::views::{theme, util};
 
-/// 查找页跨帧状态。直接持有 core 返回的 `FindOutcome`,避免把命中/来源数/失败来源
-/// 拆成多个字段后还要在各分支手动同步。
+/// 查找页跨帧状态。
 #[derive(Debug, Default)]
 pub struct FindUiState {
     pub keyword: String,
@@ -20,113 +18,233 @@ pub struct FindUiState {
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
-    ui.heading("查找");
-    let extra = app.cfg.extra_catalogs.len();
-    if extra > 0 {
-        ui.weak(format!(
-            "多机汇总：本机索引 + {extra} 个额外来源(在「设置」页管理)。"
-        ));
-    }
-    ui.add_space(4.0);
+    theme::page_header(
+        ui,
+        "项目检索与定位",
+        "快速检索全部备份盘与多机汇总索引名单中的项目，获取备份盘号、盘内完整路径及校验记录。",
+    );
 
-    let mut do_search = false;
-    ui.horizontal(|ui| {
-        ui.label("关键词：");
-        let resp = ui.text_edit_singleline(&mut app.find_ui.keyword);
-        if resp.changed() {
-            app.find_ui.result = None; // 关键词改变立即清空旧结果
-            app.find_ui.error = None;
-        }
-        // R5-7:用 !is_busy()(含 backup/verify 的 app.task、plan_task、其它 find_task),
-        // 否则查找可与备份/复查并发跑。
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            do_search = !app.is_busy();
-        }
-        if ui
-            .add_enabled(!app.is_busy(), egui::Button::new("查找"))
-            .clicked()
-        {
-            do_search = true;
-        }
-        if app.find_task.is_some() {
-            ui.spinner();
-            ui.label("查找中…");
+    let busy = app.is_busy();
+    let extra = app.cfg.extra_catalogs.len();
+
+    // ── 醒目的搜索栏卡片 ──
+    theme::card(ui, |ui| {
+        let input_width = (ui.available_width() - 180.0).clamp(80.0, 380.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("关键词：")
+                    .font(theme::subtitle_font())
+                    .color(theme::TEXT_TITLE),
+            );
+
+            let edit_resp = ui.add(
+                egui::TextEdit::singleline(&mut app.find_ui.keyword)
+                    .hint_text("输入项目名、文件夹名或部分路径…")
+                    .desired_width(input_width),
+            );
+
+            if edit_resp.changed() {
+                app.find_ui.result = None;
+                app.find_ui.error = None;
+            }
+
+            let mut do_search = false;
+            if edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                do_search = !busy;
+            }
+
+            let search_btn = ui.add_enabled(!busy, theme::btn_primary("🔍 查找"));
+            if search_btn.clicked() {
+                do_search = true;
+            }
+
+            if !app.find_ui.keyword.is_empty() && ui.button("清空").clicked() {
+                app.find_ui.keyword.clear();
+                app.find_ui.result = None;
+                app.find_ui.error = None;
+            }
+
+            if app.find_task.is_some() {
+                ui.spinner();
+                ui.label("正在全盘检索…");
+            }
+
+            if do_search {
+                run_search(app);
+            }
+        });
+
+        if extra > 0 {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("已启用多机汇总查询：检索本机总索引 + {extra} 个外部机器索引（在「设置」页管理）。"))
+                    .size(11.5)
+                    .color(theme::TEXT_MUTED),
+            );
         }
     });
-    if do_search {
-        run_search(app);
+
+    ui.add_space(theme::GAP);
+
+    // 错误提示条
+    if let Some(err) = &app.find_ui.error {
+        util::error_banner(
+            ui,
+            "检索错误",
+            err,
+            "请检查关键词格式或确认索引文件可正常读取。",
+        );
+        ui.add_space(theme::GAP);
     }
 
-    ui.separator();
-    if let Some(err) = &app.find_ui.error {
-        ui.colored_label(util::level_color(LogLevel::Error), err);
-    }
-    match &app.find_ui.result {
-        Some(outcome) => {
-            if !outcome.sources_failed.is_empty() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0xB0, 0x6A, 0x00),
-                    format!(
-                        "{} 个索引来源读取失败已跳过：{}",
-                        outcome.sources_failed.len(),
-                        find::render_failed_sources(&outcome.sources_failed)
-                    ),
-                );
-            }
-            if outcome.malformed_rows > 0 {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0xB0, 0x6A, 0x00),
-                    format!(
-                        "{} 行因格式错误被跳过(未计入结果)。",
-                        outcome.malformed_rows
-                    ),
-                );
-            }
-            if outcome.matches.is_empty() {
-                ui.label("无匹配。");
-            } else {
-                ui.label(format!(
-                    "匹配 {} 项(检索了 {} 个来源)：",
-                    outcome.matches.len(),
-                    outcome.sources_searched
-                ));
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("find_grid")
-                            .num_columns(5)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                ui.strong("文件夹");
-                                ui.strong("来源");
-                                ui.strong("备份盘");
-                                ui.strong("盘内路径");
-                                ui.strong("校验");
-                                ui.end_row();
-                                for m in &outcome.matches {
-                                    let [folder, source, drive_id, path, verify] = match_row(m);
-                                    ui.monospace(folder);
-                                    ui.label(source);
-                                    ui.label(drive_id);
-                                    ui.monospace(path);
-                                    ui.label(verify);
-                                    ui.end_row();
-                                }
-                            });
+    // ── 结果展示 ──
+    theme::card(ui, |ui| {
+        match &app.find_ui.result {
+            Some(outcome) => {
+                // 部分索引失败提示
+                if !outcome.sources_failed.is_empty() {
+                    theme::callout_with_tag(
+                        ui,
+                        theme::WARN,
+                        theme::WARN_SOFT,
+                        "部分索引未读取",
+                        &format!(
+                            "{} 个外部索引文件读取失败已跳过：{}",
+                            outcome.sources_failed.len(),
+                            bftool_core::engine::find::render_failed_sources(
+                                &outcome.sources_failed
+                            )
+                        ),
+                    );
+                    ui.add_space(6.0);
+                }
+                if outcome.malformed_rows > 0 {
+                    theme::callout_with_tag(
+                        ui,
+                        theme::WARN,
+                        theme::WARN_SOFT,
+                        "格式跳过",
+                        &format!(
+                            "{} 行数据因格式不合规被跳过，未计入结果。",
+                            outcome.malformed_rows
+                        ),
+                    );
+                    ui.add_space(6.0);
+                }
+
+                if outcome.matches.is_empty() {
+                    util::empty_state(
+                        ui,
+                        "未找到匹配项目",
+                        &format!(
+                            "未在已索引的 {} 个来源中检索到包含「{}」的项目。请核对关键词。",
+                            outcome.sources_searched,
+                            app.find_ui.keyword.trim()
+                        ),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        theme::section_title(ui, "检索结果列表");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "共匹配到 {} 项（检索了 {} 个索引来源）",
+                                    outcome.matches.len(),
+                                    outcome.sources_searched
+                                ))
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                            );
+                        });
                     });
+                    ui.add_space(6.0);
+
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, true])
+                        .max_height(420.0)
+                        .id_salt("find_results_grid")
+                        .show(ui, |ui| {
+                            egui::Grid::new("find_table")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.strong("项目名 / 文件夹");
+                                    ui.strong("备份盘");
+                                    ui.strong("盘内完整相对路径");
+                                    ui.strong("归档时间");
+                                    ui.strong("校验状态");
+                                    ui.strong("来源索引");
+                                    ui.end_row();
+
+                                    for m in &outcome.matches {
+                                        // 项目名
+                                        ui.label(
+                                            egui::RichText::new(&m.folder)
+                                                .font(theme::subtitle_font())
+                                                .color(theme::TEXT_TITLE),
+                                        );
+
+                                        // 备份盘
+                                        theme::badge(
+                                            ui,
+                                            &m.drive_id,
+                                            theme::PRIMARY_SOFT,
+                                            theme::PRIMARY,
+                                        );
+
+                                        // 盘内路径：带截断与一键复制
+                                        util::copyable_path(ui, &m.in_drive_path, 34);
+
+                                        // 归档时间
+                                        let time_display = if m.archived_time.is_empty() {
+                                            "未知时间".to_string()
+                                        } else {
+                                            m.archived_time
+                                                .split('T')
+                                                .next()
+                                                .unwrap_or(&m.archived_time)
+                                                .to_string()
+                                        };
+                                        ui.label(time_display);
+
+                                        // 校验状态
+                                        let (badge_bg, badge_fg) = if m.verify.contains("OK") {
+                                            (theme::OK_SOFT, theme::OK)
+                                        } else {
+                                            (theme::WARN_SOFT, theme::WARN)
+                                        };
+                                        theme::badge(ui, &m.verify, badge_bg, badge_fg);
+
+                                        // 来源
+                                        ui.label(
+                                            egui::RichText::new(&m.source)
+                                                .size(11.5)
+                                                .color(theme::TEXT_MUTED),
+                                        );
+
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
+            None => {
+                if app.find_task.is_none() {
+                    util::empty_state(
+                        ui,
+                        "等待检索输入",
+                        "在上方搜索框输入项目名称或关键词，按下回车或点「查找」即可快速定位备份数据。",
+                    );
+                }
             }
         }
-        None => {
-            if app.find_task.is_none() {
-                ui.weak("输入关键词后回车 / 点「查找」。");
-            }
-        }
-    }
+    });
 }
 
 fn run_search(app: &mut App) {
     if app.is_busy() {
-        return; // R5-7:任何任务进行中(备份/复查/计划/查找)都不重入
+        return;
     }
     let kw = match normalize_keyword(&app.find_ui.keyword) {
         Ok(kw) => kw,
@@ -139,14 +257,12 @@ fn run_search(app: &mut App) {
     app.find_ui.error = None;
     app.find_ui.result = None;
     let cfg = app.cfg.clone();
-    app.find_task = Some(
-        BackgroundTask::spawn(move |_cancel| find::search(&cfg, &kw))
-            // 只读查询:关窗时 detach 而非 join,避免卡在慢速/掉线网络盘的大索引读上挂死 UI。(review-r3 round3)
-            .detachable(),
-    );
+    let backend = app.backend;
+    app.find_task =
+        Some(BackgroundTask::spawn(move |_cancel| backend.find(&cfg, &kw)).detachable());
 }
 
-fn normalize_keyword(raw: &str) -> Result<String, String> {
+pub fn normalize_keyword(raw: &str) -> Result<String, String> {
     let kw = raw.trim();
     if kw.is_empty() {
         Err("请输入关键词。".to_string())
@@ -155,8 +271,8 @@ fn normalize_keyword(raw: &str) -> Result<String, String> {
     }
 }
 
-/// 一条命中 → 表格 5 列文本。纯函数,可测。
-fn match_row(m: &FindMatch) -> [String; 5] {
+/// 一条命中 → 表格 5 列文本。纯函数，可测。
+pub fn match_row(m: &FindMatch) -> [String; 5] {
     [
         m.folder.clone(),
         m.source.clone(),
@@ -199,7 +315,8 @@ mod tests {
 
     #[test]
     fn normalize_keyword_rejects_empty() {
-        assert_eq!(normalize_keyword("  ").unwrap_err(), "请输入关键词。");
-        assert_eq!(normalize_keyword("  proj ").unwrap(), "proj");
+        assert!(normalize_keyword("").is_err());
+        assert!(normalize_keyword("   ").is_err());
+        assert_eq!(normalize_keyword(" 001 ").unwrap(), "001");
     }
 }

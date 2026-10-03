@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -16,7 +16,7 @@ use crate::reporter::Reporter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
-    /// 相对源目录的路径，使用 `\` 分隔（Windows 习惯）
+    /// 相对清单根的路径；单文件源使用其文件名，使用 `\` 分隔（Windows 习惯）
     #[serde(rename = "Rel")]
     pub rel: String,
     #[serde(rename = "Size")]
@@ -44,10 +44,16 @@ impl Manifest {
 
     /// 把清单写成 CSV 文件（与 PowerShell 旧版列名一致：Rel,Size,Hash 三列）
     pub fn write_csv(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        // 先序列化到内存,再用 durable::write_synced 原子落盘(同目录 tmp + fsync + rename)。
+        self.write_csv_inner(path, false)
+    }
+
+    /// 新归档清单禁止替换任何既有证据；恢复只可复用完整相同的已验证清单。
+    pub(crate) fn write_csv_new(&self, path: &Path) -> Result<()> {
+        self.write_csv_inner(path, true)
+    }
+
+    fn write_csv_inner(&self, path: &Path, no_replace: bool) -> Result<()> {
+        // 先序列化到内存，再用 no-follow 父目录句柄创建/原子写入。
         // 校验清单是恢复/复查的唯一依据,提交序「写清单 → 移源」中它先落盘;旧实现 from_path
         // 直接在原位截断后写,崩溃/断电恰发生在「已截断、未写完」之间会留下半截清单(与 SEC-006 同源)。
         // 原子 rename 保证读者只看到旧清单或完整新清单,绝不半截。fsync 仍在(write_synced 内)。(review-r2 #3 / L-001)
@@ -75,8 +81,18 @@ impl Manifest {
         let bytes = wtr
             .into_inner()
             .map_err(|e| anyhow::anyhow!("序列化校验清单失败：{}", e))?;
-        crate::engine::durable::write_synced(path, &bytes)
-            .with_context(|| format!("写校验清单失败：{}", path.display()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = path.file_name().context("校验清单路径缺少文件名")?;
+        let parent = crate::engine::destination::SafeDir::open(parent, true)?;
+        let result = if no_replace {
+            parent.write_atomic_new(Path::new(name), &bytes)
+        } else {
+            parent.write_atomic(Path::new(name), &bytes)
+        };
+        result.with_context(|| format!("写校验清单失败：{}", path.display()))?;
         Ok(())
     }
 }
@@ -113,9 +129,9 @@ pub struct ManifestOpts {
     pub no_hash: bool,
 }
 
-/// 生成文件夹清单。`no_hash=true` 时 `Entry.hash` 为 `None`(CSV 落盘仍写空串保持兼容)。
+/// 生成文件夹或单文件清单。单文件以其父目录为清单根，与目标容器内文件名一致。`no_hash=true` 时 `Entry.hash` 为 `None`(CSV 落盘仍写空串保持兼容)。
 pub fn build(root: &Path, opts: ManifestOpts, reporter: &dyn Reporter) -> Result<Manifest> {
-    build_inner(root, opts, reporter, None)
+    build_inner(root, opts, reporter, None, None)
 }
 
 /// 同 [`build`],但文件 SHA256 优先取自 `precomputed`(rel→大写十六进制),命中即免去再读一遍源内容。
@@ -128,7 +144,21 @@ pub(crate) fn build_with_hashes(
     reporter: &dyn Reporter,
     precomputed: &HashMap<String, String>,
 ) -> Result<Manifest> {
-    build_inner(root, opts, reporter, Some(precomputed))
+    build_inner(root, opts, reporter, Some(precomputed), None)
+}
+
+/// 目标清单绑定新建目的目录句柄，逐文件 no-follow 打开并从同一文件句柄读取元数据与内容。
+/// Linux 枚举锚定 fd；Windows 由持有的非重解析目录句柄阻止父路径替换。
+pub(crate) fn build_guarded(
+    root: &crate::engine::destination::SafeDir,
+    opts: ManifestOpts,
+    reporter: &dyn Reporter,
+) -> Result<Manifest> {
+    root.require_current_binding()?;
+    let anchored = root.anchored_path();
+    let manifest = build_inner(&anchored, opts, reporter, None, Some(root))?;
+    root.require_current_binding()?;
+    Ok(manifest)
 }
 
 fn build_inner(
@@ -136,6 +166,7 @@ fn build_inner(
     opts: ManifestOpts,
     reporter: &dyn Reporter,
     precomputed: Option<&HashMap<String, String>>,
+    guarded: Option<&crate::engine::destination::SafeDir>,
 ) -> Result<Manifest> {
     let files = real_files(root, reporter)?;
     let total_bytes: u64 = files
@@ -148,13 +179,34 @@ fn build_inner(
     // 不要 canonicalize:Windows 上它会加 `\\?\` 前缀,而 cruft::walk(WalkDir)产出的路径
     // 不带前缀 → strip_prefix 失配 → rel 退化成绝对路径 → diff/verify 永远失败。
     // WalkDir 产出的路径必以传入的 root 为前缀,直接用 root 做 base 即可。(ledger L-044)
-    let base = root.to_path_buf();
+    let base = if root.is_file() {
+        root.parent()
+            .ok_or_else(|| anyhow::anyhow!("单文件源没有父目录：{}", root.display()))?
+            .to_path_buf()
+    } else {
+        root.to_path_buf()
+    };
     let mut entries = Vec::with_capacity(files.len());
     let mut metadata_errors: Vec<String> = Vec::new();
     let mut hash_errors: Vec<String> = Vec::new();
 
     for f in &files {
-        let meta = match f.metadata() {
+        let opened = if let Some(guard) = guarded {
+            let relative = f
+                .strip_prefix(&base)
+                .context("目标枚举路径不在锚定目录内")?;
+            match guard.read_regular(relative) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    metadata_errors.push(format!("{}: {}", f.display(), error));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let metadata = opened.as_ref().map_or_else(|| f.metadata(), File::metadata);
+        let meta = match metadata {
             Ok(m) => m,
             Err(e) => {
                 metadata_errors.push(format!("{}: {}", f.display(), e));
@@ -177,7 +229,12 @@ fn build_inner(
             // 复制时已边读边算出该源文件哈希,直接复用,免去再读一遍源内容。(强优化:三遍读源折叠)
             Some(h.clone())
         } else {
-            match sha256_hex(f) {
+            let hash = if let Some(file) = opened {
+                sha256_reader(&mut BufReader::with_capacity(1024 * 1024, file))
+            } else {
+                sha256_hex(f)
+            };
+            match hash {
                 Ok(h) => Some(h),
                 Err(e) => {
                     hash_errors.push(format!("{}: {}", f.display(), e));
@@ -239,6 +296,10 @@ fn build_inner(
 pub(crate) fn sha256_hex(path: &Path) -> Result<String> {
     let f = File::open(path).with_context(|| format!("打开文件失败：{}", path.display()))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, f);
+    sha256_reader(&mut reader)
+}
+
+fn sha256_reader(reader: &mut impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -248,35 +309,6 @@ pub(crate) fn sha256_hex(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex_upper(&hasher.finalize()))
-}
-
-/// 复制 `src` → `dst` 的同时计算 **源** 的 SHA256(边读边算),返回大写十六进制。强优化:供 copy_folder
-/// 把『复制 + 生成源清单哈希』两遍读源折叠为一遍。与 [`sha256_hex`] 对同一字节产出**完全一致**的哈希
-/// (同一 Sha256 增量喂入),故折叠出的源哈希与目标侧 sha256_hex 可直接比对。注意:与 `fs::copy` 不同,
-/// 本函数不复制权限位(NTFS 备份只关心内容,清单只记 rel/size/hash/mtime,权限不参与校验)。
-pub(crate) fn copy_file_hashed(src: &Path, dst: &Path) -> Result<String> {
-    let in_f = File::open(src).with_context(|| format!("打开源失败：{}", src.display()))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, in_f);
-    let out_f = File::create(dst).with_context(|| format!("创建目标失败：{}", dst.display()))?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, out_f);
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("读源失败：{}", src.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        writer
-            .write_all(&buf[..n])
-            .with_context(|| format!("写目标失败：{}", dst.display()))?;
-    }
-    writer
-        .flush()
-        .with_context(|| format!("刷写目标失败：{}", dst.display()))?;
     Ok(hex_upper(&hasher.finalize()))
 }
 
@@ -601,3 +633,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "manifest_safety_tests.rs"]
+mod manifest_safety_tests;

@@ -1,9 +1,9 @@
-//! 仪表盘:顶部栏 + 忠实进度卡 + KPI 行 + 图表网格 + 引导 callout。浅色扁平科技风。
-//! 进度卡只反映 core 上报的 SHA256 校验/枚举各遍(复制阶段 core 无进度 → 自然隐藏,不伪造)。
+//! 仪表盘视图: 突出当前状态、待备份项目、可用容量、最近复查结果，以及“备份／复查／初始化”入口。
+//! 未复查、无数据、失败绝不展示绿色健康。
 
 use eframe::egui::{self, Color32};
 
-use bftool_core::engine::status::{self, StatusReport};
+use bftool_core::engine::status::StatusReport;
 use bftool_core::engine::verify::VerifyOutcome;
 
 use crate::app::{App, View};
@@ -23,19 +23,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             .map(|(_, t)| t.elapsed().as_millis() > CACHE_TTL_MS)
             .unwrap_or(true);
         if stale {
-            // GUI 仪表盘每 1500ms 刷新一次:复查记录损坏的 warn 走 NoopReporter 丢弃,避免每次刷新刷屏。(review-r3 round4)
-            match status::gather(&app.cfg, &bftool_core::reporter::NoopReporter) {
+            match app.backend.status(&app.cfg) {
                 Ok(r) => {
                     app.status_cache = Some((r.clone(), now));
                     Some(r)
                 }
-                // R-03:gather 失败时不直接 return——否则用户连"去设置/初始化"的入口都看不到,
-                // 卡死在仪表盘。改为显示 error callout 后仍渲染操作按钮,让用户能去其他页修配置。
                 Err(e) => {
-                    theme::callout(
+                    theme::callout_with_tag(
                         ui,
                         theme::DANGER,
                         theme::DANGER_SOFT,
+                        "状态异常",
                         &format!("读取状态失败：{:#}", e),
                     );
                     None
@@ -46,80 +44,99 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
     };
 
-    // gather 失败:仍渲染操作按钮 + 来源提示,让用户能跳去设置/初始化页修配置。
     let Some(report) = report else {
         ui.add_space(theme::GAP);
         actions_row(app, ui);
-        ui.add_space(6.0);
-        ui.weak(util::source_hint(&app.config_source));
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(util::source_hint(&app.config_source))
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+        );
         return;
     };
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        kpi_row(ui, &report);
-        ui.add_space(theme::GAP);
-        charts_row(ui, &report);
-        ui.add_space(theme::GAP);
-        if report.drives.is_empty() {
-            theme::callout(
-                ui,
-                theme::WARN,
-                theme::WARN_SOFT,
-                "还没有在线的备份盘。插入一块空盘 → 到「初始化新盘」把它做成「备份N」。",
+    egui::ScrollArea::vertical()
+        .id_salt("dashboard_scroll")
+        .show(ui, |ui| {
+            kpi_row(ui, &report);
+            ui.add_space(theme::GAP);
+
+            charts_row(ui, &report);
+            ui.add_space(theme::GAP);
+
+            if report.drives.is_empty() {
+                theme::callout_with_tag(
+                    ui,
+                    theme::WARN,
+                    theme::WARN_SOFT,
+                    "无备份盘",
+                    "当前未检测到在线的备份盘。请插入已初始化的备份盘，或进入「初始化新盘」准备新磁盘。",
+                );
+                ui.add_space(8.0);
+            }
+            if report.txn_pending {
+                theme::callout_with_tag(
+                    ui,
+                    theme::WARN,
+                    theme::WARN_SOFT,
+                    "待恢复事务",
+                    "发现上次未完成的事务日志 —— 下次运行备份或复查时将自动自检核验，保障数据安全。",
+                );
+                ui.add_space(8.0);
+            }
+
+            // 主次分明的快捷操作区
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        theme::section_title(ui, "核心操作入口");
+                        ui.label(
+                            egui::RichText::new("推荐日常流程：先检查待备份项目，插入备份盘后执行备份归档。")
+                                .size(11.5)
+                                .color(theme::TEXT_MUTED),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        actions_row(app, ui);
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(util::source_hint(&app.config_source))
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
             );
-            ui.add_space(8.0);
-        }
-        if report.txn_pending {
-            theme::callout(
-                ui,
-                theme::WARN,
-                theme::WARN_SOFT,
-                "发现上次未完成的事务残留 —— 下次运行备份/复查时会自动自检核对。",
-            );
-            ui.add_space(8.0);
-        }
-        actions_row(app, ui);
-        ui.add_space(6.0);
-        ui.weak(util::source_hint(&app.config_source));
-    });
+        });
 }
 
 fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("归档备份 · 总览")
-                .font(egui::FontId::new(
-                    20.0,
-                    egui::FontFamily::Name("semibold".into()),
-                ))
-                .color(theme::TEXT_TITLE),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 头像
-            let (r, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-            ui.painter()
-                .circle_filled(r.center(), 14.0, theme::PRIMARY_SOFT);
-            ui.painter().text(
-                r.center(),
-                egui::Align2::CENTER_CENTER,
-                "我",
-                egui::FontId::proportional(12.0),
-                theme::PRIMARY,
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new("仪表盘 · 总览")
+                    .font(theme::h1_font())
+                    .color(theme::TEXT_TITLE),
             );
-            ui.add_space(8.0);
-            // 搜索框:回车 → 跳查找页
+            ui.label(
+                egui::RichText::new("实时监控待归档数据、在线磁盘容量与完整性复查状态")
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+            );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut app.find_ui.keyword)
-                    .hint_text("搜索项目…")
-                    .desired_width(180.0),
+                    .hint_text("快速搜索已备份项目… (回车)")
+                    .desired_width(200.0),
             );
             if resp.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
                 && !app.find_ui.keyword.trim().is_empty()
                 && !app.is_busy()
-            // R5-6:任务进行中不跳转(与各页 busy 禁用一致,避免绕过)
             {
-                // R4-7:跳转前清掉上次查找的旧结果/错误,避免查找页显示与当前关键词无关的过期结果。
                 app.find_ui.result = None;
                 app.find_ui.error = None;
                 app.view = View::Find;
@@ -128,8 +145,7 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-/// 忠实进度卡:仅当 core 正在上报字节进度(某一遍校验/枚举)时显示。
-/// 复制阶段 core 无进度事件 → `active=false` → 隐藏(不伪造"已传/总量/ETA")。
+/// 进度卡片：仅当 core 正在上报字节进度时展示真实进度
 fn progress_card(app: &mut App, ui: &mut egui::Ui) {
     let snap = app
         .progress
@@ -145,18 +161,20 @@ fn progress_card(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add(egui::Spinner::new().size(14.0).color(theme::PRIMARY));
             ui.add_space(6.0);
-            ui.colored_label(theme::TEXT_TITLE, format!("{phase}中…"));
+            theme::badge(ui, "任务进行中", theme::PRIMARY, Color32::WHITE);
+            ui.add_space(4.0);
+            ui.colored_label(theme::TEXT_TITLE, format!("{phase} 正在进行…"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.colored_label(theme::PRIMARY, format!("{:.0}%", frac * 100.0));
+                ui.colored_label(theme::PRIMARY, format!("{:.1}%", frac * 100.0));
             });
         });
-        ui.add_space(8.0);
-        theme::hbar(ui, frac, theme::PRIMARY);
         ui.add_space(6.0);
+        theme::hbar(ui, frac, theme::PRIMARY);
+        ui.add_space(4.0);
         ui.colored_label(
             theme::TEXT_MUTED,
             format!(
-                "{} / {} · 当前阶段({phase})",
+                "已校验 {} / 总计 {} · 阶段：{phase}",
                 util::fmt_gb(cur),
                 util::fmt_gb(total)
             ),
@@ -181,47 +199,78 @@ fn kpi_row(ui: &mut egui::Ui, report: &StatusReport) {
         0.0
     };
     let (vval, vsub, vcolor) = latest_verify(report);
-    ui.columns(4, |c| {
-        theme::kpi_card(
-            &mut c[0],
-            "待备份项目",
-            &report.pending_count.to_string(),
-            "个文件夹待归档",
-            theme::PRIMARY,
-        );
-        theme::kpi_card(
-            &mut c[1],
-            "在线备份盘",
-            &online.to_string(),
-            &format!("可用 {usable} · 封盘 {sealed}"),
-            theme::VIOLET,
-        );
-        theme::kpi_card(
-            &mut c[2],
-            "容量已用",
-            &format!("{pct:.0}%"),
-            &format!("{} / {}", util::fmt_gb(used), util::fmt_gb(total)),
-            theme::CYAN,
-        );
-        theme::kpi_card(&mut c[3], "最近复查", &vval, &vsub, vcolor);
+
+    theme::card_grid(ui, 4, 4, |card, index| match index {
+        0 => {
+            theme::kpi_card(
+                card,
+                "待备份项目",
+                &report.pending_count.to_string(),
+                if report.pending_count > 0 {
+                    "个目录待安全归档"
+                } else {
+                    "源目录目前已清空"
+                },
+                if report.pending_count > 0 {
+                    theme::PRIMARY
+                } else {
+                    theme::TEXT_MUTED
+                },
+            );
+        }
+        1 => {
+            theme::kpi_card(
+                card,
+                "在线备份盘",
+                &online.to_string(),
+                &format!("可用 {usable} · 封盘 {sealed}"),
+                if online > 0 {
+                    theme::PRIMARY
+                } else {
+                    theme::WARN
+                },
+            );
+        }
+        2 => {
+            theme::kpi_card(
+                card,
+                "可用容量情况",
+                &format!("{pct:.0}% 已用"),
+                &format!(
+                    "剩余 {} / 共 {}",
+                    util::fmt_gb(total.saturating_sub(used)),
+                    util::fmt_gb(total)
+                ),
+                if pct > 90.0 { theme::WARN } else { theme::CYAN },
+            );
+        }
+        3 => {
+            theme::kpi_card(card, "最近复查结果", &vval, &vsub, vcolor);
+        }
+        _ => unreachable!(),
     });
 }
 
-/// 复查结论 → (标签, 颜色)。纯函数,可测。
-fn outcome_label(o: &VerifyOutcome) -> (&'static str, Color32) {
-    // 强优化:文案统一用 core 的权威 VerifyOutcome::label();此处只决定配色(UI 关注点)。
+/// 复查结论 → (标签, 颜色)。纯函数，覆盖 core 权威状态
+pub fn outcome_label(o: &VerifyOutcome) -> (&'static str, Color32) {
     let color = match o {
         VerifyOutcome::Clean => theme::OK,
         VerifyOutcome::IssuesFound { .. } => theme::DANGER,
         VerifyOutcome::ExtraOnly { .. } => theme::WARN,
-        // 仅大小校验(清单无哈希)未验证内容 → WARN 色,不绿标完好。(review-r3 round5)
         VerifyOutcome::CleanButSizeOnly { .. } => theme::WARN,
-        VerifyOutcome::Cancelled => theme::TEXT_BODY,
+        VerifyOutcome::Cancelled => theme::TEXT_MUTED,
     };
     (o.label(), color)
 }
 
 fn latest_verify(report: &StatusReport) -> (String, String, Color32) {
+    if report.drives.is_empty() {
+        return (
+            "无在线盘".into(),
+            "暂未连接备份盘".into(),
+            theme::TEXT_MUTED,
+        );
+    }
     let latest = report
         .drives
         .iter()
@@ -231,117 +280,158 @@ fn latest_verify(report: &StatusReport) -> (String, String, Color32) {
         Some(v) => {
             let (label, color) = outcome_label(&v.status);
             let date = v.when.split('T').next().unwrap_or(&v.when).to_string();
-            (label.to_string(), date, color)
+            (label.to_string(), format!("复查日期：{date}"), color)
         }
-        None => (
-            "未复查".into(),
-            "建议每 6–12 个月一次".into(),
-            theme::TEXT_MUTED,
-        ),
+        None => ("未复查".into(), "建议执行完整性复查".into(), theme::WARN),
     }
 }
 
 fn charts_row(ui: &mut egui::Ui, report: &StatusReport) {
-    ui.columns(2, |c| {
-        theme::card(&mut c[0], |ui| {
-            ui.label(
-                egui::RichText::new("每盘容量")
-                    .font(theme::title_font())
-                    .color(theme::TEXT_TITLE),
-            );
-            ui.add_space(12.0);
-            if report.drives.is_empty() {
-                ui.colored_label(theme::TEXT_MUTED, "暂无在线盘");
-            } else {
-                for ds in &report.drives {
-                    let d = &ds.drive;
-                    let used = d.total_bytes.saturating_sub(d.free_bytes);
-                    let frac = if d.total_bytes > 0 {
-                        used as f32 / d.total_bytes as f32
-                    } else {
-                        0.0
-                    };
-                    ui.horizontal(|ui| {
-                        ui.colored_label(theme::TEXT_TITLE, format!("{} ({}:)", d.id, d.letter));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.colored_label(
-                                theme::TEXT_MUTED,
-                                format!(
-                                    "剩余 {} / {}",
-                                    util::fmt_gb(d.free_bytes),
-                                    util::fmt_gb(d.total_bytes)
-                                ),
+    theme::card_grid(ui, 2, 2, |card, index| match index {
+        0 => {
+            theme::card(card, |ui| {
+                theme::section_title(ui, "磁盘容量使用率");
+                ui.add_space(8.0);
+                if report.drives.is_empty() {
+                    ui.colored_label(theme::TEXT_MUTED, "暂无已挂载的备份盘");
+                } else {
+                    for ds in &report.drives {
+                        let d = &ds.drive;
+                        let used = d.total_bytes.saturating_sub(d.free_bytes);
+                        let frac = if d.total_bytes > 0 {
+                            used as f32 / d.total_bytes as f32
+                        } else {
+                            0.0
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} ({}:)", d.id, d.letter))
+                                    .font(theme::subtitle_font())
+                                    .color(theme::TEXT_TITLE),
+                            );
+                            if d.sealed {
+                                theme::badge(ui, "已封盘", theme::TRACK, theme::TEXT_MUTED);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.colored_label(
+                                        theme::TEXT_MUTED,
+                                        format!(
+                                            "可用 {} / 总共 {}",
+                                            util::fmt_gb(d.free_bytes),
+                                            util::fmt_gb(d.total_bytes)
+                                        ),
+                                    );
+                                },
                             );
                         });
-                    });
-                    ui.add_space(4.0);
-                    theme::hbar(
-                        ui,
-                        frac,
-                        if frac > 0.9 {
-                            theme::WARN
-                        } else {
-                            theme::PRIMARY
-                        },
-                    );
-                    ui.add_space(14.0);
+                        ui.add_space(3.0);
+                        theme::hbar(
+                            ui,
+                            frac,
+                            if frac > 0.9 {
+                                theme::WARN
+                            } else {
+                                theme::PRIMARY
+                            },
+                        );
+                        ui.add_space(10.0);
+                    }
                 }
-            }
-        });
-        theme::card(&mut c[1], |ui| {
-            ui.label(
-                egui::RichText::new("复查健康")
-                    .font(theme::title_font())
-                    .color(theme::TEXT_TITLE),
-            );
-            ui.add_space(8.0);
-            let verified: Vec<_> = report
-                .drives
-                .iter()
-                .filter_map(|d| d.last_verify.as_ref())
-                .collect();
-            if verified.is_empty() {
-                ui.colored_label(theme::TEXT_MUTED, "暂无复查记录");
-            } else {
-                let clean = verified
+            });
+        }
+        1 => {
+            theme::card(card, |ui| {
+                theme::section_title(ui, "数据完整性复查健康度");
+                ui.add_space(8.0);
+                let verified: Vec<_> = report
+                    .drives
                     .iter()
-                    .filter(|v| matches!(v.status, VerifyOutcome::Clean))
-                    .count();
-                let tot = verified.len();
-                let frac = clean as f32 / tot as f32;
-                ui.vertical_centered(|ui| {
-                    theme::ring(
-                        ui,
-                        frac,
-                        theme::OK,
-                        &format!("{:.0}%", frac * 100.0),
-                        "完好",
-                        140.0,
-                    );
-                    ui.add_space(8.0);
-                    ui.colored_label(theme::TEXT_BODY, format!("{clean} / {tot} 盘完好"));
-                });
-            }
-        });
+                    .filter_map(|d| d.last_verify.as_ref())
+                    .collect();
+
+                if report.drives.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        theme::ring(ui, 0.0, theme::TEXT_MUTED, "无数据", "未连接备份盘", 130.0);
+                        ui.add_space(6.0);
+                        ui.colored_label(theme::TEXT_MUTED, "请先接入或初始化备份盘");
+                    });
+                } else if verified.is_empty() {
+                    // 重点：未复查不能展示绿色健康！显示灰色/橙色与未复查文字
+                    ui.vertical_centered(|ui| {
+                        theme::ring(ui, 0.0, theme::WARN, "未复查", "尚无记录", 130.0);
+                        ui.add_space(6.0);
+                        ui.colored_label(theme::WARN, "建议定期执行复查比对 SHA256 校验和");
+                    });
+                } else {
+                    let clean = verified
+                        .iter()
+                        .filter(|v| matches!(v.status, VerifyOutcome::Clean))
+                        .count();
+                    let issues = verified
+                        .iter()
+                        .filter(|v| matches!(v.status, VerifyOutcome::IssuesFound { .. }))
+                        .count();
+                    let tot = report.drives.len(); // 统计所有在线盘
+                    let frac = clean as f32 / tot as f32;
+
+                    let ring_color = if issues > 0 {
+                        theme::DANGER
+                    } else if clean == tot {
+                        theme::OK
+                    } else {
+                        theme::WARN
+                    };
+
+                    ui.vertical_centered(|ui| {
+                        theme::ring(
+                            ui,
+                            frac,
+                            ring_color,
+                            &format!("{:.0}%", frac * 100.0),
+                            if issues > 0 {
+                                "有损坏"
+                            } else if clean == tot {
+                                "完好"
+                            } else {
+                                "部分未查"
+                            },
+                            130.0,
+                        );
+                        ui.add_space(6.0);
+                        let info_text = format!("{clean} / {tot} 块在线盘经校验完好");
+                        ui.colored_label(theme::TEXT_BODY, info_text);
+                    });
+                }
+            });
+        }
+        _ => unreachable!(),
     });
 }
 
 fn actions_row(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_enabled_ui(!app.is_busy(), |ui| {
-        ui.horizontal(|ui| {
-            let primary =
-                egui::Button::new(egui::RichText::new("▶  备份").color(egui::Color32::WHITE))
-                    .fill(theme::PRIMARY);
-            if ui.add(primary).clicked() {
-                app.view = View::Archive;
-            }
-            if ui.button("✓  复查").clicked() {
-                app.view = View::Verify;
-            }
-            if ui.button("＋  初始化新盘").clicked() {
-                app.view = View::Init;
-            }
-        });
+    let busy = app.is_busy();
+    ui.horizontal(|ui| {
+        let primary_btn = ui.add_enabled(!busy, theme::btn_primary("▶ 备份归档"));
+        if primary_btn.clicked() {
+            app.view = View::Archive;
+        }
+
+        let verify_btn = ui.add_enabled(!busy, theme::btn_secondary("✓ 完整性复查"));
+        if verify_btn.clicked() {
+            app.view = View::Verify;
+        }
+
+        let init_btn = ui.add_enabled(!busy, theme::btn_secondary("＋ 初始化新盘"));
+        if init_btn.clicked() {
+            app.view = View::Init;
+        }
+
+        if busy {
+            ui.add_space(4.0);
+            ui.colored_label(theme::TEXT_MUTED, "(任务正在运行中)");
+        }
     });
 }
 
@@ -354,7 +444,7 @@ mod tests {
         assert_eq!(outcome_label(&VerifyOutcome::Clean).0, "完好");
         assert_eq!(
             outcome_label(&VerifyOutcome::IssuesFound { bad: 2 }).0,
-            "发现损坏"
+            "发现完整性问题"
         );
         assert_eq!(
             outcome_label(&VerifyOutcome::ExtraOnly { extra: 1 }).0,

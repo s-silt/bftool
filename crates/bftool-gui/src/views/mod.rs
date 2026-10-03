@@ -10,3 +10,4 @@ pub mod settings;
 pub mod theme;
 pub mod util;
 pub mod verify;
+pub mod watch;

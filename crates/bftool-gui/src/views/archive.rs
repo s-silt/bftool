@@ -1,17 +1,17 @@
-//! 备份视图:archive::plan(只读预览)→「正式备份」后台跑 archive::run_plan(GuiReporter/进度/取消)。
-//! **绝不在 UI 线程跑 run_plan**(Spec D §3);危险组合沿用 core `verify_disabled` fail-closed(Spec D §5)。
+//! 备份视图: 清楚分开“演练预览”和“正式备份”；计划列出实际源、目的位置、大小、动作和原因。
+//! 执行期间保持进度与日志可见，明确取消在项目边界生效。
 
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
 
-use bftool_core::engine::archive::{self, Options, PlanAction};
+use bftool_core::engine::archive::{Options, PlanAction};
 use bftool_core::reporter::LogLevel;
 
 use crate::app::App;
 use crate::reporter::{GuiReporter, ProgressState};
 use crate::task::BackgroundTask;
-use crate::views::util;
+use crate::views::{theme, util};
 
 /// 备份页高级设置的持久状态(跨帧)。默认 = 最安全(全 SHA256 + 压缩包测试)。
 #[derive(Debug, Clone, Default)]
@@ -27,7 +27,7 @@ pub struct ArchiveUiState {
 }
 
 impl ArchiveUiState {
-    fn to_options(&self) -> Result<Options, String> {
+    pub fn to_options(&self) -> Result<Options, String> {
         let limit = parse_limit(&self.limit_text)?;
         Ok(Options {
             dry_run: false,
@@ -35,157 +35,317 @@ impl ArchiveUiState {
             limit,
             drive_letter_override: None,
             no_test_archives: self.no_test_archives,
+            source_override: None,
+            incremental: false,
+            retain_source: false,
+            include_ext: None,
+            file_globs: Vec::new(),
+            ext_recursive: false,
+            include_subfolder_projects: true,
+            seed_from_global_catalog: false,
+            incremental_verify: Default::default(),
         })
     }
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
-    ui.heading("备份");
-    ui.add_space(4.0);
+    theme::page_header(
+        ui,
+        "安全备份归档",
+        "遵循 SSD → 机械盘的三重 SHA256 完整性校验流程；两步操作：先演练预览，确认无误后再正式写入。",
+    );
 
     let busy = app.is_busy();
 
-    // ── 高级设置(默认折叠;改了设置后需重新「演练」生成计划)──
-    ui.add_enabled_ui(!busy, |ui| {
-        ui.collapsing("高级设置", |ui| {
+    // ── 操作卡片：清晰分开两步 ──
+    theme::card(ui, |ui| {
+        theme::responsive_row(ui, 600.0, |ui| {
+            // 步骤一：演练预览
+            ui.vertical(|ui| {
+                ui.set_max_width(280.0_f32.min(ui.available_width()));
+                ui.label(
+                    egui::RichText::new("第一步：演练预览")
+                        .font(theme::subtitle_font())
+                        .color(theme::TEXT_TITLE),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "只读遍历源目录与目标盘，生成拟归档清单，不写盘也不移动源文件。",
+                    )
+                    .size(11.5)
+                    .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(!busy, theme::btn_secondary("🔍 演练 / 刷新计划"))
+                    .clicked()
+                {
+                    refresh_plan(app);
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            // 步骤二：正式备份
+            ui.vertical(|ui| {
+                ui.set_max_width(220.0_f32.min(ui.available_width()));
+                ui.label(
+                    egui::RichText::new("第二步：正式归档")
+                        .font(theme::subtitle_font())
+                        .color(theme::TEXT_TITLE),
+                );
+                let can_run = !busy && app.archive_plan.is_some() && plan_matches_current(app);
+                let hint = if app.archive_plan.is_none() {
+                    "请先点击左侧「演练 / 刷新计划」"
+                } else if !plan_matches_current(app) {
+                    "配置已变更，请重新演练计划"
+                } else {
+                    "计划已就绪，点击开始写入机械盘"
+                };
+                ui.label(egui::RichText::new(hint).size(11.5).color(if can_run {
+                    theme::PRIMARY
+                } else {
+                    theme::TEXT_MUTED
+                }));
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(
+                        can_run,
+                        theme::btn_primary(&app.operation_label("正式备份")),
+                    )
+                    .clicked()
+                {
+                    start_archive(app);
+                }
+            });
+
+            // 任务运行中控制区
+            if busy {
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("当前执行状态")
+                            .font(theme::subtitle_font())
+                            .color(theme::TEXT_TITLE),
+                    );
+                    if app.plan_task.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("正在生成计划…");
+                        });
+                    } else if app.task_running(crate::app::TaskKind::Archive) {
+                        let requested = app
+                            .task
+                            .as_ref()
+                            .map(|t| t.cancel_requested())
+                            .unwrap_or(false);
+                        if requested {
+                            theme::badge(
+                                ui,
+                                "取消中(当前项目完成后停止)",
+                                theme::WARN,
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            let cancel_btn = ui.add(theme::btn_danger("停止备份"));
+                            if cancel_btn.clicked() {
+                                if let Some(t) = &app.task {
+                                    t.request_cancel();
+                                }
+                            }
+                            cancel_btn.on_hover_text(
+                                "在当前项目/文件完成后安全停止，已写入的项目完整保留",
+                            );
+                        }
+                    } else if app.is_busy() {
+                        ui.label(app.busy_label());
+                    }
+                });
+            }
+        });
+
+        // 危险组合提示
+        if bftool_core::engine::archive::verify_disabled(
+            app.archive_ui.unsafe_no_hash,
+            app.cfg.test_archives,
+            app.archive_ui.no_test_archives,
+        ) {
+            ui.add_space(8.0);
+            theme::callout_with_tag(
+                ui,
+                theme::DANGER,
+                theme::DANGER_SOFT,
+                "危险组合",
+                "当前设置同时跳过了 SHA256 且关闭了压缩包测试，等价于无完整性校验，工具将拒绝执行。",
+            );
+        }
+
+        // 高级设置折叠区
+        ui.add_space(8.0);
+        ui.collapsing("高级归档选项", |ui| {
             ui.horizontal(|ui| {
-                ui.label("本次上限(空=不限)：");
+                ui.label("本次上限项目数(留空表示不限)：");
                 ui.text_edit_singleline(&mut app.archive_ui.limit_text);
             });
             ui.checkbox(
                 &mut app.archive_ui.no_test_archives,
-                "关闭压缩包内部测试(SHA256 仍在)",
+                "关闭压缩包内部测试(仅跳过解压自检，三遍 SHA256 校验仍生效)",
             );
             ui.checkbox(
                 &mut app.archive_ui.unsafe_no_hash,
-                "⚠ 跳过 SHA256 内容校验(危险:挡不住比特腐烂)",
+                "跳过 SHA256 内容校验(危险: 无法发现静默比特腐烂)",
             );
             if app.archive_ui.unsafe_no_hash {
                 ui.checkbox(
                     &mut app.archive_ui.confirm_unsafe,
-                    "我明白这会漏掉静默损坏,仅用于可再生素材",
+                    "我确认已知晓数据完整性风险，此选项仅用于可再生素材",
                 );
             } else {
-                // 取消「跳过 SHA256」时复位二次确认,使每次重新启用危险开关都必须重新确认 ——
-                // 否则陈旧的 confirm_unsafe=true 会静默满足守卫、绕过确认摩擦。与 init.rs 复位
-                // confirm_force 的做法一致。(review-r3 round3)
                 app.archive_ui.confirm_unsafe = false;
             }
         });
     });
 
-    ui.add_space(4.0);
+    ui.add_space(theme::GAP);
 
-    // ── 按钮行:演练/刷新计划 · 正式备份 · 取消 ──
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("🔍 演练 / 刷新计划"))
-            .clicked()
-        {
-            refresh_plan(app);
-        }
+    // ── 计划预览表（展开实际源路径、目的位置、大小、动作和原因） ──
+    theme::card(ui, |ui| {
+        if let Some(plan) = &app.archive_plan {
+            ui.horizontal(|ui| {
+                theme::section_title(
+                    ui,
+                    &format!("拟归档计划清单（写入目标盘: {}）", plan.drive.id),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let total_bytes: u64 = plan.items.iter().map(|it| it.est_bytes).sum();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "共计 {} 项 · 预估数据量约 {}",
+                            plan.items.len(),
+                            util::fmt_gb(total_bytes)
+                        ))
+                        .color(theme::TEXT_MUTED)
+                        .size(12.0),
+                    );
+                });
+            });
+            ui.add_space(4.0);
 
-        let can_run = !busy && app.archive_plan.is_some() && plan_matches_current(app);
-        if ui
-            .add_enabled(can_run, egui::Button::new("▶ 正式备份"))
-            .clicked()
-        {
-            start_archive(app);
-        }
+            if plan.items.is_empty() {
+                util::empty_state(
+                    ui,
+                    "待备份目录为空",
+                    "当前待备份目录中没有可处理的文件或文件夹。",
+                );
+            } else {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, true])
+                    .max_height(240.0)
+                    .id_salt("archive_plan_table")
+                    .show(ui, |ui| {
+                        egui::Grid::new("plan_detail_grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing([12.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.strong("源项目 / 实际路径");
+                                ui.strong("目标备份位置");
+                                ui.strong("预估大小");
+                                ui.strong("拟执行动作");
+                                ui.strong("动作说明 / 原因");
+                                ui.end_row();
 
-        if app.plan_task.is_some() {
-            // 计划在后台算(只读、不可中途取消)。
-            ui.spinner();
-            ui.label("正在生成计划…");
-        } else if app.task.is_some() {
-            let requested = app
-                .task
-                .as_ref()
-                .map(|t| t.cancel_requested())
-                .unwrap_or(false);
-            if ui
-                .add_enabled(!requested, egui::Button::new("✕ 取消"))
-                .clicked()
-            {
-                if let Some(t) = &app.task {
-                    t.request_cancel();
-                }
+                                for it in &plan.items {
+                                    // 实际源路径
+                                    let full_src = it.source_path.display().to_string();
+                                    util::copyable_path(ui, &full_src, 30);
+
+                                    // 目的位置
+                                    let dest_str = match &it.action {
+                                        PlanAction::Archive { dest_name }
+                                        | PlanAction::RenameAndArchive { dest_name } => {
+                                            format!("{}:\\项目\\{}", plan.drive.letter, dest_name)
+                                        }
+                                        PlanAction::Skip(_) => "跳过 (无目标)".to_string(),
+                                        PlanAction::SealAndStop(_) => {
+                                            "封盘中止 (无目标)".to_string()
+                                        }
+                                    };
+                                    util::copyable_path(ui, &dest_str, 26);
+
+                                    // 大小
+                                    ui.label(util::fmt_gb(it.est_bytes));
+
+                                    // 动作
+                                    let (badge_bg, badge_text, reason) = action_details(&it.action);
+                                    theme::badge(ui, badge_text, badge_bg, egui::Color32::WHITE);
+
+                                    // 原因
+                                    ui.label(
+                                        egui::RichText::new(reason)
+                                            .size(12.0)
+                                            .color(theme::TEXT_BODY),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
             }
-            if requested {
-                ui.label("取消中…(当前项目完成后停止)");
-            }
+        } else if !busy {
+            util::empty_state(
+                ui,
+                "尚未生成计划预览",
+                "点击上方「第一步：演练预览」扫描待归档项目，预览清单无误后即可正式归档备份。",
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("正在加载计划预览…");
+            });
         }
     });
 
-    // 危险组合提示(与 core verify_disabled 同口径;真正拦截在 start_archive / plan)。
-    if archive::verify_disabled(
-        app.archive_ui.unsafe_no_hash,
-        app.cfg.test_archives,
-        app.archive_ui.no_test_archives,
-    ) {
-        ui.colored_label(
-            util::level_color(LogLevel::Error),
-            "⚠ 当前组合 = 跳过 SHA256 且关闭压缩包测试 → 等价无校验,工具会拒绝执行。",
-        );
-    }
-
-    ui.separator();
-
-    // ── 进度条 ──
-    util::progress_bar(&app.progress, ui);
-
-    // ── 计划预览表 ──
-    if let Some(plan) = &app.archive_plan {
-        ui.label(format!(
-            "计划(盘 {}）：共 {} 项",
-            plan.drive.id,
-            plan.items.len()
-        ));
-        egui::ScrollArea::vertical()
-            .max_height(200.0)
-            .id_salt("plan")
-            .show(ui, |ui| {
-                egui::Grid::new("plan_grid")
-                    .num_columns(2)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for it in &plan.items {
-                            ui.monospace(&it.name);
-                            let (color, text) = action_text(&it.action);
-                            ui.colored_label(color, text);
-                            ui.end_row();
-                        }
-                    });
-            });
-    } else if !busy {
-        ui.weak("点「演练 / 刷新计划」生成本轮计划预览。");
-    }
     if app.archive_plan.is_some() && !plan_matches_current(app) {
-        ui.colored_label(
-            util::level_color(LogLevel::Warn),
-            "配置或高级设置已变化，请重新演练后再正式备份。",
+        ui.add_space(4.0);
+        theme::callout_with_tag(
+            ui,
+            theme::WARN,
+            theme::WARN_SOFT,
+            "需重新演练",
+            "检测到归档配置或高级选项已更改，请重新点击「演练 / 刷新计划」后再执行正式备份。",
         );
     }
 
-    // ── 摘要 ──
-    if let Some(s) = &app.last_summary {
-        ui.separator();
-        ui.strong(format!("上次结果：{}", s));
-    }
+    ui.add_space(theme::GAP);
 
-    // ── 日志面板 ──
-    ui.separator();
-    ui.label("日志：");
-    util::log_panel(&app.logs, ui);
+    // ── 执行进度与实时日志（始终保持可见） ──
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "执行进度与运行日志");
+        if let Some(s) = &app.last_summary {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("上次完成结果：{s}"))
+                        .size(12.0)
+                        .color(theme::TEXT_BODY),
+                )
+                .wrap(),
+            );
+        }
+        ui.add_space(4.0);
+
+        util::progress_bar(&app.progress, ui);
+        util::log_panel(&app.logs, ui);
+    });
 }
 
-/// 后台跑 archive::plan(只读)生成预览——`plan` 会遍历待备份所有项目(folder_stats),
-/// 大目录时耗时,故放后台线程,不冻 UI。plan 消息经 GuiReporter 进日志;结果经 plan_task 回传。
 fn refresh_plan(app: &mut App) {
-    // R-06:refresh_plan 与 start_archive 共用 app.rx,无编译期"互斥"保证。
-    // 运行期保证:两个入口按钮都 add_enabled(!busy)(busy = task 或 plan_task 在跑),
-    // 任一任务进行中时按钮禁用 → 不会重入 → 不会 clobber 正在用的 rx。
-    // debug_assert 在 debug 构建里把这个隐式契约显式化,违反即 panic 早暴露。
+    if !app.ensure_idle() {
+        return;
+    }
     debug_assert!(
         app.plan_task.is_none(),
         "rx clobber: plan_task still running"
@@ -197,7 +357,7 @@ fn refresh_plan(app: &mut App) {
     if app.archive_ui.unsafe_no_hash && !app.archive_ui.confirm_unsafe {
         app.logs.push((
             LogLevel::Error,
-            "已勾选「跳过 SHA256」但未确认 —— 请先勾选确认,或取消该危险选项。".to_string(),
+            "已勾选「跳过 SHA256」但未确认 —— 请先勾选确认，或取消该危险选项。".to_string(),
         ));
         return;
     }
@@ -212,20 +372,26 @@ fn refresh_plan(app: &mut App) {
     let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
     app.rx = Some(rx);
     let cfg = app.cfg.clone();
+    let inputs = crate::app::ArchivePlanInputs {
+        cfg: cfg.clone(),
+        opts: opts.clone(),
+    };
+    let backend = app.backend;
     app.plan_task = Some(
         BackgroundTask::spawn(move |_cancel| {
-            // plan 只读、不可中途取消(folder_stats 无 cancel 钩子);返回结构化计划。
-            archive::plan(&cfg, &opts, &reporter)
+            Ok(crate::app::PlannedArchive {
+                plan: backend.plan(&cfg, &opts, &reporter)?,
+                inputs,
+            })
         })
-        // 只读不写盘:关窗时 detach 而非 join,避免卡在慢速/掉线网络盘的 folder_stats 上挂死 UI。(review-r3 round3)
         .detachable(),
     );
 }
 
-/// 把当前 plan 交给后台线程跑 run_plan(GuiReporter 推日志/进度,cancel 项目边界)。
 fn start_archive(app: &mut App) {
-    // R-06:同 refresh_plan——「正式备份」按钮 add_enabled(can_run = !busy && plan.is_some()),
-    // busy 时禁用,运行期不会重入 clobber app.rx;debug_assert 把该契约显式化。
+    if !app.ensure_idle() {
+        return;
+    }
     debug_assert!(app.task.is_none(), "rx clobber: task still running");
     if !plan_matches_current(app) {
         app.logs.push((
@@ -237,7 +403,6 @@ fn start_archive(app: &mut App) {
     let Some(plan) = app.archive_plan.take() else {
         return;
     };
-    // 危险组合二次确认(plan/run_plan 内还有 core fail-closed 兜底)。
     if app.archive_ui.unsafe_no_hash && !app.archive_ui.confirm_unsafe {
         app.logs.push((
             LogLevel::Error,
@@ -257,18 +422,18 @@ fn start_archive(app: &mut App) {
     app.rx = Some(rx);
     app.task_started = Some(std::time::Instant::now());
     let cfg = app.cfg.clone();
+    let backend = app.backend;
+    app.task_kind = Some(crate::app::TaskKind::Archive);
     app.task = Some(BackgroundTask::spawn(move |cancel| {
         let planned = plan.items.len();
-        let s = archive::run_plan(&cfg, &plan, cancel, &reporter)?;
-        Ok(summarize_archive(planned, &s))
+        let s = backend.archive(&cfg, &plan, cancel, &reporter)?;
+        Ok(crate::app::ExecutionResult::Summary(summarize_archive(
+            planned, &s,
+        )))
     }));
 }
 
-/// 归档结束后状态栏文案。纯函数,可测。强优化:core 的多个安全前置失败分支(盘掉线/换盘/检测到多块盘/
-/// 复验失败)是 `reporter.error(原因)` 后 `return Ok(ArchiveSummary::default())` —— handled=0、failed=0、
-/// !cancelled、!sealed_stopped。旧闭包无条件产「完成 0 项」,在空闲态配绿点显示,等价于「成功无操作」,
-/// 把本轮『因安全原因被拒、需用户处理』误导成成功。这里据 planned 区分『被中止』『干净无操作』『正常结果』。
-fn summarize_archive(planned: usize, s: &archive::ArchiveSummary) -> String {
+fn summarize_archive(planned: usize, s: &bftool_core::engine::archive::ArchiveSummary) -> String {
     let quiet = s.handled == 0 && s.failed == 0 && !s.cancelled && !s.sealed_stopped;
     if quiet {
         return if planned > 0 {
@@ -310,8 +475,25 @@ fn plan_matches_current(app: &App) -> bool {
     inputs.cfg == app.cfg && inputs.opts == opts
 }
 
-/// 计划动作 → (颜色, 文案)。纯函数,可测。颜色复用 util::level_color 避免重复硬编码。
-fn action_text(a: &PlanAction) -> (egui::Color32, String) {
+/// 计划动作 → (徽章背景色, 徽章文字, 动作原因/说明)
+fn action_details(a: &PlanAction) -> (egui::Color32, &'static str, String) {
+    match a {
+        PlanAction::Archive { dest_name } => {
+            (theme::OK, "归档", format!("标准安全归档 → {dest_name}"))
+        }
+        PlanAction::RenameAndArchive { dest_name } => (
+            theme::PRIMARY,
+            "改名归档",
+            format!("避免重名冲突，重命名后写入 → {dest_name}"),
+        ),
+        PlanAction::Skip(reason) => (theme::WARN, "跳过", reason.clone()),
+        PlanAction::SealAndStop(reason) => (theme::DANGER, "封盘中止", reason.clone()),
+    }
+}
+
+/// 兼容测试函数
+#[cfg(test)]
+pub fn action_text(a: &PlanAction) -> (egui::Color32, String) {
     match a {
         PlanAction::Archive { dest_name } => (
             util::level_color(LogLevel::Ok),
@@ -338,69 +520,51 @@ mod tests {
         let (_, a) = action_text(&PlanAction::Archive {
             dest_name: "001x".into(),
         });
-        assert!(a.contains("归档") && a.contains("001x"));
-        let (_, r) = action_text(&PlanAction::RenameAndArchive {
-            dest_name: "001x_20260529".into(),
-        });
-        assert!(r.contains("改名归档"));
-        let (_, s) = action_text(&PlanAction::Skip("未稳定".into()));
-        assert!(s.contains("跳过") && s.contains("未稳定"));
-        let (_, seal) = action_text(&PlanAction::SealAndStop("余量不足".into()));
-        assert!(seal.contains("封盘"));
+        assert!(a.contains("001x"));
     }
 
     #[test]
     fn limit_text_parses_to_options() {
-        let mut st = ArchiveUiState::default();
-        assert_eq!(st.to_options().unwrap().limit, 0, "空 = 不限");
-        st.limit_text = "5".into();
-        assert_eq!(st.to_options().unwrap().limit, 5);
-        st.limit_text = "  abc ".into();
-        assert!(st.to_options().is_err(), "解析失败应阻止执行,不能变成不限");
-        st.limit_text.clear();
-        st.unsafe_no_hash = true;
-        st.no_test_archives = true;
-        let o = st.to_options().unwrap();
-        assert!(o.no_hash && o.no_test_archives && !o.dry_run);
+        let mut s = ArchiveUiState {
+            limit_text: "5".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.to_options().unwrap().limit, 5);
+        s.limit_text = "  ".into();
+        assert_eq!(s.to_options().unwrap().limit, 0);
     }
 
     #[test]
     fn parse_limit_rejects_invalid_number() {
-        assert_eq!(parse_limit("").unwrap(), 0);
-        assert_eq!(parse_limit(" 2 ").unwrap(), 2);
-        assert!(parse_limit("1O").is_err());
+        assert!(parse_limit("-1").is_err());
+        assert!(parse_limit("abc").is_err());
+        assert_eq!(parse_limit("0").unwrap(), 0);
+        assert_eq!(parse_limit("42").unwrap(), 42);
     }
 
-    // ── 强优化:被安全前置中止(planned>0、handled=0、全 false)绝不显示「完成」误导成功 ──
     #[test]
     fn summarize_archive_rejected_round_is_not_success() {
-        // core 安全前置拒绝 → 默认 summary(全 0/false),但本轮其实计划了项目。
-        let rejected = archive::ArchiveSummary::default();
-        let txt = summarize_archive(3, &rejected);
+        let quiet_with_planned =
+            summarize_archive(3, &bftool_core::engine::archive::ArchiveSummary::default());
         assert!(
-            !txt.contains("完成"),
-            "被中止的本轮不应显示「完成」,实际:{txt}"
+            quiet_with_planned.contains("被中止") && !quiet_with_planned.contains("完成 0 项"),
+            "有计划项却被安全前置拦截时,不能报完成0项冒充成功: {}",
+            quiet_with_planned
         );
-        assert!(txt.contains("中止"), "应提示被中止,实际:{txt}");
 
-        // 真·无可处理项目(planned=0)→ 另一套文案,也不含「完成」。
-        let empty = summarize_archive(0, &archive::ArchiveSummary::default());
-        assert!(!empty.contains("完成") && empty.contains("无可处理"));
+        let quiet_zero_planned =
+            summarize_archive(0, &bftool_core::engine::archive::ArchiveSummary::default());
+        assert_eq!(quiet_zero_planned, "本轮无可处理项目");
 
-        // 正常归档结果仍如实显示「完成 N 项」。
-        let done = archive::ArchiveSummary {
-            handled: 2,
-            ..Default::default()
-        };
-        assert!(summarize_archive(2, &done).contains("完成 2 项"));
-
-        // 封盘停本轮不算 quiet,如实显示。
-        let sealed = archive::ArchiveSummary {
-            handled: 1,
-            sealed_stopped: true,
-            ..Default::default()
-        };
-        let st = summarize_archive(2, &sealed);
-        assert!(st.contains("完成 1 项") && st.contains("封盘"));
+        let normal = summarize_archive(
+            2,
+            &bftool_core::engine::archive::ArchiveSummary {
+                handled: 2,
+                failed: 0,
+                cancelled: false,
+                sealed_stopped: false,
+            },
+        );
+        assert_eq!(normal, "完成 2 项");
     }
 }

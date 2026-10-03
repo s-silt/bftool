@@ -47,10 +47,28 @@ pub struct Config {
     #[serde(default = "default_seven_zip")]
     pub seven_zip_path: PathBuf,
 
+    // P0 口子（未实现）：未来可选 `strict_empty_init`（默认 false、非推荐）——
+    // 若开启才把空盘软提示升级为失败。当前禁止默认硬闸；见 docs/safety-policy.md §2.1。
     /// 多机汇总查询：其它电脑拷来的「备份索引名单.csv」路径列表。
     /// `find` 查询时与本机总索引一并检索；只读、不影响归档/盘号/事务。
     #[serde(default)]
     pub extra_catalogs: Vec<PathBuf>,
+
+    /// 监视源目录（SSD 投放区）。未设时 `bftool watch` 用 `--source` 或回退到 `ready_root`。
+    #[serde(default)]
+    pub watch_source: Option<PathBuf>,
+
+    /// 是否启用监视语义的默认开关（文档/未来自动启动用；`bftool watch` 子命令本身不依赖它）。
+    #[serde(default)]
+    pub enable_watch: bool,
+
+    /// 监视轮询间隔（秒）。Linux 友好 poll 循环；Windows 目录通知可日后 feature-gate。
+    #[serde(default = "default_watch_poll_secs")]
+    pub watch_poll_secs: u64,
+
+    /// on_suspect | always | never — MetadataOnly 哈希确认
+    #[serde(default)]
+    pub incremental_verify: String,
 }
 
 fn default_reserve_gb() -> u64 {
@@ -82,6 +100,10 @@ fn default_bandizip() -> PathBuf {
     PathBuf::from(r"C:\Program Files\Bandizip\bz.exe")
 }
 
+fn default_watch_poll_secs() -> u64 {
+    30
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -98,6 +120,10 @@ impl Default for Config {
             bandizip_path: default_bandizip(),
             seven_zip_path: default_seven_zip(),
             extra_catalogs: Vec::new(),
+            watch_source: None,
+            enable_watch: false,
+            watch_poll_secs: default_watch_poll_secs(),
+            incremental_verify: "on_suspect".into(),
         }
     }
 }
@@ -375,14 +401,20 @@ mod tests {
     fn save_custom_roundtrips() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("sub").join("bftool.toml");
+        let expected_ready = d.path().join("ready");
         let lc = LoadedConfig {
-            config: Config::default(),
+            config: Config {
+                ready_root: expected_ready.clone(),
+                archived_root: d.path().join("archived"),
+                system_root: d.path().join("system"),
+                ..Config::default()
+            },
             source: ConfigSource::Default,
         };
         let written = lc.save(&SaveTarget::Custom(p.clone())).unwrap();
         assert_eq!(written, p);
         let back = Config::from_path(&p).unwrap();
-        assert_eq!(back.ready_root, Config::default().ready_root);
+        assert_eq!(back.ready_root, expected_ready);
         assert_eq!(back.name_prefix, Config::default().name_prefix);
     }
 
@@ -502,25 +534,18 @@ mod tests {
         let cfg_dir = d.path().join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let p = cfg_dir.join("bftool.toml");
-        std::fs::write(
-            &p,
-            "ready_root = \"D:/r\"\n\
-             archived_root = \"D:/a\"\n\
-             system_root = \"D:/s\"\n\
-             extra_catalogs = [\"sub/cat.csv\", \"D:/abs/cat.csv\"]\n",
-        )
-        .unwrap();
+        let absolute = d.path().join("abs/cat.csv");
+        let config = Config {
+            ready_root: PathBuf::from("ready"),
+            archived_root: PathBuf::from("archived"),
+            system_root: PathBuf::from("system"),
+            extra_catalogs: vec![PathBuf::from("sub/cat.csv"), absolute.clone()],
+            ..Config::default()
+        };
+        std::fs::write(&p, toml::to_string(&config).unwrap()).unwrap();
         let c = Config::from_path(&p).unwrap();
-        assert_eq!(
-            c.extra_catalogs[0],
-            cfg_dir.join("sub/cat.csv"),
-            "相对额外索引应锚定到配置文件目录"
-        );
-        assert_eq!(
-            c.extra_catalogs[1],
-            std::path::PathBuf::from("D:/abs/cat.csv"),
-            "绝对额外索引应原样保留"
-        );
+        assert_eq!(c.extra_catalogs[0], cfg_dir.join("sub/cat.csv"));
+        assert_eq!(c.extra_catalogs[1], absolute);
     }
 
     // ── review-r3 round5:extra_catalogs 条目的首尾空白应被 trim(与 name_prefix、GUI parse_form 一致),
@@ -531,20 +556,14 @@ mod tests {
         let cfg_dir = d.path().join("cfg");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let p = cfg_dir.join("bftool.toml");
-        std::fs::write(
-            &p,
-            "ready_root = \"D:/r\"\n\
-             archived_root = \"D:/a\"\n\
-             system_root = \"D:/s\"\n\
-             extra_catalogs = [\"  D:/abs/cat.csv  \"]\n",
-        )
-        .unwrap();
+        let absolute = d.path().join("abs/cat.csv");
+        let config = Config {
+            extra_catalogs: vec![PathBuf::from(format!("  {}  ", absolute.display()))],
+            ..Config::default()
+        };
+        std::fs::write(&p, toml::to_string(&config).unwrap()).unwrap();
         let c = Config::from_path(&p).unwrap();
-        assert_eq!(
-            c.extra_catalogs[0],
-            std::path::PathBuf::from("D:/abs/cat.csv"),
-            "额外索引条目首尾空白应被 trim 后再判绝对/锚定"
-        );
+        assert_eq!(c.extra_catalogs[0], absolute);
     }
 
     #[test]
@@ -594,7 +613,7 @@ mod tests {
         let p = d.path().join("bftool.toml");
         let lc = LoadedConfig {
             config: Config {
-                extra_catalogs: vec![PathBuf::from("D:/u/A.csv"), PathBuf::from("D:/u/B.csv")],
+                extra_catalogs: vec![d.path().join("u/A.csv"), d.path().join("u/B.csv")],
                 ..Config::default()
             },
             source: ConfigSource::Default,
@@ -602,6 +621,7 @@ mod tests {
         lc.save(&SaveTarget::Custom(p.clone())).unwrap();
         let back = Config::from_path(&p).unwrap();
         assert_eq!(back.extra_catalogs.len(), 2);
-        assert_eq!(back.extra_catalogs[0], PathBuf::from("D:/u/A.csv"));
+        assert_eq!(back.extra_catalogs[0], d.path().join("u/A.csv"));
+        assert_eq!(back.extra_catalogs[1], d.path().join("u/B.csv"));
     }
 }

@@ -186,4 +186,22 @@ mod tests {
         assert!(t.cancel_requested());
         assert!(matches!(drain(t), TaskOutcome::Done(_)));
     }
+
+    #[test]
+    fn write_task_drop_waits_for_cancelled_worker_cleanup() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let task = BackgroundTask::spawn(move |cancel| {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            worker_finished.store(true, Ordering::Release);
+            Ok(())
+        });
+        drop(task);
+        assert!(
+            finished.load(Ordering::Acquire),
+            "write worker must finish before Drop returns"
+        );
+    }
 }

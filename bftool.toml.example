@@ -52,3 +52,11 @@ seven_zip_path = "C:\\Program Files\\7-Zip\\7z.exe"
 # 例:
 # extra_catalogs = ["D:\\汇总\\A.csv", "D:\\汇总\\B.csv"]
 extra_catalogs = []
+
+# -------- 监视 / 增量（可选；P0'/P1'）--------
+# enable_watch = false
+# watch_source = "D:\\资料库\\待备份\\当前工单"
+# watch_poll_secs = 60
+# CLI：
+#   bftool archive --from <文件夹> --incremental --retain-source [--ext zip,7z]
+#   bftool watch <文件夹> [--once] [--poll-secs 30] [--ext zip,7z --recursive]

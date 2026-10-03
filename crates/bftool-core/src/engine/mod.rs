@@ -17,6 +17,7 @@
 pub mod archive;
 pub mod archive_test;
 pub mod cruft;
+pub(crate) mod destination;
 pub mod drive;
 pub mod durable;
 pub mod find;

@@ -10,8 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::engine::{cruft, durable, paths};
+use crate::engine::{cruft, destination::SafeDir, durable, paths};
+use crate::observe::{EventSink, ReporterSink};
 use crate::reporter::Reporter;
+use crate::service::request::{InitRequest, OperationRequest};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DriveInfo {
@@ -80,7 +82,8 @@ pub fn list_mounted(cfg: &Config, reporter: &dyn Reporter) -> Result<()> {
     let drives = scan_mounted(Some(reporter))?;
     if drives.is_empty() {
         reporter.warn("未发现已初始化的备份盘。");
-        reporter.info("插入一块空盘后，运行：bftool init <盘符> 把它初始化为下一个「备份N」。");
+        reporter
+            .info("插入备份盘或目标盘后，运行：bftool init <盘符> 把它初始化为下一个「备份N」。");
         return Ok(());
     }
     for d in &drives {
@@ -115,134 +118,16 @@ pub(crate) fn drive_is_sealed(root: &Path) -> bool {
     }
 }
 
-/// 扫描所有已挂载、被识别为备份盘的卷。
-/// `reporter`:Some 时,对「看起来是备份盘(有 本盘编号.txt)但编号读失败或为空」的卷发出 warn,
-/// 而非静默跳过(io 错误不得被静默吞掉);只读/内部场景传 None 避免刷屏。(review-r3 #8/#9)
+/// 扫描已挂载备份盘（实现见 [`crate::pool::scan`]）。
 pub fn scan_mounted(reporter: Option<&dyn Reporter>) -> Result<Vec<DriveInfo>> {
-    let mut out = Vec::new();
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    for d in disks.list() {
-        let mount = d.mount_point();
-        let Some(letter) = drive_letter_of(mount) else {
-            continue;
-        };
-        let root = PathBuf::from(format!("{}:\\", letter));
-        let id_file = paths::drive_id_path(&root);
-        if !id_file.is_file() {
-            continue;
-        }
-        // 已确认 本盘编号.txt 存在却读不出 → 不静默跳过:这块盘看起来是备份盘,读失败
-        // (权限/瞬时 IO/被占用)应可见,否则编号分配与多盘安全闸都在"看不全所有盘"的前提下工作。
-        // 仍 skip(不 fail-closed,以免一块无关盘的瞬时锁拖垮整次扫描/列盘/选盘)。(review-r3 #8)
-        let id = match fs::read_to_string(&id_file) {
-            Ok(s) => s.trim().to_string(),
-            Err(e) => {
-                if let Some(r) = reporter {
-                    r.warn(&format!(
-                        "跳过盘 {}:(看起来是备份盘但读取 {} 失败:{})—— 编号/容量信息可能不全,请检查该盘。",
-                        letter,
-                        id_file.display(),
-                        e
-                    ));
-                }
-                continue;
-            }
-        };
-        // 空/全空白编号 = 损坏或未初始化:与 resolve_drive_id 的 .filter(|s| !s.is_empty()) 一致,
-        // 不放行为合法备份盘,否则它会被 pick_active 选为可写盘、把空编号写进索引污染盘身份。(review-r3 #9)
-        if id.is_empty() {
-            if let Some(r) = reporter {
-                r.warn(&format!(
-                    "跳过盘 {}:(本盘编号文件为空,疑似损坏)—— 请重新 init 该盘。",
-                    letter
-                ));
-            }
-            continue;
-        }
-        out.push(DriveInfo {
-            letter,
-            root: root.clone(),
-            id,
-            sealed: drive_is_sealed(&root),
-            free_bytes: d.available_space(),
-            total_bytes: d.total_space(),
-        });
-    }
-    Ok(out)
+    crate::pool::scan::scan_mounted(reporter)
 }
 
-/// 从一组盘里挑出"可写入"的(未封盘且容量 ≥ min_drive_gb),并把"过小被忽略"的单独返回。
-/// 纯函数便于测试;容量过滤是「防误抓 U 盘」安全闸 —— 此前 min_drive_gb 形同虚设。(ledger L-006)
-fn usable_drives(all: Vec<DriveInfo>, min_drive_gb: u64) -> (Vec<DriveInfo>, Vec<DriveInfo>) {
-    let min_bytes = min_drive_gb.saturating_mul(1024 * 1024 * 1024);
-    let mut usable = Vec::new();
-    let mut too_small = Vec::new();
-    for d in all.into_iter().filter(|d| !d.sealed) {
-        if d.total_bytes >= min_bytes {
-            usable.push(d);
-        } else {
-            too_small.push(d);
-        }
-    }
-    (usable, too_small)
-}
-
-/// 当前在线、未封盘、容量达标的备份盘列表（不打日志、不挑唯一）。
-/// `run_plan` 在执行前用它复验「单盘不变式」——`pick_active` 的多盘检查只在 `plan()` 跑过一次，
-/// 预览→执行之间若插入第二块可写盘，需在这里重新拦下，否则单盘安全闸被绕过。(SEC-007)
 pub(crate) fn usable_drives_now(min_drive_gb: u64) -> Result<Vec<DriveInfo>> {
-    let (usable, _too_small) = usable_drives(scan_mounted(None)?, min_drive_gb);
-    Ok(usable)
+    crate::pool::scan::usable_drives_now(min_drive_gb)
 }
 
-/// 返回唯一一块未封盘且容量达标的备份盘；多块返回错误；零块返回 None。
-/// 容量过滤(min_drive_gb)是防误抓 U 盘/SD 卡的安全闸。(ledger L-006)
-pub(crate) fn pick_active(min_drive_gb: u64, reporter: &dyn Reporter) -> Result<Option<DriveInfo>> {
-    // min_drive_gb=0 会使容量闸 total_bytes >= 0 恒真 → 禁用『防误抓 U 盘/SD 卡』安全闸。
-    // 在选盘这步(消费该闸、且有 reporter)显式提醒,不让安全闸被静默关闭。(review-r3 round2)
-    if min_drive_gb == 0 {
-        reporter.warn(
-            "min_drive_gb=0 已禁用『防误抓 U 盘/SD 卡』的最小容量闸 —— 任何未封盘的已初始化盘\
-             (含小容量介质)都可能被选为可写备份盘。如非有意,请把配置 min_drive_gb 调回正值(默认 200)。",
-        );
-    }
-    let (usable, too_small) = usable_drives(scan_mounted(Some(reporter))?, min_drive_gb);
-    for d in &too_small {
-        reporter.warn(&format!(
-            "忽略疑似过小的盘 {} ({}:) {:.0}GB(低于最小 {}GB)—— 防误抓 U 盘/SD 卡。\
-             若确需用它,把配置 min_drive_gb 调低后重试。",
-            d.id,
-            d.letter,
-            d.total_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
-            min_drive_gb
-        ));
-    }
-    if usable.len() > 1 {
-        let names = usable
-            .iter()
-            .map(|d| format!("{}({}:)", d.id, d.letter))
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "检测到多块未封盘的备份盘：{} —— 为防止写错盘已停止。请只保留一块在线（其余盘可封盘或拔下）。",
-            names
-        );
-    }
-    Ok(usable.into_iter().next())
-}
-
-fn drive_letter_of(p: &Path) -> Option<String> {
-    // 字符安全:对 UNC(\\server)、卷 GUID、多字节首字符的挂载点返回 None 而非 panic。
-    // 旧实现 `&s[1..2]`/`s[..1]` 按字节切片,首字符是多字节字符时会 panic。(ledger L-023)
-    let s = p.to_string_lossy();
-    let mut it = s.chars();
-    let first = it.next()?;
-    if first.is_ascii_alphabetic() && it.next() == Some(':') {
-        Some(first.to_ascii_uppercase().to_string())
-    } else {
-        None
-    }
-}
+pub(crate) use crate::pool::scan::drive_letter_of;
 
 /// 初始化一块盘为下一个「备份N」（或自定义 ID）
 pub fn init(
@@ -252,57 +137,69 @@ pub fn init(
     id: Option<&str>,
     force: bool,
 ) -> Result<()> {
-    let letter = drive_letter.trim_end_matches(':').to_uppercase();
+    let req =
+        InitRequest::from_legacy_force(drive_letter.to_string(), id.map(str::to_string), force);
+    let sink = ReporterSink { reporter };
+    init_with_request(cfg, reporter, &req, &sink)
+}
+
+pub(crate) fn init_with_request(
+    cfg: &Config,
+    reporter: &dyn Reporter,
+    req: &InitRequest,
+    sink: &dyn EventSink,
+) -> Result<()> {
+    let letter = req.drive_letter.trim_end_matches(':').to_uppercase();
     if letter.len() != 1 {
-        bail!("盘符无效：{}（应为单字母，例如 E）", drive_letter);
+        bail!("盘符无效：{}（应为单字母，例如 E）", req.drive_letter);
     }
     let root = PathBuf::from(format!("{}:\\", letter));
     if !root.exists() {
         bail!("驱动器 {}: 不存在或未挂载", letter);
     }
 
-    // 防呆：系统盘 / 资料库盘 / 已是备份盘 / 非空盘 —— 判定收口到 classify_for_init(与 init_candidates 共用)
-    if !force {
-        let c = classify_for_init(cfg, &letter, &root)?;
-        if c.is_system {
-            bail!("拒绝初始化系统盘 {}:（如确需，请加 --force）", letter);
-        }
-        if c.is_library {
-            bail!(
-                "拒绝初始化资料库所在盘 {}:（待备份/已备份/备份系统 在此盘；如确需，请加 --force）",
-                letter
-            );
-        }
-        if c.already_backup {
-            // 已是备份盘 → 不阻止（等同重写元数据），但提示
-            reporter.warn(&format!(
-                "{}: 已经是一块初始化过的备份盘；将覆盖元数据，但不会动 \\项目\\ 下的数据。",
-                letter
-            ));
-        } else if c.non_empty {
-            bail!(
-                "拒绝初始化非空盘 {}:（根目录有数据，怕认错盘；如确需，请加 --force）",
-                letter
-            );
-        }
-    }
+    let req = InitRequest {
+        drive_letter: letter,
+        ..req.clone()
+    };
+    init_at_root(cfg, reporter, &root, &req, sink)
+}
+
+fn init_at_root(
+    cfg: &Config,
+    reporter: &dyn Reporter,
+    root: &Path,
+    req: &InitRequest,
+    sink: &dyn EventSink,
+) -> Result<()> {
+    let letter = &req.drive_letter;
+    // 防呆：系统盘 / 资料库盘硬闸；非空仅为软提示（DESIGN §4）。判定收口到 classify_for_init。
+    let c = classify_for_init(cfg, letter, root)?;
+    apply_init_gates(&c, req, reporter, sink)?;
+    // An abnormal marker is user data until proved otherwise. Stop before metadata
+    // writes; --force never authorizes recursively deleting a conflicting directory.
+    validate_sealed_marker(root)?;
+    let root_guard = SafeDir::open(root, false)?;
 
     // 并发 init 两块新盘会因 next_drive_number(读 seq/全局索引/挂载盘)+ bump_drive_seq(写回)非原子
     // 而分到相同「备份N」→ 盘身份碰撞、find/恢复歧义。用与 archive 同一把系统级跨进程锁,把
     // 「定号 → 写本盘编号 → bump seq」串成临界区,消除分号碰撞;与正在跑的归档也互斥。(review-r3 round4)
-    fs::create_dir_all(&cfg.system_root).ok(); // 锁文件在 system_root,先确保其存在
+    let _system_guard = SafeDir::open(&cfg.system_root, true)?;
     let _sys_lock = crate::engine::archive::ArchiveLock::acquire(&cfg.system_root)?;
 
-    let id = resolve_drive_id(&root, id, force, cfg, reporter)?;
+    // Retain the existing explicit-ID renumber policy. This aggregate is only
+    // for that metadata policy; hard-gate bypasses above use their own scopes.
+    let force = req.force_system || req.force_library;
+    let id = resolve_drive_id(root, req.id.as_deref(), force, cfg, reporter)?;
 
     // 写盘内目录
-    let info = paths::drive_info_dir(&root);
-    fs::create_dir_all(&info).context("创建本盘信息目录失败")?;
-    fs::create_dir_all(paths::drive_logs_dir(&root)).ok();
-    fs::create_dir_all(paths::drive_manifest_dir(&root)).ok();
-    fs::create_dir_all(paths::drive_projects_dir(&root)).ok();
+    let info = paths::drive_info_dir(root);
+    let info_guard = root_guard.ensure_dir(Path::new(paths::DRIVE_INFO_DIR))?;
+    info_guard.ensure_dir(Path::new(paths::DRIVE_LOGS_DIR))?;
+    info_guard.ensure_dir(Path::new(paths::DRIVE_MANIFEST_DIR))?;
+    root_guard.ensure_dir(Path::new(paths::DRIVE_PROJECTS_DIR))?;
     // 原子写(tmp+fsync+rename):本盘编号是认盘依据,断电不能留 0 字节/半截坏文件。(review-r2 R4-4)
-    durable::write_synced(&paths::drive_id_path(&root), id.as_bytes()).context("写本盘编号失败")?;
+    durable::write_synced(&paths::drive_id_path(root), id.as_bytes()).context("写本盘编号失败")?;
     durable::write_synced(&info.join(paths::DRIVE_README_FILE), readme(&id).as_bytes())?;
 
     // 序号文件追踪：保证下次取下一块的时候编号单调递增
@@ -310,42 +207,68 @@ pub fn init(
         bump_drive_seq(cfg, n, reporter)?;
     }
 
-    // re-init = 当作新盘用:若残留封盘标记,清除它。否则盘虽被重新初始化、提示"可以 archive",
-    // 但封盘标记仍在 → pick_active/try_into_writable 仍判其为已封盘而拒写,提示与实际矛盾。(EH-005)
-    // 清除的**存在性判据**必须与 drive_is_sealed 同源(symlink_metadata):若用 is_file(),标记是
-    // 非普通文件(或 stat 受限)时不清除,而 drive_is_sealed 仍判已封盘 → init 报「可写新盘」、archive
-    // 却判封盘拒写的矛盾态。stat 失败(非 NotFound)时无法安全清除 → fail-closed 上报,而非静默放过。(review-r3 round5)
-    let sealed_marker = paths::drive_sealed_path(&root);
-    match fs::symlink_metadata(&sealed_marker) {
-        Ok(meta) => {
-            let res = if meta.is_dir() {
-                fs::remove_dir_all(&sealed_marker)
-            } else {
-                fs::remove_file(&sealed_marker)
-            };
-            res.with_context(|| format!("清除封盘标记失败：{}", sealed_marker.display()))?;
-            reporter.info(&format!(
-                "已清除 {}: 的封盘标记(重新初始化 = 当作可写新盘)。",
-                letter
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // 无封盘标记,无需清除
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "检查封盘标记失败,无法确认是否需清除(为避免 init 报可写而 archive 仍判封盘的矛盾态已停止):{}",
-                    sealed_marker.display()
-                )
-            });
-        }
-    }
+    // Re-init removes only a recognized ordinary marker. A directory, link,
+    // special entry or inspection error is preserved and reported explicitly.
+    clear_sealed_marker(root, &info_guard, letter, reporter)?;
 
     reporter.ok(&format!("已初始化备份盘 {} ({}:)", id, letter));
-    if !force && paths::drive_id_path(&root).is_file() {
+    if !force && paths::drive_id_path(root).is_file() {
         // 提示用户可以接着 archive
         reporter.info(
             "现在可以运行 `bftool archive` 开始归档；先 `bftool archive --dry-run` 演练一下更稳。",
         );
+    }
+    Ok(())
+}
+
+fn marker_is_ordinary_file(meta: &fs::Metadata) -> bool {
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Every reparse point is abnormal, not only symlink-tagged reparse points.
+        if meta.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_sealed_marker(root: &Path) -> Result<bool> {
+    let marker = paths::drive_sealed_path(root);
+    match fs::symlink_metadata(&marker) {
+        Ok(meta) if marker_is_ordinary_file(&meta) => Ok(true),
+        Ok(_) => bail!(
+            "封盘标记路径不是普通文件，已保留原内容并停止初始化；请人工检查：{}",
+            marker.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("无法安全检查封盘标记，已停止初始化：{}", marker.display())),
+    }
+}
+
+fn clear_sealed_marker(
+    root: &Path,
+    info_guard: &SafeDir,
+    letter: &str,
+    reporter: &dyn Reporter,
+) -> Result<()> {
+    if validate_sealed_marker(root)? {
+        info_guard
+            .remove_regular(Path::new(paths::DRIVE_SEALED_FILE))
+            .with_context(|| {
+                format!(
+                    "安全清除封盘标记失败：{}",
+                    paths::drive_sealed_path(root).display()
+                )
+            })?;
+        reporter.info(&format!(
+            "已清除 {}: 的普通封盘标记(重新初始化 = 当作可写新盘)。",
+            letter
+        ));
     }
     Ok(())
 }
@@ -421,8 +344,8 @@ fn resolve_drive_id(
 
 /// 根目录是否为空(忽略系统目录与 OS 自动注入的杂文件)。
 /// 杂文件名单统一交给 cruft 判定(desktop.ini/Thumbs.db/$RECYCLE.BIN/System Volume Information…),
-/// 否则一块全新空盘只要有个 desktop.ini/Thumbs.db 就被误判非空、拒绝初始化。(review-r2 R4-3)
-fn root_is_empty(root: &Path) -> Result<bool> {
+/// 否则一块全新盘只要有个 desktop.ini/Thumbs.db 就被误判非空（软提示噪声）。(review-r2 R4-3)
+pub(crate) fn root_is_empty(root: &Path) -> Result<bool> {
     // RECYCLER 是旧版 Windows 回收站目录名,cruft 名单未含,这里额外忽略。
     let extra_ignore: &[&str] = &["RECYCLER"];
     let mut n = 0usize;
@@ -441,21 +364,67 @@ fn root_is_empty(root: &Path) -> Result<bool> {
     Ok(n == 0)
 }
 
-/// 由分类得出能否初始化 + 阻断原因。
-fn init_decision(c: &InitClass) -> (bool, Option<String>) {
-    if c.is_system {
-        return (false, Some("系统盘".into()));
-    }
-    if c.is_library {
-        return (false, Some("资料库所在盘(待备份/已备份/备份系统)".into()));
-    }
-    if !c.already_backup && c.non_empty {
-        return (false, Some("根目录非空(怕认错盘)".into()));
-    }
-    (true, None) // 含"已是备份盘"(re-init 覆盖元数据,允许)
+/// 由分类得出硬闸 / 软提示决策。非空永不阻断（DESIGN §4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitDecision {
+    can_init: bool,
+    block_reason: Option<String>,
+    soft_hint: Option<String>,
 }
 
-/// GUI 初始化页用:列出所有挂载盘 + 结构化防呆判定。(Spec D §4.2)
+fn init_decision(c: &InitClass) -> InitDecision {
+    if c.is_system {
+        return InitDecision {
+            can_init: false,
+            block_reason: Some("系统盘".into()),
+            soft_hint: None,
+        };
+    }
+    if c.is_library {
+        return InitDecision {
+            can_init: false,
+            block_reason: Some("资料库所在盘(待备份/已备份/备份系统)".into()),
+            soft_hint: None,
+        };
+    }
+    let soft_hint = if !c.already_backup && c.non_empty {
+        Some("根目录非空，请确认目标盘无误（不是系统盘/资料库盘）；已有数据不会被清洗，init 只写本盘约定目录".into())
+    } else {
+        None
+    };
+    InitDecision {
+        can_init: true, // 含已是备份盘(re-init)与非空(软提示)
+        block_reason: None,
+        soft_hint,
+    }
+}
+
+/// 应用 init 硬闸与软提示（P1：委托 pipeline stages）。
+/// 软提示只 warn，绝不 bail；`--force` 仅绕过系统盘/资料库硬闸。
+fn apply_init_gates(
+    c: &InitClass,
+    req: &InitRequest,
+    reporter: &dyn Reporter,
+    sink: &dyn EventSink,
+) -> Result<()> {
+    let op = OperationRequest::Init(req.clone());
+    crate::pipeline::init::run_init_gates(
+        crate::pipeline::InitStageData {
+            letter: req.drive_letter.clone(),
+            is_system: c.is_system,
+            is_library: c.is_library,
+            already_backup: c.already_backup,
+            non_empty: c.non_empty,
+            force_system: req.force_system,
+            force_library: req.force_library,
+        },
+        &op,
+        reporter,
+        sink,
+    )
+}
+
+/// GUI 初始化页用:列出所有挂载盘 + 结构化防呆判定。(Spec D §4.2 / DESIGN §4)
 #[derive(Debug, Clone)]
 pub struct InitCandidate {
     pub letter: String,
@@ -466,6 +435,8 @@ pub struct InitCandidate {
     pub non_empty: bool,
     pub can_init: bool,
     pub block_reason: Option<String>,
+    /// 非阻断提示（如根目录非空）；GUI 显示黄条，仍可选中。
+    pub soft_hint: Option<String>,
 }
 
 pub fn init_candidates(cfg: &Config) -> Result<Vec<InitCandidate>> {
@@ -479,7 +450,7 @@ pub fn init_candidates(cfg: &Config) -> Result<Vec<InitCandidate>> {
         let Ok(cls) = classify_for_init(cfg, &letter, &root) else {
             continue; // 读不了根目录的盘跳过(不进候选)
         };
-        let (can_init, block_reason) = init_decision(&cls);
+        let dec = init_decision(&cls);
         out.push(InitCandidate {
             letter,
             total_gb: d.total_space() / (1024 * 1024 * 1024),
@@ -487,8 +458,9 @@ pub fn init_candidates(cfg: &Config) -> Result<Vec<InitCandidate>> {
             is_library: cls.is_library,
             already_backup: cls.already_backup,
             non_empty: cls.non_empty,
-            can_init,
-            block_reason,
+            can_init: dec.can_init,
+            block_reason: dec.block_reason,
+            soft_hint: dec.soft_hint,
         });
     }
     Ok(out)
@@ -728,6 +700,159 @@ mod tests {
     use super::*;
     use crate::reporter::NoopReporter;
 
+    fn apply_legacy_init_gates(
+        c: &InitClass,
+        letter: &str,
+        force: bool,
+        reporter: &dyn Reporter,
+    ) -> Result<()> {
+        let req = InitRequest::from_legacy_force(letter.into(), None, force);
+        let sink = ReporterSink { reporter };
+        apply_init_gates(c, &req, reporter, &sink)
+    }
+
+    fn init_legacy_at_root(
+        cfg: &Config,
+        reporter: &dyn Reporter,
+        letter: &str,
+        root: &Path,
+        id: Option<&str>,
+        force: bool,
+    ) -> Result<()> {
+        let req = InitRequest::from_legacy_force(letter.into(), id.map(str::to_string), force);
+        let sink = ReporterSink { reporter };
+        init_at_root(cfg, reporter, root, &req, &sink)
+    }
+
+    #[test]
+    fn typed_init_force_scopes_truth_table() {
+        let reporter = NoopReporter;
+        let sink = ReporterSink {
+            reporter: &reporter,
+        };
+        for is_system in [false, true] {
+            for is_library in [false, true] {
+                for force_system in [false, true] {
+                    for force_library in [false, true] {
+                        let c = InitClass {
+                            is_system,
+                            is_library,
+                            already_backup: false,
+                            non_empty: false,
+                        };
+                        let req = InitRequest {
+                            drive_letter: "T".into(),
+                            id: None,
+                            force_system,
+                            force_library,
+                        };
+                        let allowed =
+                            (!is_system || force_system) && (!is_library || force_library);
+                        assert_eq!(
+                            apply_init_gates(&c, &req, &reporter, &sink).is_ok(),
+                            allowed,
+                            "system={is_system} library={is_library} force_system={force_system} force_library={force_library}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_init_only_bypasses_the_authorized_gate_before_writes() {
+        let reporter = NoopReporter;
+        let sink = ReporterSink {
+            reporter: &reporter,
+        };
+        let system_letter = system_drive_letter();
+        let library_letter = if system_letter.eq_ignore_ascii_case("T") {
+            "U"
+        } else {
+            "T"
+        };
+        for is_system in [false, true] {
+            for is_library in [false, true] {
+                for force_system in [false, true] {
+                    for force_library in [false, true] {
+                        let world = tempfile::tempdir().unwrap();
+                        let root = world.path().join("synthetic-drive");
+                        fs::create_dir(&root).unwrap();
+                        fs::write(root.join("user-document.txt"), b"KEEP-ME").unwrap();
+                        let letter = if is_system {
+                            &system_letter
+                        } else {
+                            library_letter
+                        };
+                        let cfg = Config {
+                            ready_root: if is_library {
+                                PathBuf::from(format!("{letter}:\\synthetic-ready"))
+                            } else {
+                                world.path().join("ready")
+                            },
+                            archived_root: world.path().join("archived"),
+                            system_root: world.path().join("system"),
+                            ..Config::default()
+                        };
+                        // On Windows, temporary library roots can share the system drive.
+                        // Both scopes must be authorized when the target matches both.
+                        let temporary_library =
+                            qualifier_letter(world.path()).is_some_and(|temporary_letter| {
+                                temporary_letter.eq_ignore_ascii_case(letter)
+                            });
+                        let classified_as_library = is_library || temporary_library;
+                        let classification = classify_for_init(&cfg, letter, &root).unwrap();
+                        assert_eq!(classification.is_system, is_system);
+                        assert_eq!(classification.is_library, classified_as_library);
+                        let req = InitRequest {
+                            drive_letter: letter.into(),
+                            id: Some("备份99".into()),
+                            force_system,
+                            force_library,
+                        };
+                        let authorized = (!is_system || force_system)
+                            && (!classified_as_library || force_library);
+                        let result = init_at_root(&cfg, &reporter, &root, &req, &sink);
+                        assert_eq!(
+                            result.is_ok(),
+                            authorized,
+                            "system={is_system} library={classified_as_library} force_system={force_system} force_library={force_library}: {result:?}",
+                        );
+                        if authorized {
+                            result.unwrap();
+                            assert_eq!(
+                                fs::read_to_string(paths::drive_id_path(&root)).unwrap(),
+                                "备份99"
+                            );
+                        } else {
+                            let error = result.unwrap_err().to_string();
+                            assert!(
+                                error.contains(if is_system && !force_system {
+                                    "系统盘"
+                                } else {
+                                    "资料库"
+                                }),
+                                "{error}"
+                            );
+                            assert!(
+                                !cfg.system_root.exists(),
+                                "denial must precede system metadata writes"
+                            );
+                            assert!(
+                                !paths::drive_info_dir(&root).exists(),
+                                "denial must precede drive metadata writes"
+                            );
+                        }
+                        assert_eq!(
+                            fs::read(root.join("user-document.txt")).unwrap(),
+                            b"KEEP-ME"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn di(letter: &str, total_gb: u64, sealed: bool) -> DriveInfo {
         let bytes = total_gb * 1024 * 1024 * 1024;
         DriveInfo {
@@ -785,7 +910,7 @@ mod tests {
         assert!(!root_is_empty(d.path()).unwrap(), "有真实文件应判非空");
     }
 
-    // ── Spec D §4.2 Finding #4: init_decision 真值表 ──
+    // ── Spec D §4.2 / DESIGN §4: init_decision 真值表（非空仅软提示，不阻断）──
     #[test]
     fn init_decision_truth_table() {
         let mk = |sys, lib, bak, ne| InitClass {
@@ -794,29 +919,93 @@ mod tests {
             already_backup: bak,
             non_empty: ne,
         };
+        let empty = init_decision(&mk(false, false, false, false));
+        assert!(empty.can_init, "空盘可初始化");
+        assert!(empty.soft_hint.is_none());
+
         assert!(
-            init_decision(&mk(false, false, false, false)).0,
-            "空盘可初始化"
-        );
-        assert!(
-            init_decision(&mk(false, false, true, false)).0,
+            init_decision(&mk(false, false, true, false)).can_init,
             "已是备份盘可 re-init"
         );
         assert!(
-            init_decision(&mk(false, false, true, true)).0,
+            init_decision(&mk(false, false, true, true)).can_init,
             "已是备份盘优先于非空"
         );
         assert!(
-            !init_decision(&mk(true, false, false, false)).0,
+            !init_decision(&mk(true, false, false, false)).can_init,
             "系统盘拒绝"
         );
         assert!(
-            !init_decision(&mk(false, true, false, false)).0,
+            !init_decision(&mk(false, true, false, false)).can_init,
             "资料库盘拒绝"
         );
+
+        let ne = init_decision(&mk(false, false, false, true));
+        assert!(ne.can_init, "非空盘不阻断（软提示）");
+        assert!(ne.block_reason.is_none());
         assert!(
-            !init_decision(&mk(false, false, false, true)).0,
-            "非空盘拒绝"
+            ne.soft_hint.as_deref().is_some_and(|s| s.contains("非空")),
+            "非空应带 soft_hint: {:?}",
+            ne.soft_hint
+        );
+    }
+
+    // ── DESIGN §4 P0: apply_init_gates — 非空只 warn 不 Err；系统盘无 force 仍拒 ──
+    #[test]
+    fn apply_init_gates_non_empty_warns_not_blocks() {
+        let c = InitClass {
+            is_system: false,
+            is_library: false,
+            already_backup: false,
+            non_empty: true,
+        };
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            apply_legacy_init_gates(&c, "E", false, &rep).is_ok(),
+            "非空盘 init 不得 bail"
+        );
+        let logs = rep.0.lock().unwrap();
+        assert!(
+            logs.iter().any(|m| m.contains("非空")),
+            "非空必须 warn，实际: {:?}",
+            logs
+        );
+    }
+
+    #[test]
+    fn apply_init_gates_system_refused_without_force() {
+        let c = InitClass {
+            is_system: true,
+            is_library: false,
+            already_backup: false,
+            non_empty: false,
+        };
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        let err = apply_legacy_init_gates(&c, "C", false, &rep).unwrap_err();
+        assert!(
+            err.to_string().contains("系统盘"),
+            "系统盘必须硬拒: {}",
+            err
+        );
+        // --force 可绕过硬闸
+        let rep2 = RecReporter(std::sync::Mutex::new(Vec::new()));
+        assert!(apply_legacy_init_gates(&c, "C", true, &rep2).is_ok());
+    }
+
+    #[test]
+    fn apply_init_gates_library_refused_without_force() {
+        let c = InitClass {
+            is_system: false,
+            is_library: true,
+            already_backup: false,
+            non_empty: true, // 非空 + 资料库：仍硬拒资料库，非空不另开闸
+        };
+        let rep = RecReporter(std::sync::Mutex::new(Vec::new()));
+        let err = apply_legacy_init_gates(&c, "D", false, &rep).unwrap_err();
+        assert!(
+            err.to_string().contains("资料库"),
+            "资料库盘必须硬拒: {}",
+            err
         );
     }
 
@@ -834,7 +1023,7 @@ mod tests {
     #[test]
     fn usable_drives_excludes_below_min_size() {
         let all = vec![di("F", 8, false), di("E", 500, false)];
-        let (usable, too_small) = usable_drives(all, 200);
+        let (usable, too_small) = crate::pool::scan::usable_drives(all, 200);
         assert_eq!(usable.len(), 1);
         assert_eq!(usable[0].letter, "E");
         assert_eq!(too_small.len(), 1);
@@ -844,7 +1033,7 @@ mod tests {
     #[test]
     fn usable_drives_excludes_sealed_without_marking_too_small() {
         let all = vec![di("E", 500, true)];
-        let (usable, too_small) = usable_drives(all, 200);
+        let (usable, too_small) = crate::pool::scan::usable_drives(all, 200);
         assert!(usable.is_empty());
         assert!(too_small.is_empty(), "已封盘不应被算作'过小'");
     }
@@ -852,7 +1041,7 @@ mod tests {
     #[test]
     fn usable_drives_keeps_large_unsealed() {
         let all = vec![di("E", 500, false)];
-        let (usable, too_small) = usable_drives(all, 200);
+        let (usable, too_small) = crate::pool::scan::usable_drives(all, 200);
         assert_eq!(usable.len(), 1);
         assert!(too_small.is_empty());
     }
@@ -860,7 +1049,7 @@ mod tests {
     #[test]
     fn usable_drives_at_exact_threshold_is_usable() {
         let all = vec![di("E", 200, false)];
-        let (usable, _) = usable_drives(all, 200);
+        let (usable, _) = crate::pool::scan::usable_drives(all, 200);
         assert_eq!(usable.len(), 1, "恰好等于阈值应可用");
     }
 
@@ -915,7 +1104,9 @@ mod tests {
     /// 记录型 Reporter:只收集 warn 文本,用于断言「不静默」。
     struct RecReporter(std::sync::Mutex<Vec<String>>);
     impl Reporter for RecReporter {
-        fn log(&self, _level: crate::reporter::LogLevel, _msg: &str) {}
+        fn log(&self, _level: crate::reporter::LogLevel, msg: &str) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
         fn warn(&self, msg: &str) {
             self.0.lock().unwrap().push(msg.to_string());
         }
@@ -1053,6 +1244,77 @@ mod tests {
             text.lines()
                 .any(|l| l.contains("项目数量") && l.contains('2')),
             "项目数量应为 2,实际:\n{text}"
+        );
+    }
+    #[test]
+    fn init_preserves_abnormal_sealed_marker_directory_even_with_force() {
+        for force in [false, true] {
+            let world = tempfile::tempdir().unwrap();
+            let root = world.path().join("synthetic-drive");
+            let marker = paths::drive_sealed_path(&root);
+            fs::create_dir_all(&marker).unwrap();
+            fs::write(marker.join("user-document.txt"), b"KEEP-ME").unwrap();
+            let cfg = Config {
+                system_root: world.path().join("system"),
+                ..Config::default()
+            };
+            let result =
+                init_legacy_at_root(&cfg, &NoopReporter, "T", &root, Some("备份99"), force);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("已保留原内容"));
+            assert_eq!(
+                fs::read(marker.join("user-document.txt")).unwrap(),
+                b"KEEP-ME"
+            );
+            assert!(!paths::drive_id_path(&root).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn init_preserves_abnormal_sealed_marker_symlink() {
+        use std::os::unix::fs::symlink;
+        let world = tempfile::tempdir().unwrap();
+        let root = world.path().join("synthetic-drive");
+        fs::create_dir_all(paths::drive_info_dir(&root)).unwrap();
+        let outside = world.path().join("outside.txt");
+        fs::write(&outside, b"KEEP-ME").unwrap();
+        symlink(&outside, paths::drive_sealed_path(&root)).unwrap();
+        let cfg = Config {
+            system_root: world.path().join("system"),
+            ..Config::default()
+        };
+        assert!(
+            init_legacy_at_root(&cfg, &NoopReporter, "T", &root, Some("备份99"), true).is_err()
+        );
+        assert!(fs::symlink_metadata(paths::drive_sealed_path(&root))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(outside).unwrap(), b"KEEP-ME");
+    }
+    #[test]
+    fn init_clears_only_an_ordinary_marker_and_retains_other_user_files() {
+        let world = tempfile::tempdir().unwrap();
+        let root = world.path().join("synthetic-drive");
+        fs::create_dir_all(paths::drive_info_dir(&root)).unwrap();
+        fs::write(paths::drive_sealed_path(&root), b"OLD-MARKER").unwrap();
+        fs::write(root.join("user-document.txt"), b"KEEP-ME").unwrap();
+        let cfg = Config {
+            ready_root: world.path().join("ready"),
+            archived_root: world.path().join("archived"),
+            system_root: world.path().join("system"),
+            ..Config::default()
+        };
+        init_legacy_at_root(&cfg, &NoopReporter, "T", &root, Some("备份99"), true).unwrap();
+        assert!(!paths::drive_sealed_path(&root).exists());
+        assert_eq!(
+            fs::read(root.join("user-document.txt")).unwrap(),
+            b"KEEP-ME"
+        );
+        assert_eq!(
+            fs::read_to_string(paths::drive_id_path(&root)).unwrap(),
+            "备份99"
         );
     }
 }

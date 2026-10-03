@@ -76,6 +76,10 @@ pub fn system_logs_dir(system_root: &Path) -> PathBuf {
     system_root.join(SYSTEM_LOGS_DIR)
 }
 
+pub fn system_incremental_dir(system_root: &Path) -> PathBuf {
+    system_root.join("增量索引")
+}
+
 pub fn system_verify_log(system_root: &Path) -> PathBuf {
     system_root.join(VERIFY_LOG_FILE)
 }
