@@ -41,6 +41,19 @@ impl GuiReporter {
 
 impl Reporter for GuiReporter {
     fn log(&self, level: LogLevel, msg: &str) {
+        // The copy-only facade reports phase transitions through the existing Reporter.
+        // Preserve those actual phases after the byte-copy progress handle finishes.
+        if matches!(
+            msg,
+            "Planning direct backup"
+                | "Copying direct backup"
+                | "Verifying direct backup"
+                | "Publishing direct backup"
+        ) {
+            if let Ok(mut progress) = self.progress.lock() {
+                progress.label = msg.to_string();
+            }
+        }
         // 发送失败(UI 已关 / 接收端 drop)只静默丢弃这条日志 —— 不是错误,不 panic、不阻塞后台任务。
         if let Ok(tx) = self.tx.lock() {
             let _ = tx.send(UiEvent::Log {

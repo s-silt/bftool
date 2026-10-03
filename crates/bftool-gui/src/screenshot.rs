@@ -13,8 +13,10 @@ use eframe::egui;
 
 pub fn inject_demo_data(app: &mut App) {
     app.backend = Backend::Demo;
+    app.view = View::Backup;
     app.cfg = synthetic_config();
     app.config_source = bftool_core::config::ConfigSource::Default;
+    crate::views::backup::apply_demo_state(app, crate::views::backup::DemoState::SingleFile);
     app.status_cache = Some((
         app.backend.status(&app.cfg).expect("pure fixture"),
         Instant::now(),
@@ -90,15 +92,30 @@ impl ScreenshotRunner {
     }
 
     pub fn step(&mut self, app: &mut App, ctx: &egui::Context) {
-        const VIEWS: [(View, &str); 8] = [
-            (View::Dashboard, "01_dashboard"),
-            (View::Archive, "02_archive"),
-            (View::Verify, "03_verify"),
-            (View::Init, "04_init"),
-            (View::Find, "05_find"),
-            (View::Drives, "06_drives"),
-            (View::Settings, "07_settings"),
-            (View::Watch, "08_watch"),
+        const STATES: [(crate::views::backup::DemoState, &str); 8] = [
+            (
+                crate::views::backup::DemoState::BlankInitial,
+                "01_blank_initial",
+            ),
+            (
+                crate::views::backup::DemoState::SingleFile,
+                "02_single_file",
+            ),
+            (
+                crate::views::backup::DemoState::MultiFolder,
+                "03_multi_folder",
+            ),
+            (crate::views::backup::DemoState::Conflict, "04_conflict"),
+            (
+                crate::views::backup::DemoState::InsufficientSpace,
+                "05_insufficient_space",
+            ),
+            (crate::views::backup::DemoState::Running, "06_running"),
+            (crate::views::backup::DemoState::Stopped, "07_stopped"),
+            (
+                crate::views::backup::DemoState::PartialFailure,
+                "08_partial_failure",
+            ),
         ];
         if self.completion.lock().map(|c| c.is_some()).unwrap_or(true) {
             return;
@@ -126,7 +143,7 @@ impl ScreenshotRunner {
                 }
                 let path = self
                     .output_dir
-                    .join(format!("{}.bmp", VIEWS[self.saved_count].1));
+                    .join(format!("{}.bmp", STATES[self.saved_count].1));
                 if let Err(e) = save_image_bmp(&image, &path) {
                     self.finish(Err(format!("{}: {e}", path.display())), ctx);
                     return;
@@ -137,7 +154,7 @@ impl ScreenshotRunner {
                 self.settle_frames = 4;
             }
         }
-        if self.saved_count == VIEWS.len() {
+        if self.saved_count == STATES.len() {
             self.finish(Ok(self.saved_count), ctx);
             return;
         }
@@ -148,7 +165,8 @@ impl ScreenshotRunner {
             self.finish(Err("screenshot response timed out".into()), ctx);
             return;
         }
-        app.view = VIEWS[self.saved_count].0;
+        app.view = View::Backup;
+        crate::views::backup::apply_demo_state(app, STATES[self.saved_count].0);
         if self.settle_frames > 0 {
             self.settle_frames -= 1;
         } else if !self.requested_screenshot {

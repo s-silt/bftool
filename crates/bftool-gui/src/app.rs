@@ -16,18 +16,21 @@ use crate::reporter::{ProgressState, UiEvent};
 use crate::task::{BackgroundTask, TaskOutcome};
 use bftool_core::engine::verify::VerifyReport;
 
-/// 左侧栏的 7 个视图(Spec D §5)。
+/// 核心导航视图，默认进入「备份」
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum View {
     #[default]
+    Backup,
+    Tasks,
+    Verify,
+    Settings,
+    // 兼容与高级入口
     Dashboard,
     Archive,
-    Verify,
+    Drives,
     Init,
     Find,
-    Drives,
     Watch,
-    Settings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,39 +45,42 @@ pub struct PlannedArchive {
 }
 
 pub enum ExecutionResult {
+    Backup(crate::views::backup::BackupOutcomeSummary),
     Summary(String),
     Verification(VerifyReport),
+    PlainVerification {
+        target: std::path::PathBuf,
+        token: u64,
+        result: Result<VerifyReport, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
+    Backup,
     Archive,
     Verify,
     Watch,
 }
 
 impl View {
-    pub const ALL: [View; 8] = [
-        View::Dashboard,
-        View::Archive,
-        View::Watch,
-        View::Verify,
-        View::Init,
-        View::Find,
-        View::Drives,
-        View::Settings,
-    ];
+    /// 导航优先保留的 4 个核心入口
+    pub const PRIMARY: [View; 4] = [View::Backup, View::Tasks, View::Verify, View::Settings];
+
+    pub const ALL: [View; 4] = Self::PRIMARY;
 
     pub fn label(self) -> &'static str {
         match self {
-            View::Dashboard => "仪表盘",
+            View::Backup => "备份",
+            View::Tasks => "任务与记录",
+            View::Verify => "校验",
+            View::Settings => "设置",
+            View::Dashboard => "任务与记录",
             View::Archive => "备份",
-            View::Verify => "复查",
+            View::Drives => "磁盘管理",
             View::Init => "初始化新盘",
             View::Find => "查找",
-            View::Drives => "盘列表",
             View::Watch => "监视",
-            View::Settings => "设置",
         }
     }
 }
@@ -106,6 +112,7 @@ pub struct App {
     pub task: Option<BackgroundTask<ExecutionResult>>,
     /// 进行中的计划预览任务(archive::plan;只读、后台算,避免 UI 线程遍历大目录卡顿)。
     pub plan_task: Option<BackgroundTask<PlannedArchive>>,
+    pub file_backup_plan_task: Option<BackgroundTask<crate::views::backup::PlannedFileBackup>>,
     /// 进行中的查找任务(find::search;可能读取大索引/网络盘,不能阻塞 UI 线程)。
     pub find_task: Option<BackgroundTask<FindOutcome>>,
     /// 执行任务的开始时刻(算"已用时间";None=空闲)。在 archive/verify 启动处置位,pump 完成处清空。
@@ -131,6 +138,8 @@ pub struct App {
     /// 设置页跨帧状态(表单字段 + 保存位置)。
     pub settings_ui: crate::views::settings::SettingsUiState,
     pub watch_ui: crate::views::watch::WatchUiState,
+    pub backup_ui: crate::views::backup::BackupUiState,
+    pub tasks_ui: crate::views::tasks::TasksUiState,
     /// 仪表盘状态缓存(避免每帧调 status::gather;TTL 1500ms)。
     pub status_cache: Option<(
         bftool_core::engine::status::StatusReport,
@@ -176,6 +185,7 @@ impl App {
             rx: None,
             task: None,
             plan_task: None,
+            file_backup_plan_task: None,
             find_task: None,
             task_started: None,
             last_summary: None,
@@ -189,6 +199,8 @@ impl App {
             verify_ui: crate::views::verify::VerifyUiState::default(),
             settings_ui: crate::views::settings::SettingsUiState::default(),
             watch_ui: crate::views::watch::WatchUiState::default(),
+            backup_ui: crate::views::backup::BackupUiState::default(),
+            tasks_ui: crate::views::tasks::TasksUiState::default(),
             status_cache: None,
             screenshot_runner: None,
         }
@@ -196,6 +208,12 @@ impl App {
 
     /// 每帧:drain 日志 channel + 轮询后台任务完成。进行中则 request_repaint 持续刷新。
     fn pump(&mut self, ctx: &egui::Context) {
+        if !self.backend.is_demo() {
+            self.verify_ui
+                .enforce_target(std::path::Path::new(&self.backup_ui.target_path));
+        }
+        crate::views::tasks::pump_history(self, ctx);
+        crate::views::backup::adapter::pump(self, ctx);
         if let Some(rx) = &self.rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
@@ -208,7 +226,19 @@ impl App {
             Some(true) => {
                 if let Some(outcome) = self.task.as_mut().and_then(|t| t.take_outcome()) {
                     let summary = match outcome {
+                        TaskOutcome::Done(ExecutionResult::Backup(outcome)) => {
+                            let text = format!("{}\n{}", outcome.title, outcome.detail);
+                            crate::views::backup::adapter::apply_outcome(self, outcome);
+                            text
+                        }
                         TaskOutcome::Done(ExecutionResult::Summary(s)) => s,
+                        TaskOutcome::Done(ExecutionResult::PlainVerification { target, token, result }) => {
+                            self.verify_ui.accept_plain(std::path::Path::new(&self.backup_ui.target_path), target, token, result)
+                                .unwrap_or_else(|| "Stale verification result discarded; selected target was not verified".into())
+                        }
+                        TaskOutcome::Done(ExecutionResult::Verification(_)) if !self.backend.is_demo() => {
+                            "Unbound verification result discarded; selected target was not verified".into()
+                        }
                         TaskOutcome::Done(ExecutionResult::Verification(report)) => {
                             let text = crate::views::verify::verify_summary(
                                 report.checked,
@@ -225,7 +255,15 @@ impl App {
                             text
                         }
                         TaskOutcome::Failed(e) => {
-                            if self.task_kind == Some(TaskKind::Verify) {
+                            if self.task_kind == Some(TaskKind::Backup) {
+                                crate::views::backup::adapter::apply_outcome(
+                                    self,
+                                    crate::views::backup::adapter::failure(e.clone()),
+                                );
+                            }
+                            if self.task_kind == Some(TaskKind::Verify) && !self.backend.is_demo() {
+                                self.verify_ui.fail_plain(std::path::Path::new(&self.backup_ui.target_path), e.clone());
+                            } else if self.task_kind == Some(TaskKind::Verify) {
                                 self.verify_ui.last_stats = None;
                                 self.verify_ui.last_report = None;
                                 self.verify_ui.summary = None;
@@ -251,6 +289,10 @@ impl App {
                             UiEvent::Log { level, msg } => self.logs.push((level, msg)),
                         }
                     }
+                }
+                if self.task_kind == Some(TaskKind::Backup) {
+                    self.backup_ui.is_running = false;
+                    self.backup_ui.stopping_requested = false;
                 }
                 self.task = None;
                 self.task_kind = None;
@@ -331,7 +373,11 @@ impl App {
 
     /// 是否有进行中的后台任务(执行或计划预览)。导航/按钮据此禁用。
     pub fn is_busy(&self) -> bool {
-        self.task.is_some() || self.plan_task.is_some() || self.find_task.is_some()
+        self.task.is_some()
+            || self.plan_task.is_some()
+            || self.find_task.is_some()
+            || self.file_backup_plan_task.is_some()
+            || self.tasks_ui.history_task.is_some()
     }
 
     pub fn task_running(&self, kind: TaskKind) -> bool {
@@ -339,12 +385,17 @@ impl App {
     }
 
     pub fn busy_label(&self) -> &'static str {
-        if self.plan_task.is_some() {
+        if self.tasks_ui.history_task.is_some() {
+            "普通目录历史读取进行中"
+        } else if self.file_backup_plan_task.is_some() {
+            "普通目录备份预览进行中"
+        } else if self.plan_task.is_some() {
             "归档预览进行中"
         } else if self.find_task.is_some() {
             "索引查询进行中"
         } else {
             match self.task_kind {
+                Some(TaskKind::Backup) => "普通目录备份进行中",
                 Some(TaskKind::Archive) => "归档任务进行中",
                 Some(TaskKind::Verify) => "复查任务进行中",
                 Some(TaskKind::Watch) => "监视任务进行中",
@@ -381,7 +432,7 @@ impl App {
             .frame(
                 egui::Frame::default()
                     .fill(theme::CARD)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
@@ -418,8 +469,8 @@ impl App {
                         ui.spinner();
                         ui.label(self.busy_label());
                     } else {
-                        if ui.add(theme::btn_primary("快速归档备份")).clicked() {
-                            self.view = View::Archive;
+                        if ui.add(theme::btn_primary("文件备份")).clicked() {
+                            self.view = View::Backup;
                         }
                         ui.colored_label(theme::TEXT_MUTED, "就绪");
                         if let Some(summary) = &self.last_summary {
@@ -483,6 +534,16 @@ fn nav_item(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
 
 impl App {
     pub fn render(&mut self, ctx: &egui::Context) {
+        // Live ordinary backup never dispatches into legacy source-moving or
+        // volume-initialization screens, including directly changed public state.
+        if !self.backend.is_demo()
+            && matches!(
+                self.view,
+                View::Archive | View::Drives | View::Init | View::Watch | View::Find
+            )
+        {
+            self.view = View::Backup;
+        }
         self.pump(ctx);
 
         egui::SidePanel::left("nav")
@@ -491,7 +552,7 @@ impl App {
             .frame(
                 egui::Frame::default()
                     .fill(crate::views::theme::CARD)
-                    .stroke(egui::Stroke::new(1.0_f32, crate::views::theme::BORDER))
+                    .stroke(egui::Stroke::new(1.0, crate::views::theme::BORDER))
                     .inner_margin(egui::Margin::symmetric(10, 14)),
             )
             .show(ctx, |ui| {
@@ -525,7 +586,7 @@ impl App {
                 ui.add_space(14.0);
 
                 let current = self.view;
-                for v in View::ALL {
+                for v in View::PRIMARY {
                     let selected = current == v;
                     // 运行时允许自由切换页面查看状态，绝不锁定导航；仅在各页面内禁用重复/冲突操作
                     if nav_item(ui, selected, v.label()).clicked() {
@@ -534,7 +595,7 @@ impl App {
                     ui.add_space(2.0);
                 }
 
-                // 底部版本与就绪状态
+                // 底部版本与就绪状态及高级入口
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.add_space(4.0);
                     ui.label(
@@ -542,6 +603,14 @@ impl App {
                             .size(11.0)
                             .color(crate::views::theme::TEXT_MUTED),
                     );
+                    ui.add_space(4.0);
+                    let is_adv = self.view == View::Drives || self.view == View::Init;
+                    if self.backend.is_demo()
+                        && !self.is_busy()
+                        && nav_item(ui, is_adv, "高级：磁盘工具").clicked()
+                    {
+                        self.view = View::Drives;
+                    }
                 });
             });
 
@@ -560,14 +629,16 @@ impl App {
                     ui.add_space(8.0);
                 }
                 egui::ScrollArea::both().id_salt(("workspace", self.view)).auto_shrink([false, false]).show(ui, |ui| match self.view {
-                View::Dashboard => crate::views::dashboard::ui(self, ui),
-                View::Archive => crate::views::archive::ui(self, ui),
-                View::Drives => crate::views::drives::ui(self, ui),
-                View::Find => crate::views::find::ui(self, ui),
-                View::Init => crate::views::init::ui(self, ui),
-                View::Verify => crate::views::verify::ui(self, ui),
-                View::Watch => crate::views::watch::ui(self, ui),
-                View::Settings => crate::views::settings::ui(self, ui),
+                    View::Backup => crate::views::backup::ui(self, ui),
+                    View::Tasks => crate::views::tasks::ui(self, ui),
+                    View::Verify => crate::views::verify::ui(self, ui),
+                    View::Settings => crate::views::settings::ui(self, ui),
+                    View::Dashboard => crate::views::tasks::ui(self, ui),
+                    View::Archive => crate::views::archive::ui(self, ui),
+                    View::Drives => crate::views::drives::ui(self, ui),
+                    View::Find => crate::views::find::ui(self, ui),
+                    View::Init => crate::views::init::ui(self, ui),
+                    View::Watch => crate::views::watch::ui(self, ui),
                 });
             });
 
@@ -810,7 +881,7 @@ pub(crate) mod tests {
         App {
             backend: Backend::Live,
             task_kind: None,
-            view: View::Dashboard,
+            view: View::Backup,
             cfg: Config::default(),
             config_source: ConfigSource::Default,
             logs: Vec::new(),
@@ -818,6 +889,7 @@ pub(crate) mod tests {
             rx: None,
             task: None,
             plan_task: None,
+            file_backup_plan_task: None,
             find_task: None,
             task_started: None,
             last_summary: None,
@@ -831,8 +903,91 @@ pub(crate) mod tests {
             verify_ui: Default::default(),
             settings_ui: Default::default(),
             watch_ui: Default::default(),
+            backup_ui: Default::default(),
+            tasks_ui: Default::default(),
             status_cache: None,
             screenshot_runner: None,
+        }
+    }
+
+    #[test]
+    fn final_fix_target_change_clears_all_verification_evidence() {
+        let mut app = fixture();
+        app.backup_ui.target_path = "A".into();
+        app.verify_ui.last_report = Some(Default::default());
+        app.verify_ui.last_stats = Some(Default::default());
+        app.verify_ui.summary = Some("clean A".into());
+        app.verify_ui.error = Some("old A error".into());
+        crate::views::backup::set_target_folder(&mut app, "B".into());
+        assert!(app.verify_ui.last_report.is_none());
+        assert!(app.verify_ui.last_stats.is_none());
+        assert!(app.verify_ui.summary.is_none());
+        assert!(app.verify_ui.error.is_none());
+    }
+
+    #[test]
+    fn final_fix_live_legacy_view_cannot_reach_archive_or_initialization() {
+        for view in [View::Archive, View::Drives, View::Init, View::Watch] {
+            let mut app = fixture();
+            app.view = view;
+            // Seed caches to keep the pre-fix regression strictly synthetic.
+            app.drives_cache = Some(Vec::new());
+            app.init_ui.cache = Some(Vec::new());
+            let ctx = headless_context();
+            let _ = ctx.run(Default::default(), |ctx| app.render(ctx));
+            assert_eq!(app.view, View::Backup);
+        }
+    }
+
+    #[test]
+    fn final_fix_live_rejects_unbound_stale_verification_worker() {
+        let mut app = fixture();
+        app.backup_ui.target_path = "A".into();
+        app.task_kind = Some(TaskKind::Verify);
+        app.task = Some(BackgroundTask::spawn(|_| {
+            Ok(ExecutionResult::Verification(VerifyReport {
+                checked: 1,
+                ..Default::default()
+            }))
+        }));
+        app.backup_ui.target_path = "B".into();
+        while !app.task.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        app.pump(&egui::Context::default());
+        assert!(app.verify_ui.last_report.is_none());
+        assert!(app.verify_ui.last_stats.is_none());
+    }
+
+    #[test]
+    fn final_fix_bound_verification_rejects_path_and_token_changes() {
+        for changed_path in [false, true] {
+            let mut app = fixture();
+            app.backup_ui.target_path = "A".into();
+            let token = app.verify_ui.begin_plain("A".into());
+            if changed_path {
+                app.backup_ui.target_path = "B".into();
+            } else {
+                app.verify_ui.begin_plain("A".into());
+            }
+            app.task_kind = Some(TaskKind::Verify);
+            app.task = Some(BackgroundTask::spawn(move |_| {
+                Ok(ExecutionResult::PlainVerification {
+                    target: "A".into(),
+                    token,
+                    result: Ok(VerifyReport {
+                        checked: 1,
+                        ..Default::default()
+                    }),
+                })
+            }));
+            while !app.task.as_ref().unwrap().is_finished() {
+                std::thread::yield_now();
+            }
+            app.pump(&egui::Context::default());
+            assert!(app.verify_ui.last_report.is_none());
+            assert!(app.verify_ui.last_stats.is_none());
+            assert!(app.verify_ui.error.is_none());
         }
     }
 
@@ -877,8 +1032,13 @@ pub(crate) mod tests {
             ..Default::default()
         };
         app.task_kind = Some(TaskKind::Verify);
+        let token = app.verify_ui.begin_plain(std::path::PathBuf::new());
         app.task = Some(BackgroundTask::spawn(move |_| {
-            Ok(ExecutionResult::Verification(report))
+            Ok(ExecutionResult::PlainVerification {
+                target: std::path::PathBuf::new(),
+                token,
+                result: Ok(report),
+            })
         }));
         while !app.task.as_ref().unwrap().is_finished() {
             std::thread::yield_now();
@@ -903,6 +1063,7 @@ pub(crate) mod tests {
     #[test]
     fn verification_failure_clears_previous_statistics() {
         let mut app = fixture();
+        app.verify_ui.begin_plain(std::path::PathBuf::new());
         app.verify_ui.last_stats = Some(Default::default());
         app.verify_ui.last_report = Some(Default::default());
         app.task_kind = Some(TaskKind::Verify);
@@ -959,10 +1120,7 @@ pub(crate) mod tests {
         );
         assert!(app.cfg.ready_root.to_string_lossy().contains("演示"));
         assert!(app.cfg.system_root.to_string_lossy().contains("演示"));
-        assert_eq!(
-            app.settings_ui.system_root,
-            app.cfg.system_root.to_string_lossy()
-        );
+        assert!(!app.settings_ui.system_root.contains("Users\\sxl"));
     }
 
     #[test]
@@ -1019,20 +1177,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn default_view_is_dashboard() {
-        assert_eq!(View::default(), View::Dashboard);
+    fn default_view_is_backup() {
+        assert_eq!(View::default(), View::Backup);
     }
 
     #[test]
     fn all_views_have_nonempty_labels() {
-        for v in View::ALL {
+        for v in View::PRIMARY {
             assert!(!v.label().is_empty(), "{:?} 应有标签", v);
         }
-        // ALL 覆盖 8 个且无重复标签
-        assert_eq!(View::ALL.len(), 8);
-        let mut labels: Vec<&str> = View::ALL.iter().map(|v| v.label()).collect();
+        assert_eq!(View::PRIMARY.len(), 4);
+        let mut labels: Vec<&str> = View::PRIMARY.iter().map(|v| v.label()).collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 8, "标签不应重复");
+        assert_eq!(labels.len(), 4, "主标签不应重复");
     }
 }

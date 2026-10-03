@@ -2,11 +2,13 @@
 //! Phase 2 实现 dashboard + archive;其余视图在 app.rs 里走 placeholder(Phase 3 补)。
 
 pub mod archive;
+pub mod backup;
 pub mod dashboard;
 pub mod drives;
 pub mod find;
 pub mod init;
 pub mod settings;
+pub mod tasks;
 pub mod theme;
 pub mod util;
 pub mod verify;

@@ -2,6 +2,12 @@
 
 pub mod request;
 
+// Ordinary-directory, copy-only facade; independent of legacy disk initialization.
+pub use crate::pipeline::backup::{
+    list_backup_history, list_backup_history_with_cancel, plan_backup, resume_backup,
+    run_backup_plan, verify_backup,
+};
+
 pub use request::{
     ArchiveRequest, FileFilter, FindRequest, InitRequest, OperationRequest, OperationResult,
     SourceSpec, VerifyRequest, WatchRequest,

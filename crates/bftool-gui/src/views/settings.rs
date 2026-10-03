@@ -61,6 +61,7 @@ impl SettingsUiState {
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
+    ui.label("以下为遗留 CLI 归档配置；普通文件备份无需设置这些目录或初始化磁盘。");
     theme::page_header(
         ui,
         "系统配置与目录设置",

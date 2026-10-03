@@ -46,9 +46,97 @@ pub struct VerifyUiState {
     pub last_report: Option<VerifyReport>,
     pub summary: Option<String>,
     pub error: Option<String>,
+    generation: u64,
+    active_plain: Option<(u64, PathBuf)>,
+    verified_target: Option<PathBuf>,
+}
+
+impl VerifyUiState {
+    pub(crate) fn invalidate_plain(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.active_plain = None;
+        self.verified_target = None;
+        self.last_stats = None;
+        self.last_report = None;
+        self.summary = None;
+        self.error = None;
+    }
+
+    pub(crate) fn begin_plain(&mut self, target: PathBuf) -> u64 {
+        self.invalidate_plain();
+        self.active_plain = Some((self.generation, target));
+        self.generation
+    }
+
+    pub(crate) fn enforce_target(&mut self, target: &std::path::Path) {
+        if self
+            .active_plain
+            .as_ref()
+            .is_some_and(|(_, bound)| bound != target)
+            || self
+                .verified_target
+                .as_ref()
+                .is_some_and(|bound| bound != target)
+        {
+            self.invalidate_plain();
+        }
+    }
+
+    pub(crate) fn accept_plain(
+        &mut self,
+        selected: &std::path::Path,
+        target: PathBuf,
+        token: u64,
+        result: Result<VerifyReport, String>,
+    ) -> Option<String> {
+        if selected != target || self.active_plain.as_ref() != Some(&(token, target.clone())) {
+            return None;
+        }
+        self.active_plain = None;
+        self.verified_target = Some(target.clone());
+        let text = match result {
+            Ok(report) => {
+                let text = format!(
+                    "{}: {}",
+                    target.display(),
+                    verify_summary(
+                        report.checked,
+                        report.bad,
+                        report.extra,
+                        report.size_only,
+                        report.cancelled
+                    )
+                );
+                self.last_stats = Some(VerifyStats::from_report(&report));
+                self.last_report = Some(report);
+                self.summary = Some(text.clone());
+                self.error = None;
+                text
+            }
+            Err(error) => {
+                let text = format!("{}: {error}", target.display());
+                self.last_stats = None;
+                self.last_report = None;
+                self.summary = None;
+                self.error = Some(text.clone());
+                text
+            }
+        };
+        Some(text)
+    }
+
+    pub(crate) fn fail_plain(&mut self, selected: &std::path::Path, error: String) {
+        if let Some((token, target)) = self.active_plain.clone() {
+            let _ = self.accept_plain(selected, target, token, Err(error));
+        }
+    }
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
+    if !app.backend.is_demo() {
+        plain_ui(app, ui);
+        return;
+    }
     theme::page_header(
         ui,
         "数据完整性复查",
@@ -411,6 +499,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn rescan(app: &mut App) {
+    if !app.backend.is_demo() {
+        return;
+    }
     match app.backend.drives() {
         Ok(ds) => app.verify_ui.drives = Some(ds),
         Err(e) => {
@@ -421,7 +512,112 @@ fn rescan(app: &mut App) {
     }
 }
 
+fn plain_ui(app: &mut App, ui: &mut egui::Ui) {
+    app.verify_ui
+        .enforce_target(std::path::Path::new(&app.backup_ui.target_path));
+    theme::page_header(
+        ui,
+        "数据完整性校验",
+        "普通目标目录：从持久清单重算 SHA-256，不需要初始化磁盘。范围仅为所选目录内的备份任务。",
+    );
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "选择普通备份目标目录");
+        ui.label(if app.backup_ui.target_path.is_empty() {
+            "尚未选择目标目录"
+        } else {
+            &app.backup_ui.target_path
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!app.is_busy(), theme::btn_secondary("选择目标目录"))
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    crate::views::backup::set_target_folder(app, path);
+                }
+            }
+            if ui
+                .add_enabled(
+                    !app.is_busy() && !app.backup_ui.target_path.is_empty(),
+                    theme::btn_primary("校验所选目录"),
+                )
+                .clicked()
+            {
+                start_plain_verify(app, PathBuf::from(&app.backup_ui.target_path));
+            }
+            if app.task_running(crate::app::TaskKind::Verify) {
+                let task = app.task.as_ref().unwrap();
+                if ui
+                    .add_enabled(!task.cancel_requested(), theme::btn_danger("停止复查"))
+                    .clicked()
+                {
+                    task.request_cancel();
+                }
+            } else if app.is_busy() {
+                ui.label(app.busy_label());
+            }
+        });
+    });
+    ui.add_space(theme::GAP);
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "实际校验结果");
+        if let Some(error) = &app.verify_ui.error {
+            ui.colored_label(theme::DANGER, error);
+        }
+        if let Some(summary) = &app.verify_ui.summary {
+            ui.label(summary);
+        }
+        if let Some(report) = &app.verify_ui.last_report {
+            if report.cancelled {
+                ui.colored_label(theme::WARN, "已取消：未检查的内容仍未知");
+            }
+            if report.checked == 0 {
+                ui.colored_label(theme::WARN, "未检查到内容；不能推断完整性");
+            }
+            egui::ScrollArea::both().max_height(250.0).show(ui, |ui| {
+                for issue in &report.issues {
+                    ui.label(format!(
+                        "{:?} · {} / {}",
+                        issue.kind, issue.project, issue.rel
+                    ));
+                }
+            });
+        }
+        util::progress_bar(&app.progress, ui);
+        util::log_panel(&app.logs, ui);
+    });
+}
+
+pub(crate) fn start_plain_verify(app: &mut App, target: PathBuf) {
+    if app.backend.is_demo() || target.as_os_str().is_empty() || !app.ensure_idle() {
+        return;
+    }
+    if target.as_path() != std::path::Path::new(&app.backup_ui.target_path) {
+        return;
+    }
+    let token = app.verify_ui.begin_plain(target.clone());
+    app.task_kind = Some(crate::app::TaskKind::Verify);
+    app.task_started = Some(std::time::Instant::now());
+    app.last_summary = None;
+    let (tx, rx) = mpsc::channel();
+    app.rx = Some(rx);
+    let reporter = GuiReporter::new(tx, Arc::clone(&app.progress));
+    app.task = Some(BackgroundTask::spawn(move |cancel| {
+        let result = bftool_core::service::verify_backup(&target, cancel, &reporter)
+            .map_err(|error| format!("{error:#}"));
+        Ok(crate::app::ExecutionResult::PlainVerification {
+            target,
+            token,
+            result,
+        })
+    }));
+}
+
 fn start_verify(app: &mut App) {
+    if !app.backend.is_demo() {
+        start_plain_verify(app, PathBuf::from(&app.backup_ui.target_path));
+        return;
+    }
     if !app.ensure_idle() {
         return;
     }
@@ -454,6 +650,10 @@ fn start_verify(app: &mut App) {
 }
 
 fn start_verify_one(app: &mut App, target: PathBuf) {
+    if !app.backend.is_demo() {
+        start_plain_verify(app, target);
+        return;
+    }
     if !app.ensure_idle() {
         return;
     }

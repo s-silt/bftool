@@ -9,11 +9,12 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::reporter::ProgressHandle;
 use sha2::{Digest, Sha256};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +22,11 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct SafeDir {
     path: PathBuf,
     handle: platform::Directory,
+}
+
+/// Identity of the filesystem object held by this file, independent of its name.
+pub(crate) fn file_identity(file: &File) -> Result<String> {
+    platform::file_identity(file).context("Read filesystem object identity failed")
 }
 
 fn normal_components(path: &Path) -> Result<Vec<OsString>> {
@@ -138,6 +144,48 @@ impl SafeDir {
         platform::anchored_path(&self.handle, &self.path)
     }
 
+    /// Identity of this exact open directory object, rather than its visible path.
+    pub(crate) fn identity(&self) -> Result<String> {
+        platform::directory_identity(&self.handle).context("Read open directory identity failed")
+    }
+
+    /// Open an existing ordinary child directory without following links or creating it.
+    pub(crate) fn open_existing_dir(&self, relative: &Path) -> Result<Self> {
+        self.require_current_binding()?;
+        self.descend(relative, false, false)
+    }
+
+    /// Enumerate names only; callers must open each entry through no-follow handles.
+    pub(crate) fn list_entries(&self) -> Result<Vec<OsString>> {
+        self.list_entries_checked(|| Ok(()))
+    }
+
+    pub(crate) fn list_entries_checked(
+        &self,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<Vec<OsString>> {
+        check()?;
+        self.require_current_binding()?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(self.anchored_path())? {
+            check()?;
+            entries.push(entry?.file_name());
+        }
+        check()?;
+        self.require_current_binding()?;
+        Ok(entries)
+    }
+
+    /// Hold a nonblocking OS lock on an ordinary job-owned lock file. Never unlink it.
+    pub(crate) fn lock_exclusive(&self, relative: &Path) -> Result<File> {
+        self.require_current_binding()?;
+        let (parent, name) = self.parent_and_name(relative, false)?;
+        let file = platform::lock_file(&parent.handle, &parent.path.join(&name), &name)
+            .context("Acquire exclusive job lock failed")?;
+        parent.require_current_binding()?;
+        Ok(file)
+    }
+
     /// Refuse a replaced or relinked visible directory before consequential stages.
     pub(crate) fn require_current_binding(&self) -> Result<()> {
         let current = Self::open(&self.path, false)?;
@@ -188,11 +236,44 @@ impl SafeDir {
         bail!("无法分配唯一临时文件，拒绝复用或删除未知文件")
     }
 
+    fn create_owned_temp(&self, target: &OsStr, suffix: &str) -> Result<File> {
+        for _ in 0..32 {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let mut name = target.to_os_string();
+            name.push(format!(
+                ".{}.{}.{}{}",
+                std::process::id(),
+                stamp,
+                sequence,
+                suffix
+            ));
+            match platform::create_owned_file(&self.handle, &self.path.join(&name), &name) {
+                Ok(file) => return Ok(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).context("Create owned direct-copy temporary failed")
+                }
+            }
+        }
+        bail!("Cannot create an exclusive direct-copy temporary; unknown entries preserved")
+    }
+
     pub(crate) fn read_regular(&self, relative: &Path) -> Result<File> {
         self.require_current_binding()?;
         let (parent, name) = self.parent_and_name(relative, false)?;
         platform::read_file(&parent.handle, &parent.path.join(&name), &name)
             .with_context(|| format!("安全打开目标普通文件失败：{}", relative.display()))
+    }
+
+    /// Keep an ordinary source object's identity alive without locking out user
+    /// edits or deletion. This attributes-only handle is not a source I/O handle.
+    pub(crate) fn hold_file_identity(&self, relative: &Path) -> Result<File> {
+        self.require_current_binding()?;
+        let (parent, name) = self.parent_and_name(relative, false)?;
+        let file = platform::hold_identity_file(&parent.handle, &parent.path.join(&name), &name)?;
+        parent.require_current_binding()?;
+        Ok(file)
     }
 
     pub(crate) fn append_synced(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
@@ -211,6 +292,47 @@ impl SafeDir {
 
     pub(crate) fn write_atomic_new(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
         self.write_atomic_mode(relative, bytes, true)
+    }
+
+    /// Direct-backup metadata is immutable. Retain the exact temporary object
+    /// through no-replace publication or cleanup; never reuse its historical name.
+    pub(crate) fn write_metadata_new(&self, relative: &Path, bytes: &[u8]) -> Result<String> {
+        platform::require_owned_mutations()?;
+        self.require_current_binding()?;
+        let (parent, name) = self.parent_and_name(relative, false)?;
+        let mut file = parent.create_owned_temp(&name, ".bftool-meta-tmp")?;
+        let mut published = false;
+        let result = (|| -> Result<String> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            tests::METADATA_HOOK.with(|hook| {
+                if let Some(callback) = hook.borrow_mut().take() {
+                    callback(&file, &parent);
+                }
+            });
+            parent.require_current_binding()?;
+            self.require_current_binding()?;
+            platform::publish_owned_file(&file, &parent.handle, &parent.path, &name)?;
+            published = true;
+            platform::sync_dir(&parent.handle)?;
+            parent.require_current_binding()?;
+            self.require_current_binding()?;
+            file_identity(&file)
+        })();
+        if result.is_err() && !published {
+            if let Err(cleanup) = platform::discard_owned_file(&file) {
+                return result.with_context(|| {
+                    format!("Owned metadata temporary cleanup failed; preserved: {cleanup}")
+                });
+            }
+        }
+        result.with_context(|| {
+            format!(
+                "Immutable metadata publication failed: {}",
+                relative.display()
+            )
+        })
     }
 
     fn write_atomic_mode(&self, relative: &Path, bytes: &[u8], no_replace: bool) -> Result<()> {
@@ -294,6 +416,115 @@ impl SafeDir {
         })
     }
 
+    /// Copy only from an already no-follow-opened ordinary source handle, rewinding
+    /// it to byte zero. The caller owns the progress handle's finish lifecycle.
+    pub(crate) fn copy_from_handle_new(
+        &self,
+        source: &mut File,
+        relative: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn ProgressHandle,
+    ) -> Result<String> {
+        platform::require_owned_mutations()?;
+        if cancel.load(Ordering::Acquire) {
+            bail!("Copy cancelled; source retained");
+        }
+        self.require_current_binding()?;
+        if !source.metadata()?.is_file() {
+            bail!("Copy source handle is not an ordinary file");
+        }
+        source.seek(SeekFrom::Start(0))?;
+        let (parent, name) = self.parent_and_name(relative, true)?;
+        if cancel.load(Ordering::Acquire) {
+            bail!("Copy cancelled; source retained");
+        }
+        let mut destination = parent.create_owned_temp(&name, crate::engine::cruft::PART_SUFFIX)?;
+        let mut published = false;
+        let result = (|| -> Result<String> {
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0; 1024 * 1024];
+            loop {
+                if cancel.load(Ordering::Acquire) {
+                    bail!("Copy cancelled; source retained");
+                }
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                if cancel.load(Ordering::Acquire) {
+                    bail!("Copy cancelled; source retained");
+                }
+                destination.write_all(&buffer[..count])?;
+                hasher.update(&buffer[..count]);
+                progress.inc(count as u64);
+            }
+            if cancel.load(Ordering::Acquire) {
+                bail!("Copy cancelled; source retained");
+            }
+            destination.sync_all()?;
+            parent.require_current_binding()?;
+            self.require_current_binding()?;
+            if cancel.load(Ordering::Acquire) {
+                bail!("Copy cancelled; source retained");
+            }
+            platform::publish_owned_file(&destination, &parent.handle, &parent.path, &name)?;
+            published = true;
+            platform::sync_dir(&parent.handle)?;
+            parent.require_current_binding()?;
+            self.require_current_binding()?;
+            Ok(format!("{:X}", hasher.finalize()))
+        })();
+        if result.is_err() && !published {
+            if let Err(cleanup) = platform::discard_owned_file(&destination) {
+                drop(destination);
+                return result.with_context(|| {
+                    format!("Owned temporary cleanup failed; temporary preserved: {cleanup}")
+                });
+            }
+        }
+        drop(destination);
+        result.with_context(|| format!("Safe handle copy failed: {}", relative.display()))
+    }
+
+    /// Publish only a known owned file/directory object, using its actual held
+    /// handle after identity verification. Drop other handles to this payload
+    /// and its descendants first; Windows denies obtaining DELETE access while
+    /// existing handles omit delete sharing. Unsupported platforms fail closed.
+    pub(crate) fn rename_owned_entry_to(
+        &self,
+        from: &Path,
+        to_dir: &Self,
+        to: &Path,
+        expected_id: &str,
+    ) -> Result<()> {
+        platform::require_owned_mutations()?;
+        self.require_current_binding()?;
+        to_dir.require_current_binding()?;
+        let (source_parent, source_name) = self.parent_and_name(from, false)?;
+        let (destination_parent, destination_name) = to_dir.parent_and_name(to, false)?;
+        let owned = platform::open_owned_entry(
+            &source_parent.handle,
+            &source_parent.path.join(&source_name),
+            &source_name,
+        )?;
+        if file_identity(&owned)? != expected_id {
+            bail!("Owned payload identity changed; unknown entry preserved");
+        }
+        source_parent.require_current_binding()?;
+        destination_parent.require_current_binding()?;
+        platform::publish_owned_file(
+            &owned,
+            &destination_parent.handle,
+            &destination_parent.path,
+            &destination_name,
+        )?;
+        platform::sync_dir(&source_parent.handle)?;
+        platform::sync_dir(&destination_parent.handle)?;
+        source_parent.require_current_binding()?;
+        destination_parent.require_current_binding()?;
+        Ok(())
+    }
+
     pub(crate) fn remove_regular(&self, relative: &Path) -> Result<()> {
         self.require_current_binding()?;
         let (parent, name) = self.parent_and_name(relative, false)?;
@@ -346,8 +577,35 @@ mod platform {
     use std::os::unix::ffi::OsStrExt;
 
     pub(super) struct Directory(File);
+    fn owned_mutation_unsupported<T>() -> io::Result<T> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "held-object direct copy/publication is implemented only on Windows; source retained",
+        ))
+    }
+    pub(super) fn require_owned_mutations() -> io::Result<()> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn create_owned_file(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn open_owned_entry(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn publish_owned_file(
+        _: &File,
+        _: &Directory,
+        _: &Path,
+        _: &OsStr,
+    ) -> io::Result<()> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn discard_owned_file(_: &File) -> io::Result<()> {
+        owned_mutation_unsupported()
+    }
     const O_RDONLY: i32 = 0;
     const O_WRONLY: i32 = 1;
+    const O_RDWR: i32 = 2;
     const O_CREAT: i32 = 0o100;
     const O_EXCL: i32 = 0o200;
     // Linux fcntl flag values differ on ARM; do not silently apply x86 flags.
@@ -363,7 +621,10 @@ mod platform {
     const O_CLOEXEC: i32 = 0o2000000;
     const O_NONBLOCK: i32 = 0o4000;
     const RENAME_NOREPLACE: u32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
     unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
         fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, mode: u32) -> i32;
         fn mkdirat(fd: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
         fn unlinkat(fd: i32, path: *const std::ffi::c_char, flags: i32) -> i32;
@@ -424,6 +685,19 @@ mod platform {
         let b = b.0.metadata()?;
         Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
+    pub(super) fn file_identity(file: &File) -> io::Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        // File::metadata obtains fstat information from the held descriptor.
+        let metadata = file.metadata()?;
+        Ok(format!(
+            "linux:{:016X}:{:016X}",
+            metadata.dev(),
+            metadata.ino()
+        ))
+    }
+    pub(super) fn directory_identity(parent: &Directory) -> io::Result<String> {
+        file_identity(&parent.0)
+    }
     pub(super) fn clone_dir(parent: &Directory) -> io::Result<Directory> {
         Ok(Directory(parent.0.try_clone()?))
     }
@@ -468,6 +742,28 @@ mod platform {
             ));
         }
         Ok(file)
+    }
+    pub(super) fn lock_file(parent: &Directory, _path: &Path, name: &OsStr) -> io::Result<File> {
+        let file = open_relative(parent, name, O_RDWR | O_CREAT | O_NONBLOCK)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "job lock is not an ordinary file",
+            ));
+        }
+        // SAFETY: file owns a live descriptor. flock is nonblocking, and the
+        // exclusive lock remains held until this File is closed by its owner.
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
+    }
+    pub(super) fn hold_identity_file(
+        parent: &Directory,
+        path: &Path,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        read_file(parent, path, name)
     }
     pub(super) fn append_file(parent: &Directory, _path: &Path, name: &OsStr) -> io::Result<File> {
         let file = open_relative(parent, name, O_WRONLY | O_APPEND | O_CREAT | O_NONBLOCK)?;
@@ -580,15 +876,49 @@ mod platform {
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
     use std::sync::Arc;
 
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_READ: u32 = 1;
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_RENAME_INFO: i32 = 3;
+    const FILE_DISPOSITION_INFO: i32 = 4;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     pub(super) struct Directory {
         held: Vec<Arc<File>>,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    // SDK 10.0.22621 winbase.h: the first union occupies a DWORD. For the
+    // FileRenameInfo class its low BOOLEAN byte is ReplaceIfExists (always 0).
+    #[repr(C)]
+    struct FileRenameInfo {
+        replace_if_exists: u32,
+        root_directory: *mut std::ffi::c_void,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: u8,
+    }
+    pub(super) fn require_owned_mutations() -> io::Result<()> {
+        Ok(())
     }
     fn ordinary(file: &File, directory: bool) -> io::Result<()> {
         let metadata = file.metadata()?;
@@ -620,10 +950,32 @@ mod platform {
     pub(super) fn anchored_path(_parent: &Directory, path: &Path) -> PathBuf {
         path.to_path_buf()
     }
-    pub(super) fn same_dir(_a: &Directory, _b: &Directory) -> io::Result<bool> {
-        // All ancestors and this directory remain open without write/delete
-        // sharing, so their visible binding cannot be replaced while held.
-        Ok(true)
+    pub(super) fn file_identity(file: &File) -> io::Result<String> {
+        let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+        // SAFETY: File owns a live Windows handle; the repr(C) output buffer has
+        // BY_HANDLE_FILE_INFORMATION's DWORD/FILETIME layout and size. The API
+        // initializes it on success, which is checked before assume_init.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let information = unsafe { information.assume_init() };
+        let index =
+            ((information.file_index_high as u64) << 32) | information.file_index_low as u64;
+        Ok(format!(
+            "windows:{:08X}:{:016X}",
+            information.volume_serial_number, index
+        ))
+    }
+    pub(super) fn directory_identity(parent: &Directory) -> io::Result<String> {
+        let file = parent.held.last().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory handle is missing")
+        })?;
+        file_identity(file)
+    }
+    pub(super) fn same_dir(a: &Directory, b: &Directory) -> io::Result<bool> {
+        Ok(directory_identity(a)? == directory_identity(b)?)
     }
     pub(super) fn clone_dir(parent: &Directory) -> io::Result<Directory> {
         Ok(Directory {
@@ -662,10 +1014,152 @@ mod platform {
         ordinary(&file, false)?;
         Ok(file)
     }
+    pub(super) fn create_owned_file(
+        _parent: &Directory,
+        path: &Path,
+        _name: &OsStr,
+    ) -> io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .access_mode(GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        ordinary(&file, false)?;
+        Ok(file)
+    }
+    pub(super) fn open_owned_entry(
+        _parent: &Directory,
+        path: &Path,
+        _name: &OsStr,
+    ) -> io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || (!metadata.is_file() && !metadata.is_dir())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned entry is a reparse point or special entry",
+            ));
+        }
+        Ok(file)
+    }
+    pub(super) fn publish_owned_file(
+        file: &File,
+        _parent: &Directory,
+        parent_path: &Path,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        let name: Vec<u16> = parent_path.join(name).as_os_str().encode_wide().collect();
+        if name.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NUL in owned rename target",
+            ));
+        }
+        let name_bytes = name
+            .len()
+            .checked_mul(2)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "owned rename target too long")
+            })?;
+        let name_offset = std::mem::offset_of!(FileRenameInfo, file_name);
+        let buffer_bytes = name_offset
+            .checked_add(name_bytes as usize)
+            .and_then(|bytes| bytes.checked_add(2))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "owned rename buffer too long")
+            })?
+            .max(std::mem::size_of::<FileRenameInfo>());
+        let buffer_size = u32::try_from(buffer_bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "owned rename buffer too long")
+        })?;
+        // usize storage supplies HANDLE alignment on both 32-bit and 64-bit
+        // Windows. FileName is the SDK's trailing variable UTF-16 array.
+        let mut buffer = vec![0usize; buffer_bytes.div_ceil(std::mem::size_of::<usize>())];
+        let information = buffer.as_mut_ptr().cast::<FileRenameInfo>();
+        // SAFETY: aligned zeroed storage is large enough for the repr(C) header
+        // and the entire UTF-16 name plus NUL. The ancestors represented by
+        // parent_path stay held without delete sharing, so target resolution is
+        // anchored. Only the source File handle is authoritative for the rename.
+        unsafe {
+            (*information).replace_if_exists = 0;
+            (*information).root_directory = std::ptr::null_mut();
+            (*information).file_name_length = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                std::ptr::addr_of_mut!((*information).file_name).cast::<u16>(),
+                name.len(),
+            );
+        }
+        // SAFETY: File owns a live DELETE-capable handle; the live buffer is
+        // FILE_RENAME_INFO with ReplaceIfExists FALSE, hence atomic no-replace.
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_RENAME_INFO,
+                information.cast(),
+                buffer_size,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub(super) fn discard_owned_file(file: &File) -> io::Result<()> {
+        let mut information = FileDispositionInfo { delete_file: 1 };
+        // SAFETY: File owns a live DELETE-capable handle; the one-byte repr(C)
+        // FILE_DISPOSITION_INFO marks that held object for deletion on close.
+        // No historical pathname is inspected, renamed, or unlinked.
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_DISPOSITION_INFO,
+                (&mut information as *mut FileDispositionInfo).cast(),
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
     pub(super) fn read_file(_parent: &Directory, path: &Path, _name: &OsStr) -> io::Result<File> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        ordinary(&file, false)?;
+        Ok(file)
+    }
+    pub(super) fn lock_file(_parent: &Directory, path: &Path, _name: &OsStr) -> io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        ordinary(&file, false)?;
+        Ok(file)
+    }
+    pub(super) fn hold_identity_file(
+        _parent: &Directory,
+        path: &Path,
+        _name: &OsStr,
+    ) -> io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | 2 | 4)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         ordinary(&file, false)?;
@@ -715,6 +1209,16 @@ mod platform {
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information_class: i32,
+            information: *mut std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
         fn MoveFileW(from: *const u16, to: *const u16) -> i32;
     }
     pub(super) fn rename_new(
@@ -780,6 +1284,32 @@ mod platform {
     use super::*;
     use std::io;
     pub(super) struct Directory;
+    fn owned_mutation_unsupported<T>() -> io::Result<T> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "held-object direct copy/publication is implemented only on Windows; source retained",
+        ))
+    }
+    pub(super) fn require_owned_mutations() -> io::Result<()> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn create_owned_file(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn open_owned_entry(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn publish_owned_file(
+        _: &File,
+        _: &Directory,
+        _: &Path,
+        _: &OsStr,
+    ) -> io::Result<()> {
+        owned_mutation_unsupported()
+    }
+    pub(super) fn discard_owned_file(_: &File) -> io::Result<()> {
+        owned_mutation_unsupported()
+    }
     fn unsupported<T>() -> io::Result<T> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -795,6 +1325,12 @@ mod platform {
     pub(super) fn same_dir(_: &Directory, _: &Directory) -> io::Result<bool> {
         unsupported()
     }
+    pub(super) fn file_identity(_: &File) -> io::Result<String> {
+        unsupported()
+    }
+    pub(super) fn directory_identity(_: &Directory) -> io::Result<String> {
+        unsupported()
+    }
     pub(super) fn clone_dir(_: &Directory) -> io::Result<Directory> {
         unsupported()
     }
@@ -808,6 +1344,12 @@ mod platform {
         unsupported()
     }
     pub(super) fn read_file(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
+        unsupported()
+    }
+    pub(super) fn lock_file(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
+        unsupported()
+    }
+    pub(super) fn hold_identity_file(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
         unsupported()
     }
     pub(super) fn append_file(_: &Directory, _: &Path, _: &OsStr) -> io::Result<File> {
@@ -843,6 +1385,658 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reporter::ProgressHandle;
+    use std::sync::atomic::AtomicBool;
+
+    // Runs only on this test thread, after a metadata temporary has been synced.
+    type MetadataHook = Box<dyn FnOnce(&File, &SafeDir)>;
+    thread_local! {
+        pub(super) static METADATA_HOOK: std::cell::RefCell<Option<MetadataHook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_fix_metadata_held_publication_preserves_unknown_temp_name() {
+        metadata_temp_substitution(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_fix_metadata_held_cleanup_preserves_unknown_temp_name_and_destination() {
+        metadata_temp_substitution(true);
+    }
+
+    #[cfg(windows)]
+    fn metadata_temp_substitution(occupied: bool) {
+        let world = tempfile::tempdir().unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        if occupied {
+            std::fs::write(world.path().join("record.json"), b"DESTINATION-KEEP").unwrap();
+        }
+        let historical = std::sync::Arc::new(std::sync::Mutex::new(PathBuf::new()));
+        let capture = historical.clone();
+        METADATA_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |held, dir| {
+                let name = dir
+                    .list_entries()
+                    .unwrap()
+                    .into_iter()
+                    .find(|n| n.to_string_lossy().ends_with(".bftool-meta-tmp"))
+                    .unwrap();
+                let path = dir.path.join(&name);
+                // Stronger than an external rename (blocked by sharing): move through
+                // the exact held object and place unrelated bytes at its old name.
+                platform::publish_owned_file(
+                    held,
+                    &dir.handle,
+                    &dir.path,
+                    OsStr::new("saved-owned"),
+                )
+                .unwrap();
+                std::fs::write(&path, b"TEMP-KEEP").unwrap();
+                *capture.lock().unwrap() = path;
+            }))
+        });
+        let result = root.write_metadata_new(Path::new("record.json"), b"OWNED-METADATA");
+        assert_eq!(result.is_err(), occupied);
+        assert_eq!(
+            std::fs::read(&*historical.lock().unwrap()).unwrap(),
+            b"TEMP-KEEP"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("record.json")).unwrap(),
+            if occupied {
+                b"DESTINATION-KEEP".as_slice()
+            } else {
+                b"OWNED-METADATA".as_slice()
+            }
+        );
+        assert!(!world.path().join("saved-owned").exists());
+    }
+
+    struct CopyProgress<'a> {
+        bytes: u64,
+        cancel_after_chunk: Option<&'a AtomicBool>,
+    }
+
+    impl ProgressHandle for CopyProgress<'_> {
+        fn inc(&mut self, delta: u64) {
+            self.bytes += delta;
+            if let Some(cancel) = self.cancel_after_chunk {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+
+        fn finish(&mut self) {}
+    }
+
+    #[test]
+    fn direct_io_identity_hold_allows_source_edits_without_changing_object_identity() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("source"), b"BEFORE").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.hold_file_identity(Path::new("source")).unwrap();
+        let identity = file_identity(&held).unwrap();
+        std::fs::write(world.path().join("source"), b"AFTER-USER-EDIT").unwrap();
+        assert_eq!(file_identity(&held).unwrap(), identity);
+        assert_eq!(
+            std::fs::read(world.path().join("source")).unwrap(),
+            b"AFTER-USER-EDIT"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_r1_held_publish_preserves_unknown_historical_name_and_hard_link() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("owned"), b"abc").unwrap();
+        std::fs::hard_link(world.path().join("owned"), world.path().join("alias")).unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = platform::open_owned_entry(
+            &root.handle,
+            &world.path().join("owned"),
+            OsStr::new("owned"),
+        )
+        .unwrap();
+        let original_identity = file_identity(&held).unwrap();
+        platform::publish_owned_file(&held, &root.handle, world.path(), OsStr::new("saved-owned"))
+            .unwrap();
+        std::fs::write(world.path().join("owned"), b"UNKNOWN").unwrap();
+        platform::publish_owned_file(&held, &root.handle, world.path(), OsStr::new("published"))
+            .unwrap();
+        assert_eq!(file_identity(&held).unwrap(), original_identity);
+        drop(held);
+        assert_eq!(
+            std::fs::read(world.path().join("published")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("owned")).unwrap(),
+            b"UNKNOWN"
+        );
+        assert_eq!(std::fs::read(world.path().join("alias")).unwrap(), b"abc");
+        assert!(!world.path().join("saved-owned").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_r1_held_cleanup_preserves_unknown_historical_name_and_hard_link() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("owned"), b"abc").unwrap();
+        std::fs::hard_link(world.path().join("owned"), world.path().join("alias")).unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = platform::open_owned_entry(
+            &root.handle,
+            &world.path().join("owned"),
+            OsStr::new("owned"),
+        )
+        .unwrap();
+        platform::publish_owned_file(&held, &root.handle, world.path(), OsStr::new("saved-owned"))
+            .unwrap();
+        std::fs::write(world.path().join("owned"), b"UNKNOWN").unwrap();
+        platform::discard_owned_file(&held).unwrap();
+        drop(held);
+        assert!(!world.path().join("saved-owned").exists());
+        assert_eq!(
+            std::fs::read(world.path().join("owned")).unwrap(),
+            b"UNKNOWN"
+        );
+        assert_eq!(std::fs::read(world.path().join("alias")).unwrap(), b"abc");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_r1_held_publish_refuses_occupied_target() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("occupied"), b"KEEP").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let mut held = platform::create_owned_file(
+            &root.handle,
+            &world.path().join("owned"),
+            OsStr::new("owned"),
+        )
+        .unwrap();
+        held.write_all(b"abc").unwrap();
+        held.sync_all().unwrap();
+        assert!(platform::publish_owned_file(
+            &held,
+            &root.handle,
+            world.path(),
+            OsStr::new("occupied")
+        )
+        .is_err());
+        drop(held);
+        assert_eq!(
+            std::fs::read(world.path().join("occupied")).unwrap(),
+            b"KEEP"
+        );
+        assert_eq!(std::fs::read(world.path().join("owned")).unwrap(), b"abc");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_r1_owned_publish_rejects_replaced_file_and_preserves_unknown() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("owned"), b"SOURCE").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.read_regular(Path::new("owned")).unwrap();
+        let expected_identity = file_identity(&held).unwrap();
+        drop(held);
+        std::fs::rename(world.path().join("owned"), world.path().join("saved-owned")).unwrap();
+        std::fs::write(world.path().join("owned"), b"UNKNOWN").unwrap();
+        assert!(root
+            .rename_owned_entry_to(
+                Path::new("owned"),
+                &root,
+                Path::new("published"),
+                &expected_identity
+            )
+            .is_err());
+        assert!(!world.path().join("published").exists());
+        assert_eq!(
+            std::fs::read(world.path().join("owned")).unwrap(),
+            b"UNKNOWN"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("saved-owned")).unwrap(),
+            b"SOURCE"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_r1_owned_publish_moves_expected_file_without_replacing() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("owned"), b"SOURCE").unwrap();
+        std::fs::write(world.path().join("occupied"), b"KEEP").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.read_regular(Path::new("owned")).unwrap();
+        let expected_identity = file_identity(&held).unwrap();
+        drop(held);
+        assert!(root
+            .rename_owned_entry_to(
+                Path::new("owned"),
+                &root,
+                Path::new("occupied"),
+                &expected_identity
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::read(world.path().join("owned")).unwrap(),
+            b"SOURCE"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("occupied")).unwrap(),
+            b"KEEP"
+        );
+        root.rename_owned_entry_to(
+            Path::new("owned"),
+            &root,
+            Path::new("published"),
+            &expected_identity,
+        )
+        .unwrap();
+        assert!(!world.path().join("owned").exists());
+        assert_eq!(
+            std::fs::read(world.path().join("published")).unwrap(),
+            b"SOURCE"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_r1_owned_publish_moves_expected_directory_after_handles_drop() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("owned")).unwrap();
+        std::fs::write(world.path().join("owned/data"), b"SOURCE").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.open_existing_dir(Path::new("owned")).unwrap();
+        let expected_identity = held.identity().unwrap();
+        drop(held);
+        root.rename_owned_entry_to(
+            Path::new("owned"),
+            &root,
+            Path::new("published"),
+            &expected_identity,
+        )
+        .unwrap();
+        assert!(!world.path().join("owned").exists());
+        assert_eq!(
+            std::fs::read(world.path().join("published/data")).unwrap(),
+            b"SOURCE"
+        );
+    }
+
+    #[test]
+    #[ignore = "child-process helper, invoked by direct_io_lock_excludes_other_processes"]
+    fn direct_io_lock_child() {
+        let fixture = std::env::var_os("BFTOOL_DIRECT_IO_LOCK_FIXTURE").unwrap();
+        let root = SafeDir::open(Path::new(&fixture), false).unwrap();
+        let result = root.lock_exclusive(Path::new("lock"));
+        if std::env::var_os("BFTOOL_DIRECT_IO_LOCK_EXPECT_ACQUIRE").is_some() {
+            assert!(
+                result.is_ok(),
+                "released lock must be acquirable in a child process"
+            );
+        } else {
+            assert!(result.is_err(), "held lock must exclude a child process");
+        }
+    }
+
+    #[test]
+    fn direct_io_lock_excludes_other_processes_and_releases_on_drop() {
+        fn run_child(fixture: &Path, expect_acquire: bool) {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "engine::destination::tests::direct_io_lock_child",
+                "--ignored",
+                "--nocapture",
+            ]);
+            command.env("BFTOOL_DIRECT_IO_LOCK_FIXTURE", fixture);
+            command.env_remove("BFTOOL_DIRECT_IO_LOCK_EXPECT_ACQUIRE");
+            if expect_acquire {
+                command.env("BFTOOL_DIRECT_IO_LOCK_EXPECT_ACQUIRE", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child lock check failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let world = tempfile::tempdir().unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.lock_exclusive(Path::new("lock")).unwrap();
+        run_child(world.path(), false);
+        drop(held);
+        run_child(world.path(), true);
+        assert!(world.path().join("lock").is_file());
+    }
+
+    #[test]
+    fn direct_io_exclusive_lock_refuses_another_handle_without_changing_contents() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("lock"), b"OWNED-LOCK").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.lock_exclusive(Path::new("lock")).unwrap();
+        assert!(root.lock_exclusive(Path::new("lock")).is_err());
+        drop(held);
+        assert_eq!(
+            std::fs::read(world.path().join("lock")).unwrap(),
+            b"OWNED-LOCK"
+        );
+    }
+
+    #[test]
+    fn direct_io_exclusive_lock_can_be_reopened_after_held_handle_drops() {
+        let world = tempfile::tempdir().unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let held = root.lock_exclusive(Path::new("lock")).unwrap();
+        assert!(root.lock_exclusive(Path::new("lock")).is_err());
+        drop(held);
+        let reopened = root.lock_exclusive(Path::new("lock")).unwrap();
+        assert!(root.lock_exclusive(Path::new("lock")).is_err());
+        drop(reopened);
+        assert!(world.path().join("lock").is_file());
+    }
+
+    #[test]
+    fn direct_io_directory_comparison_distinguishes_unrelated_objects() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("a")).unwrap();
+        std::fs::create_dir(world.path().join("b")).unwrap();
+        let a = SafeDir::open(&world.path().join("a"), false).unwrap();
+        let reopened = SafeDir::open(&world.path().join("a"), false).unwrap();
+        let b = SafeDir::open(&world.path().join("b"), false).unwrap();
+        assert!(platform::same_dir(&a.handle, &reopened.handle).unwrap());
+        assert!(!platform::same_dir(&a.handle, &b.handle).unwrap());
+    }
+
+    #[test]
+    fn direct_io_identity_is_stable_for_handles_and_hard_links() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("child")).unwrap();
+        std::fs::write(world.path().join("source"), b"abc").unwrap();
+        std::fs::hard_link(world.path().join("source"), world.path().join("alias")).unwrap();
+        std::fs::write(world.path().join("unrelated"), b"abc").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let reopened = SafeDir::open(world.path(), false).unwrap();
+        let child = root.open_existing_dir(Path::new("child")).unwrap();
+        assert_eq!(root.identity().unwrap(), reopened.identity().unwrap());
+        assert_ne!(root.identity().unwrap(), child.identity().unwrap());
+        let source = root.read_regular(Path::new("source")).unwrap();
+        let alias = root.read_regular(Path::new("alias")).unwrap();
+        let unrelated = root.read_regular(Path::new("unrelated")).unwrap();
+        assert_eq!(
+            file_identity(&source).unwrap(),
+            file_identity(&alias).unwrap()
+        );
+        assert_ne!(
+            file_identity(&source).unwrap(),
+            file_identity(&unrelated).unwrap()
+        );
+        assert_eq!(
+            file_identity(&source).unwrap(),
+            file_identity(&source).unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_io_existing_directory_open_never_creates_or_accepts_files() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::write(world.path().join("file"), b"KEEP").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        assert!(root.open_existing_dir(Path::new("missing/nested")).is_err());
+        assert!(!world.path().join("missing").exists());
+        assert!(root.open_existing_dir(Path::new("file")).is_err());
+        assert!(root.open_existing_dir(Path::new("../outside")).is_err());
+    }
+
+    #[test]
+    fn direct_io_enumeration_returns_child_names_without_creating_entries() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("child")).unwrap();
+        std::fs::write(world.path().join("file"), b"KEEP").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let mut names = root.list_entries().unwrap();
+        names.sort();
+        assert_eq!(names, vec![OsString::from("child"), OsString::from("file")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_handle_copy_rewinds_hashes_and_retains_source() {
+        use std::io::{Seek, SeekFrom};
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("destination")).unwrap();
+        std::fs::write(world.path().join("source"), b"abc").unwrap();
+        let source_root = SafeDir::open(world.path(), false).unwrap();
+        let destination = source_root
+            .open_existing_dir(Path::new("destination"))
+            .unwrap();
+        let mut source = source_root.read_regular(Path::new("source")).unwrap();
+        source.seek(SeekFrom::Start(1)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut progress = CopyProgress {
+            bytes: 0,
+            cancel_after_chunk: None,
+        };
+        let digest = destination
+            .copy_from_handle_new(
+                &mut source,
+                Path::new("nested/copied"),
+                &cancel,
+                &mut progress,
+            )
+            .unwrap();
+        assert_eq!(
+            digest,
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("destination/nested/copied")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(std::fs::read(world.path().join("source")).unwrap(), b"abc");
+        assert_eq!(progress.bytes, 3);
+        let mut names = destination
+            .open_existing_dir(Path::new("nested"))
+            .unwrap()
+            .list_entries()
+            .unwrap();
+        names.sort();
+        assert_eq!(names, vec![OsString::from("copied")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_handle_copy_refuses_existing_target_and_keeps_unknown_temporary() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("destination")).unwrap();
+        std::fs::write(world.path().join("source"), b"NEW").unwrap();
+        std::fs::write(world.path().join("destination/occupied"), b"KEEP").unwrap();
+        std::fs::write(
+            world.path().join("destination/unknown.bftool-part"),
+            b"UNKNOWN",
+        )
+        .unwrap();
+        let source_root = SafeDir::open(world.path(), false).unwrap();
+        let destination = source_root
+            .open_existing_dir(Path::new("destination"))
+            .unwrap();
+        let mut source = source_root.read_regular(Path::new("source")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut progress = CopyProgress {
+            bytes: 0,
+            cancel_after_chunk: None,
+        };
+        assert!(destination
+            .copy_from_handle_new(&mut source, Path::new("occupied"), &cancel, &mut progress,)
+            .is_err());
+        assert_eq!(
+            std::fs::read(world.path().join("destination/occupied")).unwrap(),
+            b"KEEP"
+        );
+        assert_eq!(std::fs::read(world.path().join("source")).unwrap(), b"NEW");
+        assert_eq!(
+            std::fs::read(world.path().join("destination/unknown.bftool-part")).unwrap(),
+            b"UNKNOWN"
+        );
+        let mut names = destination.list_entries().unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                OsString::from("occupied"),
+                OsString::from("unknown.bftool-part")
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_io_cancelled_handle_copy_never_publishes_or_leaves_temporary_files() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("destination")).unwrap();
+        let payload = vec![b'x'; 2 * 1024 * 1024 + 1];
+        std::fs::write(world.path().join("source"), &payload).unwrap();
+        let source_root = SafeDir::open(world.path(), false).unwrap();
+        let destination = source_root
+            .open_existing_dir(Path::new("destination"))
+            .unwrap();
+        let mut source = source_root.read_regular(Path::new("source")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut progress = CopyProgress {
+            bytes: 0,
+            cancel_after_chunk: Some(&cancel),
+        };
+        assert!(destination
+            .copy_from_handle_new(&mut source, Path::new("cancelled"), &cancel, &mut progress,)
+            .is_err());
+        assert!(destination.list_entries().unwrap().is_empty());
+        assert_eq!(std::fs::read(world.path().join("source")).unwrap(), payload);
+        assert!(progress.bytes > 0 && progress.bytes < payload.len() as u64);
+    }
+
+    #[test]
+    fn direct_io_pre_cancelled_handle_copy_does_not_create_parent_directories() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("destination")).unwrap();
+        std::fs::write(world.path().join("source"), b"abc").unwrap();
+        let source_root = SafeDir::open(world.path(), false).unwrap();
+        let destination = source_root
+            .open_existing_dir(Path::new("destination"))
+            .unwrap();
+        let mut source = source_root.read_regular(Path::new("source")).unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut progress = CopyProgress {
+            bytes: 0,
+            cancel_after_chunk: None,
+        };
+        assert!(destination
+            .copy_from_handle_new(
+                &mut source,
+                Path::new("missing/copied"),
+                &cancel,
+                &mut progress,
+            )
+            .is_err());
+        assert!(destination.list_entries().unwrap().is_empty());
+        assert_eq!(progress.bytes, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "new direct copy fails closed on Linux until held-object mutation exists"]
+    fn direct_io_handle_copy_reads_held_source_after_visible_name_changes() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("destination")).unwrap();
+        std::fs::write(world.path().join("source"), b"abc").unwrap();
+        let source_root = SafeDir::open(world.path(), false).unwrap();
+        let destination = source_root
+            .open_existing_dir(Path::new("destination"))
+            .unwrap();
+        let mut source = source_root.read_regular(Path::new("source")).unwrap();
+        std::fs::rename(
+            world.path().join("source"),
+            world.path().join("held-source"),
+        )
+        .unwrap();
+        std::fs::write(world.path().join("source"), b"DECOY").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut progress = CopyProgress {
+            bytes: 0,
+            cancel_after_chunk: None,
+        };
+        let digest = destination
+            .copy_from_handle_new(&mut source, Path::new("copied"), &cancel, &mut progress)
+            .unwrap();
+        assert_eq!(
+            digest,
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("destination/copied")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("held-source")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            std::fs::read(world.path().join("source")).unwrap(),
+            b"DECOY"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_io_linux_owned_mutations_fail_closed_without_touching_files_or_names() {
+        let world = tempfile::tempdir().unwrap();
+        std::fs::create_dir(world.path().join("destination")).unwrap();
+        std::fs::write(world.path().join("source"), b"abc").unwrap();
+        let root = SafeDir::open(world.path(), false).unwrap();
+        let destination = root.open_existing_dir(Path::new("destination")).unwrap();
+        let mut source = root.read_regular(Path::new("source")).unwrap();
+        source.seek(SeekFrom::Start(1)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut progress = CopyProgress {
+            bytes: 0,
+            cancel_after_chunk: None,
+        };
+        let error = destination
+            .copy_from_handle_new(
+                &mut source,
+                Path::new("missing/copied"),
+                &cancel,
+                &mut progress,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(source.stream_position().unwrap(), 1);
+        assert!(destination.list_entries().unwrap().is_empty());
+        let error = root
+            .rename_owned_entry_to(
+                Path::new("source"),
+                &destination,
+                Path::new("copied"),
+                &file_identity(&source).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(destination.list_entries().unwrap().is_empty());
+        assert_eq!(std::fs::read(world.path().join("source")).unwrap(), b"abc");
+        assert_eq!(progress.bytes, 0);
+    }
+
     #[test]
     fn traversal_and_existing_targets_are_rejected() {
         let temp = tempfile::tempdir().unwrap();

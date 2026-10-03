@@ -105,13 +105,13 @@ pub fn apply(ctx: &egui::Context) -> String {
     style.visuals.extreme_bg_color = TRACK;
     style.visuals.override_text_color = Some(TEXT_BODY);
     style.visuals.widgets.noninteractive.bg_fill = CARD;
-    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
     style.visuals.widgets.inactive.bg_fill = CARD;
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
     style.visuals.widgets.hovered.bg_fill = PRIMARY_SOFT;
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, PRIMARY_BORDER);
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, PRIMARY_BORDER);
     style.visuals.widgets.active.bg_fill = PRIMARY_SOFT;
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, PRIMARY);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, PRIMARY);
 
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
@@ -218,7 +218,7 @@ pub fn section_title(ui: &mut egui::Ui, title: &str) {
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::default()
         .fill(CARD)
-        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .stroke(egui::Stroke::new(1.0, BORDER))
         .corner_radius(egui::CornerRadius::same(RADIUS))
         .inner_margin(egui::Margin::same(12))
         .show(ui, add)
@@ -229,7 +229,7 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 pub fn card_subtle<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::default()
         .fill(BG)
-        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .stroke(egui::Stroke::new(1.0, BORDER))
         .corner_radius(egui::CornerRadius::same(RADIUS))
         .inner_margin(egui::Margin::same(10))
         .show(ui, add)
@@ -245,7 +245,7 @@ pub fn callout(ui: &mut egui::Ui, color: Color32, soft: Color32, text: &str) {
 pub fn callout_with_tag(ui: &mut egui::Ui, color: Color32, soft: Color32, tag: &str, text: &str) {
     egui::Frame::default()
         .fill(soft)
-        .stroke(egui::Stroke::new(1.0_f32, color))
+        .stroke(egui::Stroke::new(1.0, color))
         .corner_radius(egui::CornerRadius::same(RADIUS))
         .inner_margin(egui::Margin::symmetric(12, 9))
         .show(ui, |ui| {
@@ -369,6 +369,6 @@ pub fn btn_secondary(text: &str) -> egui::Button<'static> {
             .size(13.0)
             .color(TEXT_BODY),
     )
-    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+    .stroke(egui::Stroke::new(1.0, BORDER))
     .corner_radius(RADIUS)
 }

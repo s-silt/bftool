@@ -1,6 +1,7 @@
 //! 操作管道：阶段化硬闸 / 软提示 + archive 切片。
 
 pub mod archive;
+pub mod backup;
 pub mod init;
 pub mod stages;
 pub mod watch;

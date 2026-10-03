@@ -507,6 +507,8 @@ dependencies = [
  "bftool-core",
  "eframe",
  "rfd",
+ "sysinfo",
+ "walkdir",
  "winresource",
 ]
 

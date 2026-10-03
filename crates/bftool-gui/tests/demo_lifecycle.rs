@@ -21,6 +21,7 @@ fn fixture() -> (App, egui::Context) {
         rx: None,
         task: None,
         plan_task: None,
+        file_backup_plan_task: None,
         find_task: None,
         task_started: None,
         last_summary: None,
@@ -34,6 +35,8 @@ fn fixture() -> (App, egui::Context) {
         verify_ui: Default::default(),
         settings_ui: Default::default(),
         watch_ui: Default::default(),
+        backup_ui: Default::default(),
+        tasks_ui: Default::default(),
         status_cache: None,
         screenshot_runner: None,
     };
