@@ -15,7 +15,7 @@ service::list_backup_history_with_cancel(&Path, &AtomicBool) -> anyhow::Result<V
 service::resume_backup(&Path, job_id: &str, &AtomicBool, &dyn Reporter) -> anyhow::Result<BackupSummary>;
 ```
 
-BackupRequest 实际字段为 source: SourceSelection::File(PathBuf) 或 Directory(PathBuf)、target_dir: PathBuf、conflict: ConflictPolicy::KeepBoth。
+BackupRequest 实际字段为 source: SourceSelection::File(PathBuf) 或 Directory(PathBuf)、target_dir: PathBuf、conflict: ConflictPolicy::KeepBoth，以及可选 directory_options: Option<DirectoryOptions>。
 BackupPlan 执行绑定私有；view() 提供 job_id、destination_name、selected_target、entries、counts.files/directories、bytes、conflicts、issues。条目含 relative_path、File/Directory、bytes、sha256、identity、modified。request() 返回不可变的实际请求。
 
 BackupSummary 有 outcome: Completed/Cancelled/Failed、published、copied、verified、skipped_verified、failed、bytes、issues。published 只在经过验证且持久 Completed 日志确认后为 true；false 也不能证明最终路径不存在。
@@ -58,3 +58,19 @@ Live 校验工作结果为 `ExecutionResult::PlainVerification { target: PathBuf
 恢复仍是文件级：已记录 staging 文件须独立验证身份和 SHA-256 才可跳过；Publishing 且 stage 为空时核对完整可见 payload，之后追加 Completed。创建/发布 payload 和收据记录之间崩溃留下无收据对象时保留并停止；不自动删除孤儿。检查点临时残留、断号、未知文件、内容/身份变化均拒绝恢复。若发布后 checkpoint 失败，错误保留真实部分计数且 `published=false`，不宣称可见 payload 一定不存在。
 
 增量格式以总路径和收据字节 B、记录数 n 计，元数据存储及固定次数全量审计读取为 O(B)，文件打开次数 O(n)，索引/名称排序校验为 O(n log n)。每追加不再 clone/validate 全部收据，也不重读历史前缀。每个目标的历史/校验只加载各任务一次，避免跨任务二次放大。元数据读取和摘要每 64 KiB 检查取消；链重构、名称枚举、任务加载、收据校验逐项检查。GUI 历史线程调用新可取消 facade；原 list_backup_history 保留为无取消的兼容包装。计划容量仅计 payload，metadata 和文件系统分配开销明确未知；0 字节 payload 不能作为空间充足保证。文件 sync 和 Windows rename 不提供断电/热拔插/恶意任意修改下的快照或耐久性保证。最终构建、Clippy、安全套件和针对修复快照的审查结果须另外记录；此规范不是发布批准。
+
+## 文件夹层级与后缀规则（manifest v2）
+
+新请求必须使用 `BackupRequest::new(source, target_dir)`；它设置 KeepBoth 和 `Some(DirectoryOptions::default())`。`DirectoryOptions` 包含 `recursive: bool`、`extensions: Option<Vec<String>>`、`include_extensionless: bool`；默认 `false / None / true`。默认仅枚举所选文件夹根层，根目录保留，只选根层普通文件。子目录仅分类，不打开、不枚举其内容，也不计入目录数；修改被排除子目录的内容不影响浅层计划。
+
+`parse_extensions(&str) -> anyhow::Result<Vec<String>>` 接受逗号、分号、空白分隔，以及一个可选前导点，转换小写后排序去重。空输入返回空列表。总输入最多 32768 字节，在分词前检查。空的逗号/分号项、内部点、路径、通配符、冒号、控制字符及字母数字/下划线/短横线以外字符均拒绝；单项最多 64 字符/128 字节，最多 128 个不同后缀。规范化后仍须满足同一限制。`DirectoryOptions::canonicalized()` 验证整个规则，计划只规范化一次，并将 `Some(canonical_options)` 保存到私有请求快照。
+
+`extensions: None` 匹配所有非空后缀；`Some(vec)` 仅匹配所选最终后缀。无后缀文件由 `include_extensionless` 控制；`.hidden` 视为无后缀，`a.tar.gz` 的后缀是 `gz`，`A.ZIP` 匹配 `zip`。选择 `.tar`、`.zip` 时 GUI 应设置 `Some(["tar", "zip"])`，并按用户选项设置是否包含无后缀文件。显式单文件选择忽略文件夹规则，计划中的规则规范化为默认值，连不合法的文件夹筛选文本也不影响已选单文件。
+
+只有显式 `recursive: true` 才递归。递归筛选保留匹配文件所需目录，移除没有匹配文件的空白或无关子树；递归且未筛选时保留所有目录，包括空目录。被排除文件不读取内容、不计算 hash。重新校验和恢复使用已记录规则，新增匹配文件或已选文件的路径、身份、大小、时间、内容变化仍令旧计划失效。
+
+筛选得到 0 个文件时计划显示 0 文件、0 字节及明确 issue；执行在创建任何目标元数据之前报错。未筛选的空文件夹可保留根目录。GUI 每个目录分别保存规则；预览签名应包含规则，修改规则必须重新计划。
+
+新 immutable manifest 的 `version` 为 2，必须显式包含非 null、规范化的 `request.directory_options`。载入校验必须验证浅层深度、每个文件符合记录后缀、筛选集非空及目录确实被匹配文件需要，并维持既有身份、路径、hash、ownership、receipt、no-replace 检查。缺失或 null 规则的版本 2 manifest 拒绝。
+
+旧版本 1 manifest 中缺失或 null 的规则保持 `DirectoryOptions::legacy()`（递归、全部后缀、含无后缀）。`BackupRequest` 的 serde 缺省字段为 `None`，`effective_directory_options()` 返回已记录规则或 legacy；不要把缺省反序列化请求用于新的 GUI 请求。旧 manifest 只读兼容，恢复不会改写它。版本 1 不允许引入新的筛选含义。历史 `BackupHistoryRecord.directory_options` 返回有效规则，GUI 可展示旧递归行为与新请求行为。

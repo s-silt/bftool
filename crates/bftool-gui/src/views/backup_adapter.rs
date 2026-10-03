@@ -2,7 +2,8 @@
 use super::*;
 use anyhow::{bail, Context};
 use bftool_core::pipeline::backup::{
-    BackupEntryKind, BackupOutcome, BackupPlan, BackupRequest, ConflictPolicy, SourceSelection,
+    BackupEntryKind, BackupOutcome, BackupPlan, BackupRequest, ConflictPolicy, DirectoryOptions,
+    SourceSelection,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,6 +67,11 @@ fn plan_batch(
             },
             target_dir: target.clone(),
             conflict: ConflictPolicy::KeepBoth,
+            directory_options: Some(if source.is_dir {
+                source.folder_filter.directory_options()?
+            } else {
+                DirectoryOptions::default()
+            }),
         };
         let plan = bftool_core::service::plan_backup(&request, cancel, reporter)?;
         let view = plan.view();
@@ -80,7 +86,7 @@ fn plan_batch(
             .context("文件计数溢出")?;
         bytes = bytes.checked_add(view.bytes).context("字节计数溢出")?;
         conflicts += view.conflicts.len();
-        for entry in &view.entries {
+        for entry in view.entries.iter().filter(|_| !has_no_matches(&plan)) {
             let root = view.selected_target.join(&view.destination_name);
             // A selected file has an empty relative path. Joining it would append a
             // directory separator and misrepresent the actual published file on Windows.
@@ -206,6 +212,13 @@ pub(crate) fn pump(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+pub(super) fn has_no_matches(plan: &BackupPlan) -> bool {
+    let options = plan.request().effective_directory_options();
+    matches!(plan.request().source, SourceSelection::Directory(_))
+        && (options.extensions.is_some() || !options.include_extensionless)
+        && plan.view().counts.files == 0
+}
+
 pub(super) fn start(app: &mut App) {
     app.backup_ui.check_invalidate_plan();
     if app.backup_ui.current_signature() != app.backup_ui.core_signature {
@@ -227,11 +240,19 @@ pub(super) fn start(app: &mut App) {
     {
         return;
     }
+    if plans.iter().any(has_no_matches) || app.backup_ui.filter_error().is_some() {
+        apply_outcome(
+            app,
+            failure("没有匹配文件，整个批次未开始；请修改筛选后重新预览。".into()),
+        );
+        return;
+    }
     app.backup_ui.is_running = true;
     app.backup_ui.stopping_requested = false;
     app.backup_ui.last_outcome = None;
     app.backup_ui.done_files = 0;
     app.backup_ui.transferred_bytes = 0;
+    app.backup_ui.recovery_totals_unknown = false;
     app.backup_ui.total_files = plans.iter().map(|p| p.view().counts.files as usize).sum();
     app.backup_ui.total_bytes = plans.iter().map(|p| p.view().bytes).sum();
     app.backup_ui.speed_bps = None;
@@ -330,6 +351,9 @@ fn run_batch(
     reporter: &dyn bftool_core::reporter::Reporter,
 ) -> BackupOutcomeSummary {
     let mut result = BatchResult::default();
+    if plans.iter().any(has_no_matches) {
+        return failure("没有匹配文件，整个批次未开始。".into());
+    }
     for plan in plans {
         if cancel.load(Ordering::Relaxed) {
             result.stopped = true;
@@ -367,6 +391,14 @@ pub(crate) fn resume(app: &mut App, job_id: String) {
     app.backup_ui.eta_secs = None;
     app.backup_ui.done_files = 0;
     app.backup_ui.transferred_bytes = 0;
+    app.backup_ui.total_files = 0;
+    app.backup_ui.total_bytes = 0;
+    app.backup_ui.current_file.clear();
+    app.backup_ui.recovery_totals_unknown = true;
+    app.last_summary = None;
+    if let Ok(mut progress) = app.progress.lock() {
+        *progress = crate::reporter::ProgressState::default();
+    }
     app.task_kind = Some(crate::app::TaskKind::Backup);
     app.task_started = Some(std::time::Instant::now());
     let (tx, rx) = mpsc::channel();
@@ -471,6 +503,619 @@ mod tests {
     }
 
     #[test]
+    fn folder_filter_gui_new_folder_defaults_to_shallow_worker_snapshot() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let folder = root.0.join("archives");
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        std::fs::write(folder.join("top.zip"), b"root").unwrap();
+        std::fs::write(folder.join("nested/deep.zip"), b"nested").unwrap();
+        add_source_path(&mut app, folder.clone());
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        let display = app.backup_ui.plan.as_ref().unwrap();
+        assert_eq!(
+            display.pending_count, 1,
+            "new GUI selection must be shallow"
+        );
+        assert_eq!(display.pending_bytes, 4);
+        start_backup_action(&mut app);
+        let summary = finish_run(&mut app);
+        assert_eq!(summary.kind, BackupOutcomeKind::Success);
+        assert!(root.0.join("target/archives/top.zip").is_file());
+        assert!(!root.0.join("target/archives/nested").exists());
+        assert!(folder.join("nested/deep.zip").is_file());
+    }
+
+    fn filtered_folder(
+        app: &mut App,
+        path: PathBuf,
+        suffixes: &str,
+        recursive: bool,
+        extensionless: bool,
+    ) {
+        add_source_folder(app, path);
+        let index = app.backup_ui.sources.len() - 1;
+        set_folder_filter(
+            app,
+            index,
+            FolderFilter {
+                include_subfolders: recursive,
+                enabled: true,
+                extensions_input: suffixes.into(),
+                include_extensionless: extensionless,
+            },
+        );
+    }
+
+    #[test]
+    fn folder_filter_gui_independent_rules_selected_file_copy_verify_history() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let archives = root.0.join("archives");
+        let photos = root.0.join("photos");
+        std::fs::create_dir_all(archives.join("nested")).unwrap();
+        std::fs::create_dir(&photos).unwrap();
+        for (name, bytes) in [
+            ("A.TAR", &b"tar"[..]),
+            ("b.zip", &b"zip!"[..]),
+            ("c.txt", &b"txt"[..]),
+            ("a.tar.gz", &b"gz"[..]),
+            ("nested/deep.zip", &b"deep"[..]),
+        ] {
+            std::fs::write(archives.join(name), bytes).unwrap();
+        }
+        std::fs::write(photos.join("one.JPG"), b"jpg").unwrap();
+        std::fs::write(photos.join("README"), b"plain").unwrap();
+        std::fs::write(photos.join("two.png"), b"png").unwrap();
+        let single = root.0.join("single.txt");
+        std::fs::write(&single, b"single").unwrap();
+        filtered_folder(&mut app, archives.clone(), ".tar, ZIP", false, false);
+        filtered_folder(&mut app, photos.clone(), "jpg", false, true);
+        add_source_path(&mut app, single.clone());
+        // A selected ordinary file bypasses a forged invalid folder draft.
+        app.backup_ui.sources[2].folder_filter = FolderFilter {
+            enabled: true,
+            extensions_input: "../bad".into(),
+            ..Default::default()
+        };
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        assert_eq!(app.backup_ui.plan.as_ref().unwrap().pending_count, 5);
+        assert_eq!(app.backup_ui.plan.as_ref().unwrap().pending_bytes, 21);
+        assert_eq!(app.backup_ui.sources[0].size_bytes, 7);
+        let plans = app.backup_ui.core_plans.as_ref().unwrap();
+        assert_eq!(
+            plans[0].request().effective_directory_options().extensions,
+            Some(vec!["tar".into(), "zip".into()])
+        );
+        assert_eq!(
+            plans[2].request().directory_options,
+            Some(DirectoryOptions::default())
+        );
+        start_backup_action(&mut app);
+        let summary = finish_run(&mut app);
+        assert_eq!(summary.completed_items, 5);
+        assert_eq!(summary.completed_bytes, 21);
+        assert_eq!(summary.kind, BackupOutcomeKind::Success);
+        let target = root.0.join("target");
+        assert!(!target.join("archives/nested").exists());
+        assert!(!target.join("archives/c.txt").exists());
+        assert!(!target.join("archives/a.tar.gz").exists());
+        assert!(!target.join("photos/two.png").exists());
+        assert_eq!(std::fs::read(target.join("single.txt")).unwrap(), b"single");
+        let report = bftool_core::service::verify_backup(
+            &target,
+            &AtomicBool::new(false),
+            &bftool_core::reporter::NoopReporter,
+        )
+        .unwrap();
+        assert_eq!(report.checked, 5);
+        assert_eq!(report.bad, 0);
+        crate::views::tasks::refresh_history(&mut app);
+        await_history(&mut app);
+        assert_eq!(app.tasks_ui.records.len(), 3);
+        let record = app
+            .tasks_ui
+            .records
+            .iter()
+            .find(|r| r.source.path().file_name() == archives.file_name())
+            .unwrap();
+        assert!(!record.directory_options.recursive);
+        assert_eq!(
+            record.directory_options.extensions,
+            Some(vec!["tar".into(), "zip".into()])
+        );
+        assert!(!record.directory_options.include_extensionless);
+        // Render an actual persisted producer/consumer record, not a fabricated model.
+        app.tasks_ui.records = vec![record.clone()];
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.families.insert(
+            egui::FontFamily::Name("semibold".into()),
+            fonts.families[&egui::FontFamily::Proportional].clone(),
+        );
+        ctx.set_fonts(fonts);
+        let painted = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, 1000.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| crate::views::tasks::ui(&mut app, ui));
+            },
+        );
+        let text: Vec<_> = painted
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(value) => Some(value.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.iter().any(|label| label.contains("仅当前层")
+                && label.contains(".tar, .zip")
+                && label.contains("无后缀文件：排除")),
+            "actual history must display saved folder rules"
+        );
+        assert_eq!(
+            std::fs::read(archives.join("nested/deep.zip")).unwrap(),
+            b"deep"
+        );
+    }
+
+    #[test]
+    fn folder_filter_gui_recursion_opt_in_preserves_only_selected_structure() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let source = root.0.join("recursive");
+        std::fs::create_dir_all(source.join("nested/deeper")).unwrap();
+        std::fs::create_dir(source.join("empty")).unwrap();
+        std::fs::write(source.join("nested/deeper/a.zip"), b"zip").unwrap();
+        std::fs::write(source.join("nested/no.txt"), b"txt").unwrap();
+        filtered_folder(&mut app, source, "zip", true, false);
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        assert_eq!(app.backup_ui.plan.as_ref().unwrap().pending_count, 1);
+        start_backup_action(&mut app);
+        assert_eq!(finish_run(&mut app).kind, BackupOutcomeKind::Success);
+        assert!(root
+            .0
+            .join("target/recursive/nested/deeper/a.zip")
+            .is_file());
+        assert!(!root.0.join("target/recursive/empty").exists());
+        assert!(!root.0.join("target/recursive/nested/no.txt").exists());
+    }
+
+    #[test]
+    fn folder_filter_gui_zero_match_mixed_batch_rejects_forged_display_without_writes() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let single = root.0.join("first.txt");
+        std::fs::write(&single, b"file").unwrap();
+        add_source_path(&mut app, single);
+        let source = root.0.join("zero");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"txt").unwrap();
+        filtered_folder(&mut app, source.clone(), "zip", false, false);
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        let display = app.backup_ui.plan.as_ref().unwrap();
+        assert_eq!(display.pending_count, 1);
+        assert_eq!(display.pending_bytes, 4);
+        assert!(display
+            .items
+            .iter()
+            .all(|i| !i.source_path.starts_with(&source)));
+        assert!(app.backup_ui.has_no_matches());
+        app.backup_ui.plan.as_mut().unwrap().pending_count = 99;
+        start_backup_action(&mut app);
+        assert!(app.task.is_none());
+        assert!(!app.backup_ui.is_running);
+        assert_eq!(std::fs::read_dir(root.0.join("target")).unwrap().count(), 0);
+        // Private batch runner must also reject before publishing its matching first source.
+        let outcome = run_batch(
+            app.backup_ui.core_plans.as_ref().unwrap(),
+            &AtomicBool::new(false),
+            &bftool_core::reporter::NoopReporter,
+        );
+        assert_eq!(outcome.kind, BackupOutcomeKind::Failed);
+        assert_eq!(outcome.completed_items, 0);
+        assert_eq!(std::fs::read_dir(root.0.join("target")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn folder_filter_gui_rule_edits_invalidate_counts_tokens_and_block_invalid_drafts() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let source = root.0.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.zip"), b"zip").unwrap();
+        filtered_folder(&mut app, source, "zip", false, false);
+        for field in 0..4 {
+            set_folder_filter(
+                &mut app,
+                0,
+                FolderFilter {
+                    enabled: true,
+                    extensions_input: "zip".into(),
+                    ..Default::default()
+                },
+            );
+            generate_plan_action(&mut app);
+            await_plan(&mut app);
+            assert_eq!(app.backup_ui.sources[0].size_bytes, 3);
+            let mut draft = app.backup_ui.sources[0].folder_filter.clone();
+            match field {
+                0 => draft.include_subfolders = true,
+                1 => draft.enabled = false,
+                2 => draft.extensions_input = "ZIP".into(),
+                _ => draft.include_extensionless = true,
+            }
+            set_folder_filter(&mut app, 0, draft);
+            assert!(app.backup_ui.plan.is_none());
+            assert!(app.backup_ui.core_plans.is_none());
+            assert_eq!(app.backup_ui.sources[0].size_bytes, 0);
+            start_backup_action(&mut app);
+            assert!(app.task.is_none());
+        }
+        let mut draft = app.backup_ui.sources[0].folder_filter.clone();
+        draft.extensions_input = "../bad".into();
+        set_folder_filter(&mut app, 0, draft);
+        generate_plan_action(&mut app);
+        assert!(app.file_backup_plan_task.is_none());
+        assert!(app
+            .backup_ui
+            .last_outcome
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("suffix"));
+        // Direct worker invocation has the same validation for programmatic callers.
+        generate(&mut app);
+        await_plan(&mut app);
+        assert!(app.backup_ui.plan.is_none());
+        assert_eq!(std::fs::read_dir(root.0.join("target")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn folder_filter_gui_busy_edits_inert_and_forged_inflight_edit_discarded() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let source = root.0.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.zip"), b"zip").unwrap();
+        filtered_folder(&mut app, source, "zip", false, false);
+        generate_plan_action(&mut app);
+        let old = app.backup_ui.current_signature();
+        set_folder_filter(&mut app, 0, FolderFilter::default());
+        assert_eq!(old, app.backup_ui.current_signature());
+        // External state mutation during the actual producer/consumer task loses its token.
+        app.backup_ui.sources[0].folder_filter.include_subfolders = true;
+        await_plan(&mut app);
+        assert!(app.backup_ui.plan.is_none());
+        assert!(app.backup_ui.core_plans.is_none());
+        start_backup_action(&mut app);
+        assert!(app.task.is_none());
+        assert_eq!(std::fs::read_dir(root.0.join("target")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn folder_filter_gui_cancel_resume_history_reuses_saved_subset_after_ui_change() {
+        use bftool_core::reporter::{LogLevel, NoopReporter, ProgressHandle, Reporter};
+        struct CancelBeforePublish<'a>(&'a AtomicBool);
+        impl Reporter for CancelBeforePublish<'_> {
+            fn log(&self, _: LogLevel, message: &str) {
+                if message == "Verifying direct backup" {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            fn progress_bytes(&self, label: &str, bytes: u64) -> Box<dyn ProgressHandle> {
+                NoopReporter.progress_bytes(label, bytes)
+            }
+        }
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let source = root.0.join("saved");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("A.ZIP"), b"zip").unwrap();
+        std::fs::write(source.join("b.txt"), b"txt").unwrap();
+        std::fs::write(source.join("nested/deep.zip"), b"deep").unwrap();
+        filtered_folder(&mut app, source.clone(), "zip", false, false);
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        let cancel = AtomicBool::new(false);
+        let staged = bftool_core::service::run_backup_plan(
+            &app.backup_ui.core_plans.as_ref().unwrap()[0],
+            &cancel,
+            &CancelBeforePublish(&cancel),
+        )
+        .unwrap();
+        assert_eq!(staged.outcome, BackupOutcome::Cancelled);
+        assert!(!staged.published);
+        assert_eq!(staged.copied, 1);
+        set_folder_filter(
+            &mut app,
+            0,
+            FolderFilter {
+                include_subfolders: true,
+                enabled: true,
+                extensions_input: "txt".into(),
+                ..Default::default()
+            },
+        );
+        std::fs::write(source.join("b.txt"), b"changed excluded").unwrap();
+        std::fs::write(source.join("nested/deep.zip"), b"changed excluded nested").unwrap();
+        crate::views::tasks::refresh_history(&mut app);
+        await_history(&mut app);
+        let record = &app.tasks_ui.records[0];
+        assert!(!record.completed);
+        assert!(!record.directory_options.recursive);
+        assert_eq!(
+            record.directory_options.extensions,
+            Some(vec!["zip".into()])
+        );
+        let job = record.job_id.clone();
+        resume(&mut app, job);
+        let outcome = finish_run(&mut app);
+        assert_eq!(outcome.kind, BackupOutcomeKind::Success);
+        assert_eq!(outcome.completed_items, 1);
+        assert_eq!(
+            std::fs::read(root.0.join("target/saved/A.ZIP")).unwrap(),
+            b"zip"
+        );
+        assert!(!root.0.join("target/saved/b.txt").exists());
+        assert!(!root.0.join("target/saved/nested").exists());
+        let verify = bftool_core::service::verify_backup(
+            &root.0.join("target"),
+            &AtomicBool::new(false),
+            &NoopReporter,
+        )
+        .unwrap();
+        assert_eq!(verify.checked, 1);
+        assert_eq!(verify.bad, 0);
+        crate::views::tasks::refresh_history(&mut app);
+        await_history(&mut app);
+        assert!(app.tasks_ui.records[0].completed);
+        assert_eq!(
+            app.tasks_ui.records[0].directory_options.extensions,
+            Some(vec!["zip".into()])
+        );
+    }
+
+    #[test]
+    fn folder_filter_gui_root_only_zero_matches_has_zero_preview_no_success_row() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let source = root.0.join("zero");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"txt").unwrap();
+        filtered_folder(&mut app, source, "zip", false, false);
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        let preview = app.backup_ui.plan.as_ref().unwrap();
+        assert_eq!(preview.pending_count, 0);
+        assert_eq!(preview.pending_bytes, 0);
+        assert!(preview.items.is_empty());
+        assert!(app.backup_ui.has_no_matches());
+        start_backup_action(&mut app);
+        assert!(app.task.is_none());
+        assert_eq!(std::fs::read_dir(root.0.join("target")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn folder_filter_gui_extensionless_only_selection_and_unfiltered_empty_root() {
+        let root = SyntheticDir::new();
+        let mut app = app_for(&root);
+        let source = root.0.join("plain");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("README"), b"plain").unwrap();
+        std::fs::write(source.join("file.zip"), b"zip").unwrap();
+        std::fs::write(source.join("nested/NESTED"), b"nested").unwrap();
+        filtered_folder(&mut app, source, "", false, true);
+        let empty = root.0.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        add_source_folder(&mut app, empty);
+        generate_plan_action(&mut app);
+        await_plan(&mut app);
+        assert_eq!(app.backup_ui.plan.as_ref().unwrap().pending_count, 1);
+        assert!(!app.backup_ui.has_no_matches());
+        start_backup_action(&mut app);
+        assert_eq!(finish_run(&mut app).kind, BackupOutcomeKind::Success);
+        assert_eq!(
+            std::fs::read(root.0.join("target/plain/README")).unwrap(),
+            b"plain"
+        );
+        assert!(!root.0.join("target/plain/file.zip").exists());
+        assert!(!root.0.join("target/plain/nested").exists());
+        assert!(root.0.join("target/empty").is_dir());
+    }
+
+    fn rendered_recovery_labels(app: &mut App, backup_page: bool) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.families.insert(
+            egui::FontFamily::Name("semibold".into()),
+            fonts.families[&egui::FontFamily::Proportional].clone(),
+        );
+        ctx.set_fonts(fonts);
+        let painted = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if backup_page {
+                        super::super::render_running_card(app, ui);
+                    } else {
+                        crate::views::tasks::ui(app, ui);
+                    }
+                });
+            },
+        );
+        fn collect(shape: &egui::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(value) => labels.push(value.galley.text().into()),
+                egui::Shape::Vec(values) => {
+                    for value in values {
+                        collect(value, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut labels = Vec::new();
+        for shape in &painted.shapes {
+            collect(&shape.shape, &mut labels);
+        }
+        labels
+    }
+
+    fn resume_display_case(prior_batch: bool) {
+        use bftool_core::reporter::{LogLevel, NoopReporter, ProgressHandle, Reporter};
+        struct CancelBeforePublish<'a>(&'a AtomicBool);
+        impl Reporter for CancelBeforePublish<'_> {
+            fn log(&self, _: LogLevel, message: &str) {
+                if message == "Verifying direct backup" {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            fn progress_bytes(&self, label: &str, bytes: u64) -> Box<dyn ProgressHandle> {
+                NoopReporter.progress_bytes(label, bytes)
+            }
+        }
+        let root = SyntheticDir::new();
+        let mut original = app_for(&root);
+        let saved = root.0.join("saved");
+        std::fs::create_dir(&saved).unwrap();
+        std::fs::write(saved.join("one.zip"), b"saved zip").unwrap();
+        std::fs::write(saved.join("excluded.txt"), b"excluded").unwrap();
+        filtered_folder(&mut original, saved.clone(), "zip", false, false);
+        generate_plan_action(&mut original);
+        await_plan(&mut original);
+        let plan = &original.backup_ui.core_plans.as_ref().unwrap()[0];
+        let job = plan.view().job_id.clone();
+        let cancel = AtomicBool::new(false);
+        let staged =
+            bftool_core::service::run_backup_plan(plan, &cancel, &CancelBeforePublish(&cancel))
+                .unwrap();
+        assert!(!staged.published);
+        assert_eq!(staged.outcome, BackupOutcome::Cancelled);
+        drop(original);
+        let mut app = crate::app::tests::fixture();
+        app.backend = crate::backend::Backend::Live;
+        set_target_folder(&mut app, root.0.join("target"));
+        if prior_batch {
+            let prior = root.0.join("prior");
+            std::fs::create_dir(&prior).unwrap();
+            for name in ["a", "b", "c"] {
+                std::fs::write(prior.join(name), b"unrelated").unwrap();
+            }
+            add_source_folder(&mut app, prior);
+            generate_plan_action(&mut app);
+            await_plan(&mut app);
+            start_backup_action(&mut app);
+            assert_eq!(app.backup_ui.total_files, 3);
+            assert_eq!(finish_run(&mut app).kind, BackupOutcomeKind::Success);
+            app.backup_ui.current_file = "unrelated stale phase".into();
+            app.backup_ui.done_files = 3;
+            app.backup_ui.transferred_bytes = 27;
+            app.backup_ui.speed_bps = Some(42);
+            app.backup_ui.eta_secs = Some(9);
+        }
+        resume(&mut app, job);
+        // GUI state is read before pumping reporter updates, regardless of worker speed.
+        for backup_page in [true, false] {
+            let labels = rendered_recovery_labels(&mut app, backup_page);
+            assert!(
+                labels.iter().any(|s| s.contains("恢复任务：整项总量未知")),
+                "recovery card must not invent whole-job denominator: {labels:?}"
+            );
+            assert!(!labels.iter().any(|s| s.contains("0/0")
+                || s.contains("0/3")
+                || s.contains("unrelated stale phase")));
+        }
+        assert_eq!(app.backup_ui.total_files, 0);
+        assert_eq!(app.backup_ui.total_bytes, 0);
+        assert_eq!(app.backup_ui.done_files, 0);
+        assert_eq!(app.backup_ui.transferred_bytes, 0);
+        assert!(app.backup_ui.current_file.is_empty());
+        assert!(app.backup_ui.speed_bps.is_none());
+        assert!(app.backup_ui.eta_secs.is_none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !app.task.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let (progress_tx, _progress_rx) = mpsc::channel();
+        let actual_reporter =
+            crate::reporter::GuiReporter::new(progress_tx, Arc::clone(&app.progress));
+        let mut bytes =
+            actual_reporter.progress_bytes("trusted current-file reporter", 100 * 1024 * 1024);
+        bytes.inc(20 * 1024 * 1024);
+        pump(&mut app, &egui::Context::default());
+        assert_eq!(app.backup_ui.transferred_bytes, 20 * 1024 * 1024);
+        assert_eq!(app.backup_ui.total_bytes, 100 * 1024 * 1024);
+        for backup_page in [true, false] {
+            let labels = rendered_recovery_labels(&mut app, backup_page);
+            assert!(labels.iter().any(|s| s.contains("恢复任务：整项总量未知")
+                && s.contains("当前步骤字节")
+                && s.contains("20.0%")));
+            assert!(labels
+                .iter()
+                .any(|s| s.contains("trusted current-file reporter")));
+            assert!(!labels.iter().any(|s| s.contains("整批最终计数")));
+        }
+        bytes.finish();
+        let outcome = finish_run(&mut app);
+        assert_eq!(outcome.kind, BackupOutcomeKind::Success);
+        assert_eq!(outcome.completed_items, 1);
+        assert_eq!(std::fs::read(saved.join("one.zip")).unwrap(), b"saved zip");
+        assert_eq!(
+            std::fs::read(root.0.join("target/saved/one.zip")).unwrap(),
+            b"saved zip"
+        );
+        assert!(!root.0.join("target/saved/excluded.txt").exists());
+        // A subsequent normal start and demo keep their trusted known totals.
+        if !app.backup_ui.sources.is_empty() {
+            generate_plan_action(&mut app);
+            await_plan(&mut app);
+            start_backup_action(&mut app);
+            for backup_page in [true, false] {
+                let labels = rendered_recovery_labels(&mut app, backup_page);
+                assert!(labels.iter().any(|s| s.contains("0/3")));
+                assert!(!labels.iter().any(|s| s.contains("整项总量未知")));
+            }
+            assert_eq!(finish_run(&mut app).kind, BackupOutcomeKind::Success);
+        }
+        app.backend = crate::backend::Backend::Demo;
+        apply_demo_state(&mut app, DemoState::Running);
+        for backup_page in [true, false] {
+            let labels = rendered_recovery_labels(&mut app, backup_page);
+            assert!(labels.iter().any(|s| s.contains("48/120")));
+            assert!(!labels.iter().any(|s| s.contains("整项总量未知")));
+        }
+    }
+
+    #[test]
+    fn folder_filter_resume_fresh_session_marks_totals_unknown_in_both_cards() {
+        resume_display_case(false);
+    }
+
+    #[test]
+    fn folder_filter_resume_prior_batch_clears_stale_totals_in_both_cards() {
+        resume_display_case(true);
+    }
+
+    #[test]
     fn direct_integration_same_size_conflict_keeps_both_source_and_unknown_target() {
         let root = SyntheticDir::new();
         let mut app = app_for(&root);
@@ -529,6 +1174,7 @@ mod tests {
         std::fs::create_dir_all(folder.join("empty")).unwrap();
         std::fs::write(folder.join("file"), b"data").unwrap();
         add_source_path(&mut app, folder.clone());
+        app.backup_ui.sources[0].folder_filter.include_subfolders = true;
         add_source_path(&mut app, folder.join("file"));
         generate_plan_action(&mut app);
         await_plan(&mut app);

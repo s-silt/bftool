@@ -209,6 +209,7 @@ pub fn list_backup_history_with_cancel(
     for (_job, _stage, m, j) in load_jobs(&root, cancel)? {
         check_cancel(cancel)?;
         records.push(BackupHistoryRecord {
+            directory_options: m.request.effective_directory_options(),
             job_id: m.job_id,
             source: m.request.source,
             destination_name: m.destination_name,

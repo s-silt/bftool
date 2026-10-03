@@ -451,7 +451,7 @@ pub(super) fn create_job(
     let stage = job.create_new_dir(Path::new("stage"))?;
     let manifest = Manifest {
         magic: MAGIC.into(),
-        version: 1,
+        version: 2,
         job_id: plan.view.job_id.clone(),
         job_dir_id: job.identity()?,
         stage_id: stage.identity()?,
@@ -558,8 +558,21 @@ pub(super) fn require_empty_stage(stage: &SafeDir, cancel: &AtomicBool) -> Resul
 }
 pub(super) fn validate(m: &Manifest, j: &Journal, cancel: &AtomicBool) -> Result<()> {
     check_cancel(cancel)?;
-    if m.magic != MAGIC || j.magic != MAGIC || m.version != 1 || m.job_id != j.job_id {
+    if m.magic != MAGIC || j.magic != MAGIC || !matches!(m.version, 1 | 2) || m.job_id != j.job_id {
         bail!("Invalid backup manifest/journal header");
+    }
+    let options = m.request.effective_directory_options();
+    if m.version == 2 {
+        if m.request.directory_options.is_none() || options.canonicalized()? != options {
+            bail!("Version 2 manifest requires canonical folder options");
+        }
+        if matches!(m.request.source, SourceSelection::File(_))
+            && options != DirectoryOptions::default()
+        {
+            bail!("Selected-file manifest contains active folder options");
+        }
+    } else if m.request.directory_options.is_some() && options != DirectoryOptions::legacy() {
+        bail!("Version 1 manifest cannot introduce folder filtering");
     }
     valid_job_id(&m.job_id)?;
     safe_relative(&m.destination_name, false)?;
@@ -579,6 +592,18 @@ pub(super) fn validate(m: &Manifest, j: &Journal, cancel: &AtomicBool) -> Result
         check_cancel(cancel)?;
         entries_by_path.insert(entry.relative_path.clone(), entry);
         safe_relative(&entry.relative_path, true)?;
+        if m.version == 2 && matches!(m.request.source, SourceSelection::Directory(_)) {
+            if !options.recursive
+                && ((entry.kind == BackupEntryKind::Directory
+                    && !entry.relative_path.as_os_str().is_empty())
+                    || entry.relative_path.components().count() > 1)
+            {
+                bail!("Manifest entry violates shallow folder rule");
+            }
+            if entry.kind == BackupEntryKind::File && !options.matches_file(&entry.relative_path) {
+                bail!("Manifest file violates recorded suffix rule");
+            }
+        }
         if entry.identity.is_empty() || !seen.insert(key(&entry.relative_path)) {
             bail!("Duplicate or missing manifest entry identity");
         }
@@ -603,6 +628,24 @@ pub(super) fn validate(m: &Manifest, j: &Journal, cancel: &AtomicBool) -> Result
     }
     if bytes != m.bytes || m.entries.is_empty() {
         bail!("Invalid manifest byte count or empty manifest");
+    }
+    if m.version == 2
+        && matches!(m.request.source, SourceSelection::Directory(_))
+        && options.filtered()
+    {
+        let mut needed = BTreeSet::new();
+        for entry in m.entries.iter().filter(|e| e.kind == BackupEntryKind::File) {
+            for parent in entry.relative_path.ancestors().skip(1) {
+                needed.insert(parent.to_path_buf());
+            }
+        }
+        if needed.is_empty()
+            || m.entries
+                .iter()
+                .any(|e| e.kind == BackupEntryKind::Directory && !needed.contains(&e.relative_path))
+        {
+            bail!("Filtered manifest has no selected files or unrelated directories");
+        }
     }
     let root_kind = paths
         .get(Path::new(""))
@@ -753,6 +796,7 @@ mod scale_tests {
             source: SourceSelection::Directory(source.clone()),
             target_dir: target.clone(),
             conflict: ConflictPolicy::KeepBoth,
+            directory_options: Some(DirectoryOptions::legacy()),
         };
         let plan = crate::service::plan_backup(&request, &cancel, &NoopReporter).unwrap();
         METADATA_IO.with(|counter| counter.set((0, 0)));

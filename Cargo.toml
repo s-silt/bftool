@@ -14,7 +14,7 @@ default-members = ["crates/bftool-cli"]
 # 共享的发布元数据 + 依赖版本。子 crate 用 `.workspace = true` 引用，
 # 保证升级集中在一处，子 crate 之间不会版本漂移。
 [workspace.package]
-version = "0.1.11-rc.1"
+version = "0.1.11-rc.2"
 edition = "2021"
 # Locked CLI/core dependencies require Rust 1.85 (including edition-2024 crates).
 # GUI declares its higher dependency floor separately. Windows validation used Rust 1.95.0;

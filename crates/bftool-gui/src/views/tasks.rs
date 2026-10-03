@@ -92,16 +92,9 @@ fn render_active_task_section(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!(
-                        "整批最终计数（结束后更新）{}/{} · 当前源字节 {} / {} ({:.1}%)",
-                        app.backup_ui.done_files,
-                        app.backup_ui.total_files,
-                        util::fmt_gb(app.backup_ui.transferred_bytes),
-                        util::fmt_gb(app.backup_ui.total_bytes),
-                        frac * 100.0
-                    ))
-                    .size(11.5)
-                    .color(theme::TEXT_MUTED),
+                    egui::RichText::new(app.backup_ui.running_progress_text())
+                        .size(11.5)
+                        .color(theme::TEXT_MUTED),
                 );
 
                 if let (Some(bps), Some(eta)) = (app.backup_ui.speed_bps, app.backup_ui.eta_secs) {
@@ -357,6 +350,12 @@ fn render_plain_history(app: &mut App, ui: &mut egui::Ui) {
                         record.source.path().display(),
                         util::fmt_gb(record.bytes)
                     ));
+                    if matches!(
+                        record.source,
+                        bftool_core::pipeline::backup::SourceSelection::Directory(_)
+                    ) {
+                        ui.label(folder_rule_label(&record.directory_options));
+                    }
                     ui.label(if record.completed {
                         "日志标记已完成；当前内容完整性请在校验页重新检查"
                     } else {
@@ -376,4 +375,35 @@ fn render_plain_history(app: &mut App, ui: &mut egui::Ui) {
             crate::views::backup::adapter::resume(app, job);
         }
     });
+}
+
+fn folder_rule_label(options: &bftool_core::pipeline::backup::DirectoryOptions) -> String {
+    let scope = if options.recursive {
+        "包含子文件夹（递归）"
+    } else {
+        "仅当前层（不包含子文件夹）"
+    };
+    let suffixes = options
+        .extensions
+        .as_ref()
+        .map(|values| {
+            if values.is_empty() {
+                "未选择后缀".into()
+            } else {
+                values
+                    .iter()
+                    .map(|s| format!(".{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        })
+        .unwrap_or_else(|| "全部后缀".into());
+    format!(
+        "范围：{scope}；后缀：{suffixes}；无后缀文件：{}",
+        if options.include_extensionless {
+            "包含"
+        } else {
+            "排除"
+        }
+    )
 }

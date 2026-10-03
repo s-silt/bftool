@@ -21,6 +21,10 @@ pub fn plan_backup(
 ) -> Result<BackupPlan> {
     reporter.info("Planning direct backup");
     check_cancel(cancel)?;
+    let options = match request.source {
+        SourceSelection::File(_) => DirectoryOptions::default(),
+        SourceSelection::Directory(_) => request.effective_directory_options().canonicalized()?,
+    };
     // Open the original paths first so canonicalization cannot hide a symlink ancestor.
     let target = SafeDir::open(&request.target_dir, false)?;
     let path = request.source.path();
@@ -57,7 +61,7 @@ pub fn plan_backup(
     {
         bail!("Source and target overlap or share a selected file parent");
     }
-    let entries = snapshot(&source, source_leaf.as_deref(), cancel)?;
+    let entries = snapshot(&source, source_leaf.as_deref(), &options, cancel)?;
     if let Some(held) = &selected_file_handle {
         if entries.first().map(|e| e.identity.as_str()) != Some(file_identity(held)?.as_str()) {
             bail!("Selected source file identity changed while planning");
@@ -101,6 +105,7 @@ pub fn plan_backup(
         NEXT_JOB.fetch_add(1, Ordering::Relaxed)
     );
     let mut request = request.clone();
+    request.directory_options = Some(options.clone());
     request.target_dir = target_path.clone();
     request.source = if source_leaf.is_some() {
         SourceSelection::File(source_path)
@@ -120,10 +125,14 @@ pub fn plan_backup(
             destination_name,
             selected_target: target_path,
             entries,
-            counts,
+            counts: counts.clone(),
             bytes,
             conflicts,
-            issues: Vec::new(),
+            issues: if options.filtered() && counts.files == 0 {
+                vec!["No files match the selected folder suffix rules".into()]
+            } else {
+                Vec::new()
+            },
         },
     })
 }

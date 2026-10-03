@@ -1,6 +1,109 @@
 use crate::engine::destination::SafeDir;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryOptions {
+    pub recursive: bool,
+    pub extensions: Option<Vec<String>>,
+    pub include_extensionless: bool,
+}
+impl Default for DirectoryOptions {
+    fn default() -> Self {
+        Self {
+            recursive: false,
+            extensions: None,
+            include_extensionless: true,
+        }
+    }
+}
+fn canonical_extension(token: &str) -> anyhow::Result<String> {
+    let suffix = token.strip_prefix('.').unwrap_or(token);
+    if suffix.is_empty()
+        || suffix.chars().count() > 64
+        || suffix.len() > 128
+        || !suffix
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!("Invalid file suffix: {token:?}");
+    }
+    let suffix = suffix.to_lowercase();
+    if suffix.chars().count() > 64
+        || suffix.len() > 128
+        || !suffix
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!("Invalid canonical file suffix");
+    }
+    Ok(suffix)
+}
+pub fn parse_extensions(input: &str) -> anyhow::Result<Vec<String>> {
+    if input.len() > 32_768 {
+        anyhow::bail!("File suffix input exceeds 32768 bytes");
+    }
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut suffixes = std::collections::BTreeSet::new();
+    for part in input.split([',', ';']) {
+        if part.trim().is_empty() {
+            anyhow::bail!("Empty file suffix token");
+        }
+        for token in part.split_whitespace() {
+            suffixes.insert(canonical_extension(token)?);
+            if suffixes.len() > 128 {
+                anyhow::bail!("Too many distinct file suffixes");
+            }
+        }
+    }
+    Ok(suffixes.into_iter().collect())
+}
+impl DirectoryOptions {
+    pub fn legacy() -> Self {
+        Self {
+            recursive: true,
+            ..Self::default()
+        }
+    }
+    pub fn canonicalized(&self) -> anyhow::Result<Self> {
+        let extensions = self
+            .extensions
+            .as_ref()
+            .map(|tokens| -> anyhow::Result<Vec<String>> {
+                let mut suffixes = std::collections::BTreeSet::new();
+                for token in tokens {
+                    suffixes.insert(canonical_extension(token)?);
+                    if suffixes.len() > 128 {
+                        anyhow::bail!("Too many distinct file suffixes");
+                    }
+                }
+                Ok(suffixes.into_iter().collect())
+            })
+            .transpose()?;
+        Ok(Self {
+            recursive: self.recursive,
+            extensions,
+            include_extensionless: self.include_extensionless,
+        })
+    }
+    pub fn matches_file(&self, path: &Path) -> bool {
+        match path.extension().filter(|e| !e.is_empty()) {
+            None => self.include_extensionless,
+            Some(suffix) => match &self.extensions {
+                None => true,
+                Some(tokens) => suffix
+                    .to_str()
+                    .is_some_and(|s| tokens.iter().any(|t| t == &s.to_lowercase())),
+            },
+        }
+    }
+    pub(super) fn filtered(&self) -> bool {
+        self.extensions.is_some() || !self.include_extensionless
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceSelection {
@@ -24,6 +127,23 @@ pub struct BackupRequest {
     pub source: SourceSelection,
     pub target_dir: PathBuf,
     pub conflict: ConflictPolicy,
+    #[serde(default)]
+    pub directory_options: Option<DirectoryOptions>,
+}
+impl BackupRequest {
+    pub fn new(source: SourceSelection, target_dir: PathBuf) -> Self {
+        Self {
+            source,
+            target_dir,
+            conflict: ConflictPolicy::KeepBoth,
+            directory_options: Some(DirectoryOptions::default()),
+        }
+    }
+    pub fn effective_directory_options(&self) -> DirectoryOptions {
+        self.directory_options
+            .clone()
+            .unwrap_or_else(DirectoryOptions::legacy)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackupOutcome {
@@ -146,6 +266,7 @@ impl std::error::Error for BackupExecutionError {
 pub struct BackupHistoryRecord {
     pub job_id: String,
     pub source: SourceSelection,
+    pub directory_options: DirectoryOptions,
     pub destination_name: PathBuf,
     pub bytes: u64,
     pub completed: bool,

@@ -11,6 +11,7 @@ fn request(source: SourceSelection, target: &std::path::Path) -> BackupRequest {
         source,
         target_dir: target.to_path_buf(),
         conflict: ConflictPolicy::KeepBoth,
+        directory_options: Some(bftool_core::pipeline::backup::DirectoryOptions::legacy()),
     }
 }
 

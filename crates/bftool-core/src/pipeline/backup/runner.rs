@@ -147,6 +147,12 @@ pub fn run_backup_plan(
             summary.outcome = BackupOutcome::Cancelled;
             return Ok(summary);
         }
+        if matches!(plan.request.source, SourceSelection::Directory(_))
+            && plan.request.effective_directory_options().filtered()
+            && plan.view.counts.files == 0
+        {
+            bail!("No files match the selected folder suffix rules; target untouched");
+        }
         revalidate(plan, cancel)?;
         destination_free(&plan.target, &plan.view.destination_name)?;
         check_cancel(cancel)?;

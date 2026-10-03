@@ -24,6 +24,27 @@ pub struct SourceItem {
     pub name: String,
     pub is_dir: bool,
     pub size_bytes: u64,
+    pub folder_filter: FolderFilter,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FolderFilter {
+    pub include_subfolders: bool,
+    pub enabled: bool,
+    pub extensions_input: String,
+    pub include_extensionless: bool,
+}
+impl FolderFilter {
+    pub fn directory_options(
+        &self,
+    ) -> anyhow::Result<bftool_core::pipeline::backup::DirectoryOptions> {
+        let extensions = bftool_core::pipeline::backup::parse_extensions(&self.extensions_input)?;
+        Ok(bftool_core::pipeline::backup::DirectoryOptions {
+            recursive: self.include_subfolders,
+            extensions: self.enabled.then_some(extensions),
+            include_extensionless: !self.enabled || self.include_extensionless,
+        })
+    }
 }
 
 /// 目标盘类型
@@ -202,6 +223,8 @@ pub struct BackupUiState {
     pub current_file: String,
     pub done_files: usize,
     pub total_files: usize,
+    // Recovery has no validated whole-job denominator in the GUI contract.
+    pub recovery_totals_unknown: bool,
     pub transferred_bytes: u64,
     pub total_bytes: u64,
     pub speed_bps: Option<u64>,
@@ -228,6 +251,7 @@ impl Default for BackupUiState {
             current_file: String::new(),
             done_files: 0,
             total_files: 0,
+            recovery_totals_unknown: false,
             transferred_bytes: 0,
             total_bytes: 0,
             speed_bps: None,
@@ -240,16 +264,63 @@ impl Default for BackupUiState {
 }
 
 impl BackupUiState {
+    pub(crate) fn running_progress_text(&self) -> String {
+        let fraction = if self.total_bytes > 0 {
+            (self.transferred_bytes as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if self.recovery_totals_unknown {
+            if self.total_bytes == 0 {
+                "恢复任务：整项总量未知；等待当前步骤字节进度".into()
+            } else {
+                format!(
+                    "恢复任务：整项总量未知；当前步骤字节 {} / {} ({:.1}%)",
+                    util::fmt_gb(self.transferred_bytes),
+                    util::fmt_gb(self.total_bytes),
+                    fraction * 100.0
+                )
+            }
+        } else {
+            format!(
+                "整批最终计数（结束后更新）{}/{} · 当前源字节 {} / {} ({:.1}%)",
+                self.done_files,
+                self.total_files,
+                util::fmt_gb(self.transferred_bytes),
+                util::fmt_gb(self.total_bytes),
+                fraction * 100.0
+            )
+        }
+    }
+
     /// 计算当前输入快照签名，用于探测输入变更时失效旧计划
     pub fn current_signature(&self) -> String {
         format!("{:?}=>{:?}", self.sources, self.target_path)
     }
 
-    /// 输入变更时检查并失效预览
+    pub fn filter_error(&self) -> Option<String> {
+        self.sources.iter().filter(|s| s.is_dir).find_map(|s| {
+            s.folder_filter
+                .directory_options()
+                .err()
+                .map(|e| format!("{}: {e}", s.name))
+        })
+    }
+
+    pub fn has_no_matches(&self) -> bool {
+        self.core_plans
+            .as_ref()
+            .is_some_and(|plans| plans.iter().any(adapter::has_no_matches))
+    }
+
+    /// 输入变更时检查并失效预览。
     pub fn check_invalidate_plan(&mut self) {
         let sig = self.current_signature();
         if sig != self.plan_signature {
             self.plan = None;
+            for source in &mut self.sources {
+                source.size_bytes = 0;
+            }
             self.core_plans = None;
             self.core_signature.clear();
             self.plan_signature.clear();
@@ -386,7 +457,7 @@ fn render_step_1(app: &mut App, ui: &mut egui::Ui) {
                 .clicked()
             {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    add_source_path(app, folder);
+                    add_source_folder(app, folder);
                 }
             }
 
@@ -410,12 +481,15 @@ fn render_step_1(app: &mut App, ui: &mut egui::Ui) {
                 "点击上方「添加文件」或「添加文件夹」，支持将文件/文件夹直接拖拽至窗口。",
             );
         } else {
+            let busy = app.is_busy() || app.backup_ui.is_running;
             let mut remove_idx = None;
             egui::ScrollArea::vertical()
                 .id_salt("source_list_scroll")
                 .max_height(200.0)
                 .show(ui, |ui| {
-                    for (i, item) in app.backup_ui.sources.iter().enumerate() {
+                    let mut edits = Vec::new();
+                    let preview_current = app.backup_ui.plan.is_some();
+                    for (i, item) in app.backup_ui.sources.clone().iter().enumerate() {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 let icon = if item.is_dir { "📁" } else { "📄" };
@@ -433,7 +507,6 @@ fn render_step_1(app: &mut App, ui: &mut egui::Ui) {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        let busy = app.is_busy() || app.backup_ui.is_running;
                                         let btn = ui.add_enabled(
                                             !busy,
                                             egui::Button::new(
@@ -441,23 +514,31 @@ fn render_step_1(app: &mut App, ui: &mut egui::Ui) {
                                                     .size(11.0)
                                                     .color(theme::DANGER),
                                             )
-                                            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                                            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
                                             .corner_radius(3),
                                         );
                                         if btn.clicked() {
                                             remove_idx = Some(i);
                                         }
                                         ui.label(
-                                            egui::RichText::new(util::fmt_gb(item.size_bytes))
+                                            egui::RichText::new(if preview_current { util::fmt_gb(item.size_bytes) } else { "待预览".into() })
                                                 .size(12.0)
                                                 .color(theme::TEXT_MUTED),
                                         );
                                     },
                                 );
                             });
+                            if item.is_dir {
+                                let mut draft = item.folder_filter.clone();
+                                ui.push_id(i, |ui| render_folder_filter(ui, &mut draft, !busy));
+                                if draft != item.folder_filter { edits.push((i, draft)); }
+                            } else if !preview_current {
+                                ui.colored_label(theme::TEXT_MUTED, "拖入的文件夹将在首次预览识别；文件夹默认仅当前层，单文件直接备份。");
+                            }
                         });
                         ui.add_space(2.0);
                     }
+                    for (i, draft) in edits { set_folder_filter(app, i, draft); }
                 });
 
             if let Some(i) = remove_idx {
@@ -654,9 +735,13 @@ fn render_step_3(app: &mut App, ui: &mut egui::Ui) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let busy = app.is_busy() || app.backup_ui.is_running;
                 let has_plan = app.backup_ui.plan.is_some();
-                let can_plan =
-                    !busy && !app.backup_ui.sources.is_empty() && app.backup_ui.validation.is_ok();
+                let can_plan = !busy
+                    && !app.backup_ui.sources.is_empty()
+                    && app.backup_ui.validation.is_ok()
+                    && app.backup_ui.filter_error().is_none();
                 let can_start = !busy
+                    && app.backup_ui.filter_error().is_none()
+                    && !app.backup_ui.has_no_matches()
                     && has_plan
                     && app
                         .backup_ui
@@ -731,6 +816,15 @@ fn render_step_3(app: &mut App, ui: &mut egui::Ui) {
         }
 
         // 计划汇总胶囊标签 (5 大分类)
+        if let Some(error) = app.backup_ui.filter_error() {
+            ui.colored_label(theme::DANGER, format!("后缀输入无效：{error}"));
+        }
+        if app.backup_ui.has_no_matches() {
+            ui.colored_label(
+                theme::WARN,
+                "没有匹配文件：该文件夹为 0 文件 / 0 字节；请修改筛选或移除该源后重新预览。",
+            );
+        }
         if let Some(plan) = &app.backup_ui.plan {
             if !app.backend.is_demo() {
                 ui.label("容量数字仅含文件内容；元数据和文件系统分配开销未知，0 字节文件也需要空间，不能据此保证空间充足。");
@@ -885,7 +979,7 @@ fn render_running_card(app: &mut App, ui: &mut egui::Ui) {
                     );
                 } else {
                     ui.spinner();
-                    theme::badge(ui, "正在备份复制中", theme::PRIMARY, Color32::WHITE);
+                    theme::badge(ui, if app.backup_ui.recovery_totals_unknown { "正在恢复备份…" } else { "正在备份复制中" }, theme::PRIMARY, Color32::WHITE);
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -914,7 +1008,7 @@ fn render_running_card(app: &mut App, ui: &mut egui::Ui) {
                         .color(theme::TEXT_MUTED),
                 );
                 let curr = if app.backup_ui.current_file.is_empty() {
-                    "正在初始化文件读取...".to_string()
+                    if app.backup_ui.recovery_totals_unknown { "正在读取已保存的恢复任务…".into() } else { "正在初始化文件读取...".into() }
                 } else {
                     app.backup_ui.current_file.clone()
                 };
@@ -938,14 +1032,7 @@ fn render_running_card(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!(
-                        "整批最终计数（结束后更新）{}/{} · 当前源字节 {} / {} ({:.1}%)",
-                        app.backup_ui.done_files,
-                        app.backup_ui.total_files,
-                        util::fmt_gb(app.backup_ui.transferred_bytes),
-                        util::fmt_gb(app.backup_ui.total_bytes),
-                        frac * 100.0
-                    ))
+                    egui::RichText::new(app.backup_ui.running_progress_text())
                     .size(11.5)
                     .color(theme::TEXT_MUTED),
                 );
@@ -991,7 +1078,7 @@ fn render_outcome_banner(outcome: &BackupOutcomeSummary, ui: &mut egui::Ui) {
 
     egui::Frame::default()
         .fill(soft)
-        .stroke(egui::Stroke::new(1.0, color))
+        .stroke(egui::Stroke::new(1.0_f32, color))
         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -1023,7 +1110,7 @@ fn render_pending_core_modal(app: &mut App, ctx: &egui::Context) {
         .frame(
             egui::Frame::default()
                 .fill(theme::CARD)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
                 .corner_radius(egui::CornerRadius::same(theme::RADIUS))
                 .inner_margin(egui::Margin::same(16)),
         )
@@ -1090,11 +1177,90 @@ fn handle_drag_and_drop(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+fn render_folder_filter(ui: &mut egui::Ui, draft: &mut FolderFilter, editable: bool) {
+    ui.add_enabled_ui(editable, |ui| {
+        ui.checkbox(&mut draft.include_subfolders, "包含子文件夹");
+        ui.colored_label(
+            theme::TEXT_MUTED,
+            if draft.include_subfolders {
+                "当前文件夹及子文件夹（递归）"
+            } else {
+                "仅当前层（不包含子文件夹）"
+            },
+        );
+        ui.checkbox(&mut draft.enabled, "按文件后缀筛选");
+        ui.add_enabled_ui(draft.enabled, |ui| {
+            ui.label("常用后缀");
+            let parsed = bftool_core::pipeline::backup::parse_extensions(&draft.extensions_input);
+            ui.horizontal_wrapped(|ui| {
+                for suffix in ["tar", "zip", "jpg", "png", "mp4", "mov", "pdf", "txt"] {
+                    let mut chosen = parsed
+                        .as_ref()
+                        .is_ok_and(|values| values.iter().any(|s| s == suffix));
+                    if ui
+                        .add_enabled(
+                            parsed.is_ok(),
+                            egui::Checkbox::new(&mut chosen, format!(".{suffix}")),
+                        )
+                        .changed()
+                    {
+                        let mut values = bftool_core::pipeline::backup::parse_extensions(
+                            &draft.extensions_input,
+                        )
+                        .unwrap_or_default();
+                        values.retain(|s| s != suffix);
+                        if chosen {
+                            values.push(suffix.into());
+                        }
+                        values.sort();
+                        draft.extensions_input = values.join(", ");
+                    }
+                }
+            });
+            ui.label("手动后缀（逗号 / 空格分隔；a.tar.gz 的后缀为 gz）");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.extensions_input)
+                    .hint_text("tar, zip")
+                    .char_limit(8192)
+                    .desired_width(ui.available_width()),
+            );
+            ui.checkbox(&mut draft.include_extensionless, "包含无后缀文件");
+        });
+        if let Err(error) = draft.directory_options() {
+            ui.colored_label(theme::DANGER, format!("后缀输入无效：{error}"));
+        }
+        if ui.small_button("清除筛选（保留子文件夹范围）").clicked() {
+            draft.enabled = false;
+            draft.extensions_input.clear();
+            draft.include_extensionless = false;
+        }
+    });
+}
+
 pub fn selection_allowed(app: &App) -> bool {
     !app.backend.is_demo() && !app.is_busy() && !app.backup_ui.is_running
 }
 
+pub fn add_source_folder(app: &mut App, path: PathBuf) {
+    add_source_selection(app, path, true);
+}
+
+pub fn set_folder_filter(app: &mut App, index: usize, draft: FolderFilter) {
+    if !selection_allowed(app) {
+        return;
+    }
+    if let Some(source) = app.backup_ui.sources.get_mut(index) {
+        source.folder_filter = draft;
+        app.backup_ui.check_invalidate_plan();
+        app.backup_ui.last_outcome = None;
+    }
+}
+
 pub fn add_source_path(app: &mut App, path: PathBuf) {
+    add_source_selection(app, path, false);
+}
+
+fn add_source_selection(app: &mut App, path: PathBuf, folder_hint: bool) {
     if !selection_allowed(app) {
         return;
     }
@@ -1109,8 +1275,9 @@ pub fn add_source_path(app: &mut App, path: PathBuf) {
     app.backup_ui.sources.push(SourceItem {
         path,
         name,
-        is_dir: false,
+        is_dir: folder_hint,
         size_bytes: 0,
+        folder_filter: FolderFilter::default(),
     });
     revalidate(app);
     app.backup_ui.check_invalidate_plan();
@@ -1205,6 +1372,11 @@ pub fn generate_plan_action(app: &mut App) {
         apply_demo_state(app, state);
         return;
     }
+    app.backup_ui.check_invalidate_plan();
+    if let Some(error) = app.backup_ui.filter_error() {
+        adapter::apply_outcome(app, adapter::failure(error));
+        return;
+    }
     adapter::generate(app);
 }
 
@@ -1222,6 +1394,7 @@ pub fn start_backup_action(app: &mut App) {
     app.backup_ui.is_running = true;
     app.backup_ui.stopping_requested = false;
     app.backup_ui.done_files = 0;
+    app.backup_ui.recovery_totals_unknown = false;
     app.backup_ui.total_files = plan.pending_count;
     app.backup_ui.transferred_bytes = 0;
     app.backup_ui.total_bytes = plan.pending_bytes;
@@ -1293,6 +1466,7 @@ pub fn apply_demo_state(app: &mut App, state: DemoState) {
         return;
     }
     app.backup_ui.core_plans = None;
+    app.backup_ui.recovery_totals_unknown = false;
     app.backup_ui.demo_state = Some(state);
     app.backup_ui.is_running = false;
     app.backup_ui.stopping_requested = false;
@@ -1315,6 +1489,7 @@ pub fn apply_demo_state(app: &mut App, state: DemoState) {
                 name: "纪录片_终剪版_4K.mov".into(),
                 is_dir: false,
                 size_bytes: 28 * 1024 * 1024 * 1024 + 400 * 1024 * 1024, // 28.4 GB
+                folder_filter: FolderFilter::default(),
             }];
             app.backup_ui.target_path = r"E:\机械备份主盘\202610_媒体归档".into();
             app.backup_ui.target_info = Some(TargetInfo {
@@ -1359,18 +1534,27 @@ pub fn apply_demo_state(app: &mut App, state: DemoState) {
                     name: "202610_宣传片拍摄原片".into(),
                     is_dir: true,
                     size_bytes: 125 * 1024 * 1024 * 1024,
+                    folder_filter: FolderFilter {
+                        include_subfolders: true,
+                        ..Default::default()
+                    },
                 },
                 SourceItem {
                     path: PathBuf::from(r"D:\音频工程\环境音效库_WAV"),
                     name: "环境音效库_WAV".into(),
                     is_dir: true,
                     size_bytes: 42 * 1024 * 1024 * 1024,
+                    folder_filter: FolderFilter {
+                        include_subfolders: true,
+                        ..Default::default()
+                    },
                 },
                 SourceItem {
                     path: PathBuf::from(r"D:\设计源文件\宣传画册分层设计.psd"),
                     name: "宣传画册分层设计.psd".into(),
                     is_dir: false,
                     size_bytes: 3800 * 1024 * 1024,
+                    folder_filter: FolderFilter::default(),
                 },
             ];
             app.backup_ui.target_path = r"F:\机械存储阵列\项目归档区".into();
@@ -1452,12 +1636,14 @@ pub fn apply_demo_state(app: &mut App, state: DemoState) {
                     name: "纪录片剪辑工程_v2.prproj".into(),
                     is_dir: false,
                     size_bytes: 2100 * 1024 * 1024,
+                    folder_filter: FolderFilter::default(),
                 },
                 SourceItem {
                     path: PathBuf::from(r"D:\剪辑工程\背景配乐_母带.wav"),
                     name: "背景配乐_母带.wav".into(),
                     is_dir: false,
                     size_bytes: 150 * 1024 * 1024,
+                    folder_filter: FolderFilter::default(),
                 },
             ];
             app.backup_ui.target_path = r"E:\项目备份目录".into();
@@ -1512,6 +1698,10 @@ pub fn apply_demo_state(app: &mut App, state: DemoState) {
                 name: "8K_RED_RAW素材集".into(),
                 is_dir: true,
                 size_bytes: 820 * 1024 * 1024 * 1024,
+                folder_filter: FolderFilter {
+                    include_subfolders: true,
+                    ..Default::default()
+                },
             }];
             app.backup_ui.target_path = r"G:\老式机械备份移动盘".into();
             app.backup_ui.target_info = Some(TargetInfo {
@@ -1600,6 +1790,159 @@ pub fn apply_demo_state(app: &mut App, state: DemoState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Pos2)> {
+        fn collect(shape: &egui::Shape, found: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Text(text) => found.push((text.galley.text().into(), text.pos)),
+                egui::Shape::Vec(values) => {
+                    for value in values {
+                        collect(value, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for shape in shapes {
+            collect(&shape.shape, &mut found);
+        }
+        found
+    }
+
+    #[test]
+    fn folder_filter_gui_headless_real_controls_clicks_and_busy_inert() {
+        let mut app = crate::app::tests::fixture();
+        app.backend = crate::backend::Backend::Live;
+        // No filesystem classification is necessary to expose native AddFolder controls.
+        add_source_folder(&mut app, PathBuf::from("synthetic-no-such-folder"));
+        assert!(app.backup_ui.sources[0].is_dir);
+        let mut draft = app.backup_ui.sources[0].folder_filter.clone();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| render_folder_filter(ui, &mut draft, true));
+        });
+        let text = rendered_text(&output.shapes);
+        for label in [
+            "包含子文件夹",
+            "仅当前层（不包含子文件夹）",
+            "按文件后缀筛选",
+            "常用后缀",
+            ".tar",
+            ".zip",
+            "tar, zip",
+            "包含无后缀文件",
+            "清除筛选（保留子文件夹范围）",
+        ] {
+            assert!(
+                text.iter().any(|(value, _)| value.contains(label)),
+                "missing rendered control: {label}"
+            );
+        }
+        let click_pos = text
+            .iter()
+            .find(|(value, _)| value == "包含子文件夹")
+            .unwrap()
+            .1
+            + egui::vec2(6.0, 6.0);
+        for pressed in [true, false] {
+            let mut event = input.clone();
+            event.events = vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run(event, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| render_folder_filter(ui, &mut draft, true));
+            });
+        }
+        assert!(
+            draft.include_subfolders,
+            "actual checkbox pointer event must update draft"
+        );
+        let saved = draft.clone();
+        for pressed in [true, false] {
+            let mut event = input.clone();
+            event.events = vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run(event, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| render_folder_filter(ui, &mut draft, false));
+            });
+        }
+        assert_eq!(draft, saved, "busy rendered controls must ignore input");
+    }
+
+    #[test]
+    fn folder_filter_gui_clear_filter_restores_all_files_with_scope_preserved() {
+        let mut draft = FolderFilter {
+            include_subfolders: true,
+            enabled: true,
+            extensions_input: "zip".into(),
+            include_extensionless: false,
+        };
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| render_folder_filter(ui, &mut draft, true));
+        });
+        let text = rendered_text(&output.shapes);
+        let click_pos = text
+            .iter()
+            .find(|(value, _)| value == "清除筛选（保留子文件夹范围）")
+            .unwrap()
+            .1
+            + egui::vec2(6.0, 6.0);
+        for pressed in [true, false] {
+            let mut event = input.clone();
+            event.events = vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run(event, |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| render_folder_filter(ui, &mut draft, true));
+            });
+        }
+        let options = draft.directory_options().unwrap();
+        assert!(options.recursive);
+        assert!(options.extensions.is_none());
+        assert!(options.include_extensionless);
+        assert!(draft.extensions_input.is_empty());
+        assert!(!draft.enabled);
+    }
 
     #[test]
     fn direct_regression_demo_selection_is_inert_even_for_existing_directory() {
@@ -1717,6 +2060,7 @@ mod tests {
             name: "project".into(),
             is_dir: true,
             size_bytes: 100,
+            folder_filter: FolderFilter::default(),
         }];
 
         // 目标为空
@@ -1752,6 +2096,7 @@ mod tests {
             name: "source1.txt".into(),
             is_dir: false,
             size_bytes: 1024,
+            folder_filter: FolderFilter::default(),
         });
         state.target_path = r"D:\target".into();
         state.plan = Some(FileBackupPlan {
