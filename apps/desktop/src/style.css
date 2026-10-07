@@ -1475,6 +1475,8 @@ footer {
     gap: 4px;
   }
   nav button {
+    width: auto;
+    flex: 0 0 auto;
     height: 30px;
     padding: 0 8px;
     font-size: 12px;
