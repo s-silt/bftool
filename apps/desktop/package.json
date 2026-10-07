@@ -1,0 +1,6 @@
+{
+  "name": "bftool-desktop", "version": "0.1.11-rc.2", "private": true, "type": "module",
+  "scripts": { "dev": "vite --host 127.0.0.1", "build": "vue-tsc --noEmit && vite build", "test": "node --test tests/*.test.ts tests/*.test.mjs", "tauri": "tauri" },
+  "dependencies": { "vue": "3.5.43", "@tauri-apps/api": "2.12.1" },
+  "devDependencies": { "vite": "8.3.3", "typescript": "5.9.3", "vue-tsc": "3.3.12", "@vitejs/plugin-vue": "6.0.9", "@tauri-apps/cli": "2.12.1" }
+}
