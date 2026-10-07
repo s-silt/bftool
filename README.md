@@ -54,3 +54,8 @@ Windows 限定的安全测试脚本为 `scripts/test_safe_windows.py`，其排�
 核心 API 与 GUI 适配约定见 [接口规范](docs/CORE_FILE_BACKUP_INTERFACE_SPEC.md)。
 
 [MIT License](LICENSE)
+
+
+## Tauri desktop migration candidate
+
+A first complete backup workflow is available in [apps/desktop](apps/desktop/README.md), with [architecture and validation scope](docs/UI_MIGRATION.md). It retains the Rust backup core and existing CLI/egui. The independent frontend/native/bridge locks and desktop CI are separate from the original workspace. This candidate is unsigned and requires WebView2 Runtime; it is not a stable release or a full graphics-compatibility acceptance.

@@ -1,0 +1,17 @@
+[package]
+name = "bftool-desktop-bridge"
+version = "0.1.11-rc.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/s-silt/bftool"
+
+[workspace]
+
+[dependencies]
+bftool-core = { path = "../bftool-core" }
+anyhow = "=1.0.103"
+serde = { version = "=1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+serde_json = "1.0"

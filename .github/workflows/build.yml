@@ -44,7 +44,10 @@ jobs:
         with:
           tool: cargo-audit
       - name: cargo audit（依赖已知漏洞扫描）
-        run: cargo audit
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file crates/bftool-desktop-bridge/Cargo.lock
+          cargo audit --file apps/desktop/src-tauri/Cargo.lock
 
   build:
     name: build (${{ matrix.target }})
@@ -91,6 +94,58 @@ jobs:
             bftool-${{ matrix.target }}.zip
           if-no-files-found: error
 
+  desktop:
+    name: desktop frontend + bridge + x64 Release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/bftool-desktop-bridge -> target
+            apps/desktop/src-tauri -> target
+      - name: Install locked frontend dependencies
+        run: npm ci --prefix apps/desktop --ignore-scripts
+      - name: Frontend tests and build
+        run: |
+          npm test --prefix apps/desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build --prefix apps/desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Independent Rust format checks
+        run: |
+          cargo fmt --manifest-path crates/bftool-desktop-bridge/Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Bridge synthetic contract and recovery tests
+        run: cargo test --manifest-path crates/bftool-desktop-bridge/Cargo.toml --locked
+      - name: Bridge lint
+        run: cargo clippy --manifest-path crates/bftool-desktop-bridge/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Native Release lint
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked --target x86_64-pc-windows-msvc --features custom-protocol -- -D warnings
+      - name: Native x64 Release build
+        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --release --locked --target x86_64-pc-windows-msvc --features custom-protocol
+      - name: Package with reviewed third-party notices
+        run: |
+          node scripts/package-desktop-release.mjs apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bftool-desktop.exe dist/desktop-x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path dist/desktop-x64/* -DestinationPath bftool-desktop-x64.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bftool-desktop-x64-candidate
+          path: bftool-desktop-x64.zip
+          if-no-files-found: error
+
   release:
     name: release
     needs: [build, audit]
@@ -103,7 +158,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v7
         with:
-          path: artifacts
+          name: bftool-x86_64-pc-windows-msvc
+          path: artifacts/legacy
       - name: publish release
         uses: softprops/action-gh-release@v3
         with:

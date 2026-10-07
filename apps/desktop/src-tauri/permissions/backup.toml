@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "backup-ui"
+description = "Explicit copy-only backup commands; no shell, filesystem plugin or remote origins"
+commands.allow = ["choose_paths", "input_revision", "invalidate_plan", "preview_backup", "plan_entries", "start_backup", "resume_backup", "job_snapshot", "cancel_job", "backup_history", "verify_backup"]

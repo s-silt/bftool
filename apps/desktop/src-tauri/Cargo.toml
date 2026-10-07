@@ -1,0 +1,21 @@
+[package]
+name = "bftool-desktop"
+version = "0.1.11-rc.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/s-silt/bftool"
+build = "build.rs"
+
+[workspace]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = "=2.7.1"
+
+[dependencies]
+tauri = "=2.12.1"
+serde = { version = "=1.0.228", features = ["derive"] }
+bftool-desktop-bridge = { path = "../../../crates/bftool-desktop-bridge" }
+rfd = "=0.15.4"

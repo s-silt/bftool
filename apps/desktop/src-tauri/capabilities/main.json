@@ -1,0 +1,3 @@
+{
+  "identifier": "backup-main", "description": "Local backup commands for the main bundled UI only", "windows": ["main"], "local": true, "permissions": ["backup-ui"]
+}
